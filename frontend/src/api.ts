@@ -124,6 +124,7 @@ export const api = {
   createCredential: (c: { name: string; type: string; data: Record<string, unknown> }) => req<Credential>('POST', '/api/credentials', c),
   updateCredential: (id: string, c: { name?: string; data?: Record<string, unknown> }) => req<Credential>('PUT', `/api/credentials/${id}`, c),
   deleteCredential: (id: string) => req('DELETE', `/api/credentials/${id}`),
+  moveCredential: (id: string, ownerId: string) => req<Credential>('POST', `/api/credentials/${id}/move`, { owner_id: ownerId }),
 
   // Telephony (LiveKit SIP trunks / dispatch rules, Plivo wiring)
   telephony: (credId: string) => req<Telephony>('GET', `/api/voice/telephony/${credId}`),

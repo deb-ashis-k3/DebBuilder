@@ -90,7 +90,7 @@ function useCredentials() {
   const [creds, setCreds] = useState<Credential[]>(credCache ?? [])
   useEffect(() => {
     credListeners.add(setCreds)
-    if (!credCache) refreshCreds()
+    refreshCreds().catch(() => {})
     return () => { credListeners.delete(setCreds) }
   }, [])
   return creds
@@ -125,8 +125,23 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
   const creds = useCredentials()
   const [modal, setModal] = useState(false)
   const allowed = spec.credential_types ?? []
-  const options = ofOwner(creds).filter((c) => !allowed.length || allowed.includes(c.type))
+  const ofType = creds.filter((c) => !allowed.length || allowed.includes(c.type))
+  const options = ofOwner(ofType)
+  // Admins also receive other users' credentials; say why they can't be picked instead of hiding them silently.
+  const others = ofType.filter((c) => !options.includes(c))
+  const [moving, setMoving] = useState<string | null>(null)
+  const move = async (c: Credential) => {
+    if (!pickerOwner) return
+    setMoving(c.id)
+    try {
+      await api.moveCredential(c.id, pickerOwner)
+      await refreshCreds()
+      onChange(c.id)
+      toast(`Moved "${c.name}" to this workflow's owner`, 'info')
+    } catch (e) { toast(String(e instanceof Error ? e.message : e), 'error') } finally { setMoving(null) }
+  }
   return (
+    <div>
     <div className="row">
       <Select value={String(value ?? '')} onChange={(v) => onChange(v || null)} placeholder={options.length ? 'Select credential…' : 'No credentials yet'}
         options={options.map((c) => ({ value: c.id, label: c.name, hint: c.type_label }))} />
@@ -141,6 +156,26 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
         <CredentialModal allowedTypes={allowed} onClose={() => setModal(false)}
           onSaved={async (c) => { setModal(false); await refreshCreds(); onChange(c.id) }} />
       )}
+    </div>
+    {others.length > 0 && !options.some((c) => c.id === value) && (
+      <div className="cred-others small">
+        <Icon name="info" size={13} />
+        <div>
+          {others.length === 1 ? 'This credential belongs' : `These ${others.length} credentials belong`} to another user, and a workflow
+          can only use its owner's credentials:
+          {others.map((c) => (
+            <div key={c.id} className="cred-other">
+              <b>{c.name}</b> <span className="muted">· {c.owner_name ?? 'unknown'}{c.owner_email ? ` (${c.owner_email})` : ''}</span>
+              {pickerOwner && (
+                <button className="link-btn" disabled={moving === c.id} onClick={() => move(c)}>
+                  {moving === c.id ? 'Moving…' : "Move to this workflow's owner"}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
     </div>
   )
 }

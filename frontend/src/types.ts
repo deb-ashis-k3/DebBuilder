@@ -204,6 +204,7 @@ export interface Credential {
   oauth_connected?: boolean
   owner_id?: string | null
   owner_name?: string | null
+  owner_email?: string | null
   updated_at: string
   data?: Record<string, unknown>
 }

@@ -458,3 +458,7 @@ input[type='password']::-ms-reveal, input[type='password']::-ms-clear { display:
 .voice-worker .listener-state .btn { padding: 2px 8px; font-size: 12px; }
 .worker-log { max-height: 220px; overflow: auto; margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--surface-3);
   font: 11.5px/1.45 var(--mono, ui-monospace, monospace); white-space: pre-wrap; word-break: break-all; }
+
+.cred-others { display: flex; gap: 8px; margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--warning-soft); color: var(--text-2); line-height: 1.45; }
+.cred-others > svg { flex-shrink: 0; margin-top: 2px; color: var(--warning); }
+.cred-other { margin-top: 4px; }
