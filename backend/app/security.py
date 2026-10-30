@@ -84,6 +84,19 @@ def password_problems(pw: str, email: str = "", name: str = "") -> list[str]:
     return out
 
 
+_USERNAME = re.compile(r"[a-z][a-z0-9._-]{2,31}")
+
+
+def clean_username(raw: str | None) -> str | None:
+    """Optional sign-in name: 3–32 chars, starts with a letter, a-z 0-9 . _ - (never contains @, so it can't look like an email)."""
+    u = (raw or "").strip().lower()
+    if not u:
+        return None
+    if not _USERNAME.fullmatch(u):
+        raise HTTPException(400, "Username must be 3–32 characters: letters, digits, dot, dash or underscore, starting with a letter")
+    return u
+
+
 def check_password_policy(pw: str, email: str = "", name: str = "") -> None:
     problems = password_problems(pw, email, name)
     if problems:
@@ -216,12 +229,12 @@ POLICY: list[tuple[str, str, str]] = [
     # public
     (R, r"/api/health", "public"),
     (R, r"/api/auth/status", "public"),
-    ("POST", r"/api/auth/(setup|login|login/verify|login/resend|logout)", "public"),
+    ("POST", r"/api/auth/(setup|signup|login|login/verify|login/resend|logout|password/forgot|password/reset/verify|password/reset)", "public"),
     ("*", r"/webhook/.+", "public"),                      # production webhooks (active workflows only)
     ("GET|POST", r"/form/[^/]+", "public"),               # hosted forms are public by design
     ("GET|POST", r"/api/whatsapp/webhook", "public"),     # verified by Meta signature / verify token
     (R, r"/api/oauth2/callback", "public"),               # verified by the signed state
-    ("GET|POST", r"/api/voice/(config/[^/]+|turn)", "public"),  # verified by INTERNAL_TOKEN
+    ("GET|POST", r"/api/voice/(config/[^/]+|turn|resolve|event)", "public"),  # verified by INTERNAL_TOKEN
     ("POST", r"/api/chat/[^/]+", "optional"),             # public only if the Chat Trigger allows it
     # signed-in user, own account
     ("*", r"/api/auth/.*", "self"),
@@ -233,10 +246,13 @@ POLICY: list[tuple[str, str, str]] = [
     (R, r"/api/(workflows|folders)(/.*)?", "workflow:read"),
     ("POST", r"/api/workflows/[^/]+/run", "workflow:execute"),
     ("POST", r"/api/voice/session", "workflow:execute"),
+    (R, r"/api/voice/telephony/[^/]+", "credential:read"),
+    (W, r"/api/voice/telephony(/.*)?", "credential:write"),
     ("*", r"/webhook-test/.+", "workflow:execute"),
     (W, r"/api/(workflows|folders|templates)(/.*)?", "workflow:write"),
     # executions
     (R, r"/api/executions(/.*)?", "execution:read"),
+    (R, r"/api/binary/[0-9a-f]{32}", "execution:read"),
     ("POST", r"/api/executions/(stop|[^/]+/(resume|cancel|retry))", "workflow:execute"),
     (W, r"/api/executions(/.*)?", "execution:write"),
     # credentials

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -120,11 +121,12 @@ def _params(node: dict) -> dict:
     return params
 
 
-async def _cred(params: dict) -> dict:
+async def _cred(params: dict, workflow_id: str) -> dict:
     if not params.get("credential"):
         return {}
     async with SessionLocal() as s:
-        return (await load_credential(s, params["credential"]))[1]
+        wf = await s.get(Workflow, uuid.UUID(workflow_id))
+        return (await load_credential(s, params["credential"], wf.owner_id if wf else None))[1]
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +190,7 @@ async def _supervise(workflow_id: str, node: dict, status: Status, reason: str, 
             status.state = "starting"
         try:
             params = _params(node)
-            lc = ListenCtx(workflow_id=workflow_id, node=node, params=params, cred=await _cred(params),
+            lc = ListenCtx(workflow_id=workflow_id, node=node, params=params, cred=await _cred(params, workflow_id),
                            emit=_emitter(workflow_id, node, status, int(params.get("max_concurrency") or 5)),
                            reason=reason if first else "reconnected", status=status, stopping=stopping)
 

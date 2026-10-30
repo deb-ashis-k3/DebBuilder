@@ -1,5 +1,6 @@
 import {
-  Background, BackgroundVariant, Controls, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, useUpdateNodeInternals,
+  Background, BackgroundVariant, ControlButton, Controls, MiniMap, ReactFlow, ReactFlowProvider, SelectionMode, addEdge, useEdgesState, useNodesState,
+  useReactFlow, useUpdateNodeInternals,
   type Connection, type Edge, type FinalConnectionState, type Node,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -10,14 +11,18 @@ import { EdgeActionsCtx, edgeTypes, type EdgeActions } from '../components/Canva
 import { ChatPanel } from '../components/ChatPanel'
 import { Menu, MoveDialog, PromptDialog, confirmDialog, folderPath } from '../components/Dialogs'
 import { ExecutionLog, type ExecMeta } from '../components/ExecutionLog'
+import { subNodeStats, upsertSubRun } from '../components/logTree'
 import { nodeTypes, type FlowNodeData } from '../components/FlowNode'
 import { NodeDetails } from '../components/NodeDetails'
 import { Palette } from '../components/Palette'
-import { PropertyField } from '../components/PropertyField'
+import { OwnerBadge } from '../components/Owner'
+import { PropertyField, setPickerOwner } from '../components/PropertyField'
 import { Icon, defaultParams, newId, toast, uniqueName, useCatalog } from '../lib'
-import type { ExecEvent, Execution, Folder, Item, NodeRun, NodeTypeSpec, RunState, WFEdge, WFNode, Workflow } from '../types'
+import type { ExecEvent, Execution, Folder, Item, NodeRun, NodeTypeSpec, RunState, StateKey, WFEdge, WFNode, Workflow } from '../types'
 import { WorkflowExecutionsView } from './Executions'
 import { useAuth } from '../auth'
+import { CanvasContextMenu, SelectionToolbar, type MenuTarget } from '../canvas/CanvasMenus'
+import { tidyUp } from '../canvas/tidyUp'
 
 // LiveKit client is large; load it only when the voice panel opens.
 const VoicePanel = lazy(() => import('../components/VoicePanel').then((m) => ({ default: m.VoicePanel })))
@@ -83,7 +88,7 @@ function EditorInner() {
   const importRef = useRef<HTMLInputElement>(null)
   useEffect(() => { api.folders().then(setFolders).catch(() => {}) }, [])
   const { byType } = useCatalog()
-  const { can } = useAuth()
+  const { can, user } = useAuth()
   const readOnly = !can('workflow:write')
   const rf = useReactFlow()
   const [wf, setWf] = useState<Workflow | null>(null)
@@ -91,6 +96,12 @@ function EditorInner() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
   const updateInternals = useUpdateNodeInternals()
   const [dirty, setDirty] = useState(false)
+  const [ctxMenu, setCtxMenu] = useState<MenuTarget | null>(null)
+  const [panning, setPanning] = useState(false)
+  const pointer = useRef<{ x: number; y: number } | null>(null)
+  const placeAt = useRef<{ x: number; y: number } | null>(null)  // "Add node" from the canvas menu: drop it where you right-clicked
+  // Undo/redo: snapshots of the graph, committed once edits settle (a drag or a burst of typing = one step).
+  const history = useRef<{ past: string[]; future: string[]; last: string | null; timer?: number }>({ past: [], future: [], last: null })
   const [palette, setPalette] = useState<{ pending?: Pending } | null>(null)
   const [openNode, setOpenNode] = useState<string | null>(null)
   const [execRuns, setExecRuns] = useState<NodeRun[]>([])
@@ -113,10 +124,13 @@ function EditorInner() {
     let alive = true // ignore a superseded response (route change / StrictMode double effect)
     api.workflow(id).then((w) => {
       if (!alive) return
+      setPickerOwner(w.owner_id ?? null, w.owner_id === user?.id)
       setWf(w)
       setNodes(w.nodes.map((n) => toRF(n)))
       setEdges(w.edges.map(edgeToRF))
       setDirty(false)
+      history.current = { past: [], future: [], last: null }
+      scheduleCommit()
       requestAnimationFrame(() => {
         rf.fitView({ padding: 0.3, maxZoom: 1 })
         // Replacing nodes can drop React Flow's cached handle positions without a re-measure,
@@ -124,7 +138,8 @@ function EditorInner() {
         requestAnimationFrame(() => updateInternals(w.nodes.map((n) => n.id)))
       })
     }).catch((e) => toast(String(e), 'error'))
-    return () => { alive = false }
+    return () => { alive = false; setPickerOwner(undefined) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, rf, setEdges, setNodes, updateInternals])
 
   // ---- live execution events ---------------------------------------------
@@ -159,6 +174,9 @@ function EditorInner() {
             item_counts: ev.item_counts, error: ev.error, duration_ms: ev.duration_ms, finished_at: ev.finished_at, pinned: ev.pinned }
           return next
         })
+      } else if (ev.type === 'sub_run' && ev.node_id && ev.sub_run) {
+        // A model / tool / memory call inside an AI node: grows the log tree while the node runs.
+        setExecRuns((rs) => upsertSubRun(rs, ev.node_id!, ev.sub_run!))
       } else if (ev.type === 'node_waiting' && ev.node_id) {
         setExecRuns((rs) => rs.map((r) => (r.node_id === ev.node_id && r.status === 'running' ? { ...r, status: 'waiting' } : r)))
       } else if (ev.type === 'log') {
@@ -183,7 +201,10 @@ function EditorInner() {
   }, [])
 
   // Push run data into node components & edge labels.
-  const viewNodes = useMemo(() => nodes.map((n) => (n.data.run === runData[n.id] ? n : { ...n, data: { ...n.data, run: runData[n.id] } })), [nodes, runData])
+  // Sub-nodes (models, tools, memory) never run on their own: show what their AI node did with them.
+  const subStats = useMemo(() => subNodeStats(execRuns), [execRuns])
+  const viewNodes = useMemo(() => nodes.map((n) => (n.data.run === runData[n.id] && n.data.sub === subStats[n.id] ? n
+    : { ...n, data: { ...n.data, run: runData[n.id], sub: subStats[n.id] } })), [nodes, runData, subStats])
   const viewEdges = useMemo(() => edges.map((e) => {
     const c = runData[e.source]?.counts?.[e.sourceHandle ?? 'main']
     const tgt = runData[e.target]?.status
@@ -194,7 +215,47 @@ function EditorInner() {
   }), [edges, runData])
 
   // ---- graph editing -----------------------------------------------------
-  const markDirty = () => setDirty(true)
+  const snapshot = () => JSON.stringify({ nodes: fromRF(rf.getNodes() as RFNode[]), edges: edgesFromRF(rf.getEdges()) })
+  const commit = () => {
+    const h = history.current
+    window.clearTimeout(h.timer)
+    h.timer = undefined
+    const now = snapshot()
+    if (h.last === null) { h.last = now; return }
+    if (now === h.last) return
+    h.past.push(h.last)
+    if (h.past.length > 100) h.past.shift()
+    h.future = []
+    h.last = now
+  }
+  function scheduleCommit() {
+    window.clearTimeout(history.current.timer)
+    history.current.timer = window.setTimeout(commit, 350)
+  }
+  const markDirty = () => { setDirty(true); scheduleCommit() }
+  const restore = (state: string) => {
+    const s = JSON.parse(state) as { nodes: WFNode[]; edges: WFEdge[] }
+    setNodes(s.nodes.map((n) => toRF(n)))
+    setEdges(s.edges.map(edgeToRF))
+    history.current.last = state
+    setDirty(true)
+  }
+  const undo = () => {
+    commit()  // an edit still settling becomes its own step first
+    const h = history.current
+    const prev = h.past.pop()
+    if (prev === undefined || h.last === null) return toast('Nothing to undo')
+    h.future.push(h.last)
+    restore(prev)
+  }
+  const redo = () => {
+    commit()
+    const h = history.current
+    const next = h.future.pop()
+    if (next === undefined || h.last === null) return toast('Nothing to redo')
+    h.past.push(h.last)
+    restore(next)
+  }
   const currentNodes = () => fromRF(rf.getNodes() as RFNode[])
 
   const isValidConnection = useCallback((c: Connection | Edge) => {
@@ -231,7 +292,8 @@ function EditorInner() {
 
   const addNode = useCallback((spec: NodeTypeSpec, position?: { x: number; y: number }, pending?: Pending) => {
     const existing = currentNodes()
-    let pos = position ?? pending?.position
+    let pos = position ?? pending?.position ?? placeAt.current ?? undefined
+    placeAt.current = null
     const ins = pending?.insertEdge
     if (ins) {
       // n8n-style insert: place the node right after the source and push the target branch
@@ -364,14 +426,18 @@ function EditorInner() {
     if (saved) toast(saved.active ? 'Workflow activated' : 'Workflow deactivated')
   }
 
-  /** Add nodes/edges (pasted or imported) to the canvas with fresh ids, offset and selected. */
-  const insertGraph = (data: { nodes?: WFNode[]; edges?: WFEdge[] }) => {
+  /** Add nodes/edges (pasted or imported) to the canvas with fresh ids, selected. `at` = top-left of the group
+   *  in flow coordinates (paste at the mouse, like n8n); otherwise offset by 40 px from where they were. */
+  const insertGraph = (data: { nodes?: WFNode[]; edges?: WFEdge[] }, at?: { x: number; y: number }) => {
     if (!Array.isArray(data?.nodes)) return 0
     const existing = currentNodes()
     const idMap: Record<string, string> = {}
-    const pasted: WFNode[] = data.nodes.filter((n) => byType[n.type]).map((n) => {
+    const known = data.nodes.filter((n) => byType[n.type])
+    const minX = Math.min(...known.map((n) => n.position?.x ?? 0)), minY = Math.min(...known.map((n) => n.position?.y ?? 0))
+    const dx = at ? Math.round((at.x - minX) / 20) * 20 : 40, dy = at ? Math.round((at.y - minY) / 20) * 20 : 40
+    const pasted: WFNode[] = known.map((n) => {
       idMap[n.id] = newId()
-      const node = { ...n, id: idMap[n.id], name: uniqueName(n.name, existing), position: { x: (n.position?.x ?? 0) + 40, y: (n.position?.y ?? 0) + 40 } }
+      const node = { ...n, id: idMap[n.id], name: uniqueName(n.name, existing), position: { x: (n.position?.x ?? 0) + dx, y: (n.position?.y ?? 0) + dy } }
       existing.push(node)
       return node
     })
@@ -383,42 +449,140 @@ function EditorInner() {
     return pasted.length
   }
 
-  // ---- keyboard: save, copy/paste ------------------------------------------
+  // ---- selection, clipboard, layout ----------------------------------------
+  const selectedNodes = () => (rf.getNodes() as RFNode[]).filter((n) => n.selected)
+  /** Selected nodes + the connections between them: the clipboard format (also valid workflow JSON to import). */
+  const selectionData = (sel = selectedNodes()) => {
+    const ids = new Set(sel.map((n) => n.id))
+    return { nodes: fromRF(sel), edges: edgesFromRF(rf.getEdges().filter((x) => ids.has(x.source) && ids.has(x.target))) }
+  }
+  const pointerFlow = () => {
+    const el = document.querySelector('.canvas')?.getBoundingClientRect()
+    const pt = pointer.current
+    return el && pt && pt.x >= el.left && pt.x <= el.right && pt.y >= el.top && pt.y <= el.bottom ? rf.screenToFlowPosition(pt) : undefined
+  }
+  const deleteSelected = () => {
+    const ids = new Set(selectedNodes().map((n) => n.id))
+    if (!ids.size) return
+    setNodes((ns) => ns.filter((n) => !ids.has(n.id)))
+    setEdges((es) => es.filter((e) => !ids.has(e.source) && !ids.has(e.target)))
+    markDirty()
+  }
+  const copySelection = async (cut = false) => {
+    const sel = selectedNodes()
+    if (!sel.length) return
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(selectionData(sel), null, 2))
+      toast(`${cut ? 'Cut' : 'Copied'} ${sel.length} node${sel.length === 1 ? '' : 's'}`)
+      if (cut) deleteSelected()
+    } catch { toast('The browser blocked clipboard access. Use Ctrl+C instead.', 'error') }
+  }
+  const pasteFromClipboard = async (at?: { x: number; y: number }) => {
+    try {
+      const data = JSON.parse(await navigator.clipboard.readText())
+      const n = insertGraph(data, at)
+      if (!n) toast('The clipboard has no DebBuilder nodes', 'error')
+    } catch { toast('The clipboard has no DebBuilder nodes (or the browser blocked access: use Ctrl+V)', 'error') }
+  }
+  const duplicateSelected = () => {
+    const sel = selectedNodes()
+    if (sel.length) insertGraph(selectionData(sel))
+  }
+  const selectAll = () => setNodes((ns) => ns.map((n) => ({ ...n, selected: true })))
+  const toggleDisabled = (ids?: string[]) => {
+    const target = new Set(ids ?? selectedNodes().map((n) => n.id))
+    if (!target.size) return
+    const sel = (rf.getNodes() as RFNode[]).filter((n) => target.has(n.id) && n.type !== 'sticky')
+    const disable = sel.some((n) => !n.data.node.disabled)  // n8n: any enabled → disable all
+    setNodes((ns) => ns.map((n) => (target.has(n.id) && n.type !== 'sticky' ? { ...n, data: { ...n.data, node: { ...n.data.node, disabled: disable || undefined } } } : n)))
+    markDirty()
+  }
+  /** n8n "Tidy up": the selection when 2+ nodes are selected, otherwise the whole workflow. */
+  const tidy = () => {
+    const all = rf.getNodes() as RFNode[]
+    const sel = all.filter((n) => n.selected)
+    const scope = sel.length > 1 ? sel : all
+    if (scope.length < 2) return
+    const ids = new Set(scope.map((n) => n.id))
+    const moves = tidyUp(
+      scope.map((n) => ({ id: n.id, x: n.position.x, y: n.position.y, width: n.measured?.width ?? 92, height: n.measured?.height ?? 92, sticky: n.type === 'sticky' })),
+      rf.getEdges().filter((e) => ids.has(e.source) && ids.has(e.target)).map((e) => ({ source: e.source, target: e.target, ai: (e.targetHandle ?? '').startsWith('ai_') })),
+    )
+    setNodes((ns) => ns.map((n) => {
+      const m = moves[n.id]
+      if (!m) return n
+      const node = m.width ? { ...n.data.node, width: m.width, height: m.height } : n.data.node
+      return { ...n, position: { x: m.x, y: m.y }, data: { ...n.data, node }, ...(m.width ? { style: { ...n.style, width: m.width, height: m.height } } : {}) }
+    }))
+    markDirty()
+    if (sel.length <= 1) requestAnimationFrame(() => rf.fitView({ padding: 0.2, duration: 300, maxZoom: 1 }))
+  }
+  const addSticky = () => { const s = byType['ui.sticky']; if (s) addNode(s, pointerFlow()) }
+
+  // The listeners below are registered once per mode; they call the latest handlers through this ref.
+  const act = useRef({ run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
+    pointerFlow, selectionData, selectedNodes, save })
+  act.current = { run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
+    pointerFlow, selectionData, selectedNodes, save }
+  // ---- keyboard (n8n's canvas keymap), clipboard events ----------------------
   useEffect(() => {
-    const inField = (t: EventTarget | null) => t instanceof HTMLElement && (t.closest('input, textarea, select, .modal, .palette') !== null)
+    const inField = (t: EventTarget | null) => t instanceof HTMLElement && (t.closest('input, textarea, select, [contenteditable], .modal, .palette, .ndv') !== null)
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save().then(() => toast('Saved')) }
-      else if (e.key === 'Tab' && !inField(e.target)) { e.preventDefault(); setPalette({}) }
+      const mod = e.ctrlKey || e.metaKey
+      const k = e.key.toLowerCase()
+      if (mod && k === 's') { e.preventDefault(); act.current.save().then(() => toast('Saved')); return }
+      if (inField(e.target) || tab !== 'editor') return
+      if (e.key === ' ' && !e.repeat) setPanning(true)
+      if (mod && k === 'enter') { e.preventDefault(); act.current.run(); return }
+      if (mod && k === 'a') { e.preventDefault(); act.current.selectAll(); return }
+      if (e.key === '1' && !mod) { rf.fitView({ padding: 0.2, duration: 200 }); return }
+      if (e.key === '0' && !mod) { rf.zoomTo(1, { duration: 200 }); return }
+      if (readOnly) return
+      if (mod && k === 'z' && !e.shiftKey) { e.preventDefault(); act.current.undo(); return }
+      if ((mod && k === 'z' && e.shiftKey) || (mod && k === 'y')) { e.preventDefault(); act.current.redo(); return }
+      if (mod && k === 'd') { e.preventDefault(); act.current.duplicateSelected(); return }
+      if (e.shiftKey && e.altKey && e.code === 'KeyT') { e.preventDefault(); act.current.tidy(); return }
+      if (e.shiftKey && !mod && !e.altKey && k === 's') { e.preventDefault(); act.current.addSticky(); return }
+      if (!mod && !e.shiftKey && !e.altKey && k === 'd') { act.current.toggleDisabled(); return }
+      if (e.key === 'Tab') { e.preventDefault(); setPalette({}) }
     }
-    const onCopy = (e: ClipboardEvent) => {
-      if (inField(e.target)) return
-      const sel = (rf.getNodes() as RFNode[]).filter((n) => n.selected)
+    const onKeyUp = (e: KeyboardEvent) => { if (e.key === ' ') setPanning(false) }
+    const onCopy = (e: ClipboardEvent, cut = false) => {
+      if (inField(e.target) || tab !== 'editor') return
+      const sel = act.current.selectedNodes()
       if (!sel.length) return
-      const ids = new Set(sel.map((n) => n.id))
-      const data = { nodes: fromRF(sel), edges: edgesFromRF(rf.getEdges().filter((x) => ids.has(x.source) && ids.has(x.target))) }
-      e.clipboardData?.setData('text/plain', JSON.stringify(data, null, 2))
+      e.clipboardData?.setData('text/plain', JSON.stringify(act.current.selectionData(sel), null, 2))
       e.preventDefault()
-      toast(`Copied ${sel.length} node(s)`)
+      toast(`${cut ? 'Cut' : 'Copied'} ${sel.length} node${sel.length === 1 ? '' : 's'}`)
+      if (cut && !readOnly) act.current.deleteSelected()
     }
+    const onCut = (e: ClipboardEvent) => onCopy(e, true)
     const onPaste = (e: ClipboardEvent) => {
-      if (inField(e.target)) return
+      if (inField(e.target) || readOnly || tab !== 'editor') return
       try {
         const data = JSON.parse(e.clipboardData?.getData('text/plain') ?? '')
         if (!Array.isArray(data?.nodes)) return
         e.preventDefault()
-        insertGraph(data)
+        act.current.insertGraph(data, act.current.pointerFlow())
       } catch { /* not ours */ }
     }
+    const onBlur = () => setPanning(false)
     window.addEventListener('keydown', onKey)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', onBlur)
     window.addEventListener('copy', onCopy)
+    window.addEventListener('cut', onCut)
     window.addEventListener('paste', onPaste)
     return () => {
       window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', onBlur)
       window.removeEventListener('copy', onCopy)
+      window.removeEventListener('cut', onCut)
       window.removeEventListener('paste', onPaste)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [save, rf, byType])
+  }, [rf, readOnly, tab])
 
   if (!wf) return <div className="empty">Loading workflow…</div>
 
@@ -478,6 +642,7 @@ function EditorInner() {
         )}
         {crumbs.length > 0 && <span className="ed-crumb-sep hide-sm">/</span>}
         <input className="wf-name" value={wf.name} onChange={(e) => { setWf({ ...wf, name: e.target.value }); markDirty() }} />
+        <OwnerBadge item={wf} />
         <span className={`save-state ${dirty ? 'dirty' : ''}`} title={dirty ? 'Unsaved changes' : 'All changes saved'}><span className="btn-text">{dirty ? 'Unsaved changes' : 'All changes saved'}</span></span>
         <span className="spacer" />
         <div className="tabs ed-tabs" role="tablist">
@@ -513,7 +678,8 @@ function EditorInner() {
       {/* The editor stays mounted on the Executions tab so unsaved changes and the canvas view survive. */}
       <div className={`ed-pane ${tab === 'editor' ? '' : 'ed-hidden'}`}>
       <div className="canvas-wrap">
-        <div className="canvas" onDrop={onDrop} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}>
+        <div className={`canvas ${panning ? 'panning' : ''}`} onDrop={onDrop} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
+          onMouseMove={(e) => { pointer.current = { x: e.clientX, y: e.clientY } }}>
           <EdgeActionsCtx.Provider value={edgeActions}>
           <ReactFlow
             nodes={viewNodes} edges={viewEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
@@ -522,16 +688,49 @@ function EditorInner() {
             onConnect={connect} onConnectEnd={onConnectEnd} isValidConnection={isValidConnection}
             onNodeDoubleClick={(_, n) => setOpenNode(n.id)}
             onNodeClick={(_, n) => setLogFocus(n.id)}
-            deleteKeyCode={['Delete', 'Backspace']} multiSelectionKeyCode={['Control', 'Meta', 'Shift']}
-            defaultEdgeOptions={{ type: 'canvas' }} snapToGrid snapGrid={[20, 20]} minZoom={0.2} maxZoom={2}
+            deleteKeyCode={readOnly ? null : ['Delete', 'Backspace']} multiSelectionKeyCode={['Control', 'Meta', 'Shift']}
+            // n8n: drag on empty canvas = selection box; middle mouse (or Space + drag) pans; wheel pans, Ctrl/Cmd + wheel zooms.
+            selectionOnDrag={!panning} selectionMode={SelectionMode.Full} panOnDrag={panning ? [0, 1] : [1]} panOnScroll
+            zoomActivationKeyCode={['Control', 'Meta']} panActivationKeyCode={null}
+            onNodeContextMenu={(e, n) => {
+              e.preventDefault()
+              if (!n.selected) setNodes((ns) => ns.map((x) => ({ ...x, selected: x.id === n.id })))
+              setCtxMenu({ kind: 'nodes', x: e.clientX, y: e.clientY, ids: n.selected ? selectedNodes().map((x) => x.id) : [n.id] })
+            }}
+            onSelectionContextMenu={(e, sel) => { e.preventDefault(); setCtxMenu({ kind: 'nodes', x: e.clientX, y: e.clientY, ids: sel.map((x) => x.id) }) }}
+            onPaneContextMenu={(e) => { e.preventDefault(); setCtxMenu({ kind: 'pane', x: e.clientX, y: e.clientY, at: rf.screenToFlowPosition({ x: e.clientX, y: e.clientY }) }) }}
+            onPaneClick={() => setCtxMenu(null)}
+            onNodeDragStart={() => setCtxMenu(null)}
+            defaultEdgeOptions={{ type: 'canvas' }} snapToGrid snapGrid={[20, 20]} minZoom={0.1} maxZoom={2}
             proOptions={{ hideAttribution: true }}
           >
             <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} color="var(--canvas-dot)" />
-            <Controls showInteractive={false} />
+            <Controls showInteractive={false}>
+              <ControlButton onClick={() => rf.zoomTo(1, { duration: 200 })} title="Reset zoom (0)"><Icon name="scan-search" size={14} /></ControlButton>
+              {!readOnly && <>
+                <ControlButton onClick={tidy} title="Tidy up (Shift+Alt+T)"><Icon name="wand-sparkles" size={14} /></ControlButton>
+                <ControlButton onClick={undo} title="Undo (Ctrl+Z)"><Icon name="undo-2" size={14} /></ControlButton>
+                <ControlButton onClick={redo} title="Redo (Ctrl+Shift+Z)"><Icon name="redo-2" size={14} /></ControlButton>
+              </>}
+            </Controls>
             <MiniMap pannable zoomable nodeColor={(n) => byType[(n.data as FlowNodeData).node.type]?.color ?? '#999'} />
           </ReactFlow>
           </EdgeActionsCtx.Provider>
 
+          {!readOnly && (
+            <SelectionToolbar count={nodes.filter((n) => n.selected).length} onCopy={() => copySelection()} onDuplicate={duplicateSelected}
+              onTidy={tidy} onDisable={() => toggleDisabled()} onDelete={deleteSelected} />
+          )}
+          {ctxMenu && (
+            <CanvasContextMenu target={ctxMenu} readOnly={readOnly} onClose={() => setCtxMenu(null)}
+              nodeCount={nodes.length} disabledAll={ctxMenu.kind === 'nodes' && nodes.filter((n) => ctxMenu.ids.includes(n.id) && n.type !== 'sticky').every((n) => n.data.node.disabled)}
+              actions={{
+                open: (id) => setOpenNode(id), execute: (id) => run(id), copy: () => copySelection(), cut: () => copySelection(true),
+                duplicate: duplicateSelected, toggleDisabled: (ids) => toggleDisabled(ids), remove: deleteSelected, tidy, selectAll,
+                paste: (at) => pasteFromClipboard(at), addNode: (at) => { placeAt.current = at; setPalette({}) }, addSticky: (at) => { const s = byType['ui.sticky']; if (s) addNode(s, at) },
+                fitView: () => rf.fitView({ padding: 0.2, duration: 200 }),
+              }} />
+          )}
           {nodes.length === 0 && (
             <div className="empty-canvas">
               <div>
@@ -610,7 +809,7 @@ function EditorInner() {
           }} />
       )}
       {dialog === 'move' && (
-        <MoveDialog title={`Move "${wf.name}"`} folders={folders} current={wf.folder_id ?? null} onClose={() => setDialog(null)}
+        <MoveDialog title={`Move "${wf.name}"`} folders={folders.filter((f) => f.owner_id === wf.owner_id)} current={wf.folder_id ?? null} onClose={() => setDialog(null)}
           onPick={async (folderId) => {
             const saved = await api.updateWorkflow(wf.id, { folder_id: folderId })
             setWf((w) => (w ? { ...w, folder_id: saved.folder_id } : w))
@@ -624,6 +823,14 @@ function EditorInner() {
     </div>
   )
 }
+
+const STATE_REDUCERS = [
+  { label: 'Replace: last write wins', value: 'replace' },
+  { label: 'Append: add to a list', value: 'append' },
+  { label: 'Add: sum numbers (counters)', value: 'add' },
+  { label: 'Merge: combine objects', value: 'merge' },
+  { label: 'Messages: chat history', value: 'messages' },
+]
 
 function SettingsModal({ wf, onChange, onClose, onDelete }: { wf: Workflow; onChange: (w: Workflow) => void; onClose: () => void; onDelete: () => void }) {
   return (
@@ -640,6 +847,16 @@ function SettingsModal({ wf, onChange, onClose, onDelete }: { wf: Workflow; onCh
           <PropertyField spec={{ name: 'variables', label: 'Variables ($vars.key)', type: 'collection', default: [], fields: [
             { name: 'key', label: 'Key', type: 'string', default: '' }, { name: 'value', label: 'Value', type: 'string', default: '' }] }}
             value={wf.settings.variables ?? []} onChange={(v) => onChange({ ...wf, settings: { ...wf.settings, variables: v as { key: string; value: string }[] } })} />
+          <PropertyField spec={{ name: 'state', label: 'State ($state.key)', type: 'collection', default: [],
+            description: 'LangGraph graph state: shared by every node, kept across loops and Human Approval pauses. '
+              + 'Each key has a reducer that decides how writes combine. Write it with the Update State node, set_state() in Code, '
+              + 'or an AI Agent\'s "Conversation in state key".',
+            fields: [
+              { name: 'key', label: 'Key', type: 'string', default: '' },
+              { name: 'reducer', label: 'Reducer', type: 'options', default: 'replace', options: STATE_REDUCERS },
+              { name: 'default', label: 'Initial value (JSON)', type: 'string', default: '', placeholder: '[] · 0 · "" · {}' },
+            ] }}
+            value={wf.settings.state ?? []} onChange={(v) => onChange({ ...wf, settings: { ...wf.settings, state: v as StateKey[] } })} />
           <p className="muted small">Workflow ID: <code>{wf.id}</code></p>
         </div>
         <div className="modal-foot">

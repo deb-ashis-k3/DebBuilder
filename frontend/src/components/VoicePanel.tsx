@@ -1,14 +1,36 @@
 import '@livekit/components-styles'
 import {
-  BarVisualizer, LiveKitRoom, RoomAudioRenderer, VoiceAssistantControlBar, useTranscriptions, useVoiceAssistant,
+  BarVisualizer, LiveKitRoom, RoomAudioRenderer, VoiceAssistantControlBar, useRoomContext, useTranscriptions, useVoiceAssistant,
 } from '@livekit/components-react'
 import { useState } from 'react'
 import { api } from '../api'
 import { Icon, toast } from '../lib'
 
+const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
+const DTMF_CODE: Record<string, number> = { '*': 10, '#': 11 }
+
+/** Phone keypad: sends real DTMF tones, so IVR menus ("press 1 for sales") can be tested in the browser. */
+function Keypad() {
+  const room = useRoomContext()
+  const [sent, setSent] = useState('')
+  const press = async (k: string) => {
+    try {
+      await room.localParticipant.publishDtmf(DTMF_CODE[k] ?? Number(k), k)
+      setSent((s) => (s + k).slice(-16))
+    } catch (e) { toast(String(e), 'error') }
+  }
+  return (
+    <div className="keypad">
+      <div className="keypad-sent">{sent || 'Keypad'}</div>
+      <div className="keypad-grid">{KEYS.map((k) => <button key={k} className="btn" onClick={() => press(k)}>{k}</button>)}</div>
+    </div>
+  )
+}
+
 function Stage() {
   const { state, audioTrack } = useVoiceAssistant()
   const transcripts = useTranscriptions()
+  const [pad, setPad] = useState(false)
   return (
     <div className="voice-stage">
       <div className="voice-viz">
@@ -16,6 +38,8 @@ function Stage() {
       </div>
       <div className="voice-state">{state}</div>
       <VoiceAssistantControlBar controls={{ leave: false }} />
+      <button className="btn sm ghost" onClick={() => setPad(!pad)}><Icon name="grid-3x3" size={14} /> {pad ? 'Hide keypad' : 'Keypad (DTMF)'}</button>
+      {pad && <Keypad />}
       <div className="chat-log" style={{ width: '100%', maxHeight: 340 }}>
         {transcripts.slice(-30).map((t) => {
           const isAgent = t.participantInfo.identity.startsWith('agent')

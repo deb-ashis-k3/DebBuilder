@@ -54,6 +54,14 @@ def _opt(kwargs: dict, **extra) -> dict:
     return {**kwargs, **{k: v for k, v in extra.items() if v not in (None, "")}}
 
 
+def model_name(ctx: NodeContext, p: dict) -> str:
+    """The node's model; never fall back to a library default the provider may not serve."""
+    m = str(p.get("model") or "").strip()
+    if not m:
+        raise NodeError("Pick a model: select the credential, then choose one under Model (or type it with By ID)", ctx.name)
+    return m
+
+
 async def _openai(ctx: NodeContext):
     from langchain_openai import ChatOpenAI
 
@@ -61,7 +69,7 @@ async def _openai(ctx: NodeContext):
     p = ctx.params()
     return ChatOpenAI(**_opt(
         # Local OpenAI-compatible servers often need no key, but the client requires one.
-        {"model": p["model"], "api_key": cred.get("api_key") or "not-needed", "streaming": True},
+        {"model": model_name(ctx, p), "api_key": cred.get("api_key") or "not-needed", "streaming": True},
         base_url=cred.get("base_url"), organization=cred.get("organization"),
         temperature=p.get("temperature"), max_tokens=p.get("max_tokens"),
     ))
@@ -73,7 +81,7 @@ async def _anthropic(ctx: NodeContext):
     _, cred = await ctx.credential()
     p = ctx.params()
     return ChatAnthropic(**_opt(
-        {"model": p["model"], "api_key": cred["api_key"], "streaming": True,
+        {"model": model_name(ctx, p), "api_key": cred["api_key"], "streaming": True,
          "max_tokens": int(p.get("max_tokens") or 4096)},
         temperature=p.get("temperature"),
     ))
@@ -85,7 +93,7 @@ async def _gemini(ctx: NodeContext):
     _, cred = await ctx.credential()
     p = ctx.params()
     return ChatGoogleGenerativeAI(**_opt(
-        {"model": p["model"], "google_api_key": cred["api_key"]},
+        {"model": model_name(ctx, p), "google_api_key": cred["api_key"]},
         temperature=p.get("temperature"), max_output_tokens=p.get("max_tokens"),
     ))
 
@@ -95,24 +103,22 @@ async def _ollama(ctx: NodeContext):
 
     _, cred = await ctx.credential()
     p = ctx.params()
-    return ChatOllama(**_opt({"model": p["model"], "base_url": cred.get("base_url")},
+    return ChatOllama(**_opt({"model": model_name(ctx, p), "base_url": cred.get("base_url")},
                              temperature=p.get("temperature"), num_predict=p.get("max_tokens")))
 
 
-for _type, _label, _cred, _default, _options, _fn in [
-    ("model.openai", "OpenAI Chat Model", "openai", "gpt-5-mini",
-     ["gpt-5.5", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4o-mini"], _openai),
-    ("model.anthropic", "Anthropic Chat Model", "anthropic", "claude-sonnet-5-5",
-     ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"], _anthropic),
-    ("model.gemini", "Google Gemini Chat Model", "google_genai", "gemini-2.5-flash",
-     ["gemini-3.1-pro", "gemini-2.5-pro", "gemini-2.5-flash"], _gemini),
-    ("model.ollama", "Ollama Chat Model", "ollama", "llama3.2", ["llama3.2", "qwen3", "mistral"], _ollama),
+# Models are listed live from the provider through the node's credential (no built-in names).
+for _type, _label, _cred, _fn in [
+    ("model.openai", "OpenAI Chat Model", "openai", _openai),
+    ("model.anthropic", "Anthropic Chat Model", "anthropic", _anthropic),
+    ("model.gemini", "Google Gemini Chat Model", "google_genai", _gemini),
+    ("model.ollama", "Ollama Chat Model", "ollama", _ollama),
 ]:
     register(NodeType(
         type=_type, label=_label, icon="brain", description=f"{_label} for AI nodes.",
         properties=[
             prop("credential", "Credential", "credential", None, credential_types=[_cred], required=True),
-            prop("model", "Model", "combo", _default, options=_options, required=True),
+            prop("model", "Model", "combo", "", required=True, load_options="models"),
             *MODEL_COMMON,
         ],
         provides="ai_model", supply=_fn, **SUB_MODEL,
@@ -449,13 +455,32 @@ def _json_schema(fields: list[dict]) -> dict | None:
     return {"title": "Output", "type": "object", "properties": props, "required": required}
 
 
+def state_history(msgs: Any) -> list[BaseMessage]:
+    """Chat messages kept in graph state ({role, content}) as LangChain messages."""
+    kinds = {"human": HumanMessage, "user": HumanMessage, "ai": AIMessage, "assistant": AIMessage, "system": SystemMessage}
+    out: list[BaseMessage] = []
+    for m in msgs if isinstance(msgs, list) else []:
+        if isinstance(m, dict) and str(m.get("content") or "").strip():
+            out.append(kinds.get(m.get("role"), HumanMessage)(str(m["content"])))
+    return out
+
+
 async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_iterations: int = 10,
-                    output_fields: list | None = None, memory=None) -> dict:
+                    output_fields: list | None = None, memory=None, state_messages: str | None = None) -> dict:
+    """`state_messages`: a graph-state key holding the conversation (LangGraph's MessagesState):
+    read as history, and this turn is appended to it."""
     model = await ctx.require_model(i)
     tools = await collect_tools(ctx, i)
     schema = _json_schema(output_fields or [])
     agent = create_agent(model, tools, system_prompt=system or None, response_format=schema)
-    history = await memory.load() if memory else []
+    history = []
+    if memory:  # logged like n8n: the memory node shows what it loaded and saved
+        step = ctx.start_sub_run(memory, "memory", "load", {"action": "loadMemoryVariables", "session_key": memory.session_key,
+                                                            "window": memory.window})
+        history = await memory.load()
+        ctx.end_sub_run(step, output={"chat_history": [{"role": m.type, "content": message_text(m)} for m in history]})
+    if state_messages:
+        history = [*history, *state_history(ctx.state.get(state_messages))]
     config: dict = {"recursion_limit": max_iterations * 2 + 1}
     if cbs := ctx.callbacks():  # empty for sub-agents: they inherit the parent's handlers
         config["callbacks"] = cbs
@@ -470,8 +495,15 @@ async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_i
                 res = by_id.get(tc.get("id"))
                 steps.append({"tool": tc["name"], "input": tc.get("args"),
                               "output": message_text(res)[:2000] if res else None})
+    if state_messages:
+        ctx.set_state(state_messages, [{"role": "human", "content": prompt},
+                                       {"role": "ai", "content": answer if isinstance(answer, str) else json.dumps(answer)}],
+                      "messages")
     if memory:
+        step = ctx.start_sub_run(memory, "memory", "save", {"action": "saveContext", "session_key": memory.session_key,
+                                                            "input": prompt, "output": answer})
         await memory.save(prompt, answer)
+        ctx.end_sub_run(step, output={"saved": 2})
     out: dict = {"output": answer}
     if schema and result.get("structured_response") is not None:
         sr = result["structured_response"]
@@ -492,7 +524,10 @@ async def _agent(ctx: NodeContext):
         res = await run_agent(ctx, i, str(prompt), p.get("system_message") or "",
                               max_iterations=int(p.get("max_iterations") or 10),
                               output_fields=ctx.raw_params.get("output_fields") if p.get("structured") else None,
-                              memory=memories[0] if memories else None)
+                              memory=memories[0] if memories else None,
+                              state_messages=str(p.get("state_messages") or "").strip() or None)
+        if str(p.get("output_state_key") or "").strip():
+            ctx.set_state(str(p["output_state_key"]).strip(), res["output"])
         if not p.get("include_steps"):
             res.pop("steps", None)
         out.append({**({"input": item} if p.get("keep_input") else {}), **res})
@@ -506,6 +541,11 @@ AGENT_PROPS = [
     prop("structured", "Require structured output", "boolean", False),
     prop("output_fields", "Output fields", "collection", [], fields=PARAM_FIELDS, show_if={"structured": [True]}),
     prop("include_steps", "Include tool steps in output", "boolean", False),
+    prop("state_messages", "Conversation in state key", "string", "", placeholder="messages",
+         description="LangGraph MessagesState: read the conversation from this graph-state key and append this turn to it, "
+                     "so loops and later agents see the whole history. Declare it in Settings → State with the 'messages' reducer."),
+    prop("output_state_key", "Save output to state key", "string", "", placeholder="draft",
+         description="Also write the answer to this graph-state key (using its reducer)."),
     prop("keep_input", "Keep input item under 'input'", "boolean", False),
 ]
 

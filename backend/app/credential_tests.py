@@ -266,6 +266,17 @@ async def _ftp(d, _id, **_):
     return ok("FTP login successful")
 
 
+@tester("ssh")
+async def _ssh(d, _id, **_):
+    import asyncssh
+
+    from .nodes.files import _ssh_opts
+
+    async with asyncssh.connect(**_ssh_opts(d)) as conn:
+        r = await conn.run("echo ok", check=False, timeout=15)
+    return ok(f"SSH login successful{' (shell available)' if str(r.stdout).strip() == 'ok' else ''}")
+
+
 @tester("livekit")
 async def _livekit(d, _id, **_):
     from livekit import api

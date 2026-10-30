@@ -154,10 +154,65 @@ register(NodeType(
 ))
 
 # ---------------------------------------------------------------------------
+# Update State (graph state, see engine/state.py)
+# ---------------------------------------------------------------------------
+
+STATE_REDUCER_OPTIONS = [
+    {"label": "Key's reducer (Settings → State)", "value": ""},
+    {"label": "Replace", "value": "replace"},
+    {"label": "Append to list", "value": "append"},
+    {"label": "Add (number)", "value": "add"},
+    {"label": "Merge object", "value": "merge"},
+    {"label": "Add chat messages", "value": "messages"},
+]
+
+
+async def _update_state(ctx: NodeContext):
+    from ..engine.state import apply_updates, public
+
+    rows = ctx.raw_params.get("updates") or []
+    each = ctx.param("mode") == "each"
+    for i in range(len(ctx.items) if each else 1):
+        for row in rows:
+            key = str(ctx.eval(row.get("key") or "", i) or "").strip()
+            if not key:
+                continue
+            value = _cast(ctx.eval(row.get("value"), i), row.get("type") or "auto")
+            ctx.set_state(key, value, row.get("reducer") or None)
+    if ctx.param("output") == "state":
+        return {"main": [public(apply_updates(ctx.graph_state, ctx.state_updates))]}
+    return {"main": ctx.items}
+
+
+register(NodeType(
+    type="flow.state", label="Update State", icon="database-zap",
+    description="Write the workflow's graph state ($state): counters, lists, drafts, chat messages. "
+                "Each key combines writes with its reducer, like LangGraph.",
+    properties=[
+        prop("updates", "State updates", "collection", [{"key": "", "value": "", "reducer": "", "type": "auto"}], fields=[
+            prop("key", "Key"),
+            prop("value", "Value", "string", "", placeholder="{{ $json.output }}"),
+            prop("reducer", "How to combine", "options", "", options=STATE_REDUCER_OPTIONS),
+            prop("type", "Type", "options", "auto", options=["auto", "string", "number", "boolean", "json"]),
+        ]),
+        prop("mode", "Run", "options", "once", options=[
+            {"label": "Once (first item)", "value": "once"},
+            {"label": "For each item", "value": "each"},
+        ]),
+        prop("output", "Output", "options", "items", options=[
+            {"label": "Input items (pass through)", "value": "items"},
+            {"label": "The state after this update", "value": "state"},
+        ]),
+    ],
+    execute=_update_state, **FLOW,
+))
+
+# ---------------------------------------------------------------------------
 # Code (Python)
 # ---------------------------------------------------------------------------
 
 DEFAULT_CODE = """# `items` is a list of dicts (all input items).
+# Graph state: read `state["key"]`, write `set_state("key", value)` (uses the key's reducer).
 # Return a list of dicts (or a single dict).
 for item in items:
     item["processed"] = True
@@ -183,6 +238,7 @@ async def _code(ctx: NodeContext):
         "httpx": httpx, "asyncio": asyncio, "print": _print,
         "node": lambda name: ctx.run.outputs_by_name().get(name, []),
         "vars": ctx.run.meta.get("vars", {}), "execution_id": ctx.run.execution_id,
+        "state": copy.deepcopy(ctx.state), "set_state": ctx.set_state,
     }
     src = "async def __user_fn(items, item, index):\n" + textwrap.indent(code, "    ")
     try:
@@ -298,6 +354,16 @@ async def http_call(ctx: NodeContext, i: int) -> dict | list:
     if resp.status_code >= 400 and not p.get("never_error"):
         raise NodeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
     fmt = p.get("response_format", "auto")
+    if fmt == "file":
+        import re as _re
+        from urllib.parse import unquote, urlparse
+
+        cd = resp.headers.get("content-disposition") or ""
+        m = _re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
+        name = unquote(m.group(1)) if m else (urlparse(str(resp.url)).path.rsplit("/", 1)[-1] or "file")
+        ref = ctx.put_file(resp.content, name, (resp.headers.get("content-type") or "").split(";")[0] or None)
+        out = {"binary": {p.get("binary_property") or "data": ref}}
+        return {"status": resp.status_code, "headers": dict(resp.headers), **out} if p.get("full_response") else out
     data = None
     if fmt in ("auto", "json"):
         try:
@@ -336,7 +402,8 @@ HTTP_PROPS = [
     prop("body_type", "Body", "options", "none", options=["none", "json", "form", "raw"]),
     prop("body", "Body content", "json", "", show_if={"body_type": ["json", "raw"]}),
     prop("form", "Form fields", "collection", [], fields=KV, show_if={"body_type": ["form"]}),
-    prop("response_format", "Response format", "options", "auto", options=["auto", "json", "text"]),
+    prop("response_format", "Response format", "options", "auto", options=["auto", "json", "text", "file"]),
+    prop("binary_property", "Put the file in binary property", "string", "data", show_if={"response_format": ["file"]}),
     prop("split_list", "Split array response into items", "boolean", True),
     prop("full_response", "Include status & headers", "boolean", False),
     prop("never_error", "Never error on 4xx/5xx", "boolean", False),
@@ -474,18 +541,20 @@ register(NodeType(
 
 
 async def _loop(ctx: NodeContext):
-    state = ctx.run.__dict__.setdefault("_loop_state", {})
-    nid = ctx.node["id"]
+    # The cursor lives in graph state (an internal key), so it's checkpointed: a loop whose body
+    # pauses for Human Approval / Wait continues where it was after the resume.
+    key = f"__loop:{ctx.node['id']}"
     size = max(1, int(ctx.param("batch_size") or 1))
-    st = state.get(nid)
+    st = copy.deepcopy(ctx.graph_state.get(key))
     if st is None:
-        st = state[nid] = {"queue": list(ctx.items), "done": []}
+        st = {"queue": list(ctx.items), "done": []}
     else:
         st["done"].extend(ctx.items)
     if st["queue"]:
         batch, st["queue"] = st["queue"][:size], st["queue"][size:]
+        ctx.set_state(key, st, "replace")
         return {"loop": batch, "done": []}
-    state.pop(nid, None)
+    ctx.set_state(key, None, "replace")
     return {"loop": [], "done": st["done"]}
 
 
@@ -711,7 +780,12 @@ register(NodeType(
 async def run_subworkflow(ctx: NodeContext, workflow_id: str, items: list[dict]) -> list[dict]:
     from ..engine.runtime import execute_workflow, load_workflow
 
-    wf = await load_workflow(workflow_id)
+    try:
+        wf = await load_workflow(workflow_id)
+    except ValueError as e:
+        raise NodeError(str(e)) from e
+    if wf["owner_id"] != ctx.run.meta.get("owner_id"):  # same answer as a missing id: don't reveal it exists
+        raise NodeError(f"Workflow {workflow_id} not found")
     res = await execute_workflow(wf, trigger_type="trigger.subworkflow", items=items, mode="subworkflow") \
         if any(n["type"] == "trigger.subworkflow" for n in wf["nodes"]) \
         else await execute_workflow(wf, items=items, mode="subworkflow")

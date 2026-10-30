@@ -83,8 +83,13 @@ T("qdrant", "Qdrant", AI, color="#dc244c", fields=[F("url", "URL", placeholder="
 VOICE = "Voice & Speech"
 T("livekit", "LiveKit", VOICE, color="#ff4f2c", docs="https://cloud.livekit.io",
   fields=[F("url", "Server URL", placeholder="wss://your-project.livekit.cloud"), F("api_key", "API Key"),
-          KEY("API Secret", "api_secret"), F("sip_trunk_id", "Outbound SIP Trunk ID", required=False)],
+          KEY("API Secret", "api_secret"), F("sip_trunk_id", "Outbound SIP Trunk ID", required=False),
+          F("sip_uri", "SIP URI (for inbound calls)", required=False, placeholder="xxxxxxxx.sip.livekit.cloud",
+            help="Project settings → SIP URI in LiveKit Cloud. Carriers (Plivo, Twilio…) send inbound calls here.")],
   test={"custom": "livekit"})
+T("plivo", "Plivo", VOICE, color="#43b049", docs="https://console.plivo.com/dashboard/",
+  fields=[F("auth_id", "Auth ID"), KEY("Auth Token", "auth_token")],
+  auth={"basic": ["{auth_id}", "{auth_token}"]}, test={"url": "https://api.plivo.com/v1/Account/{auth_id}/"})
 T("deepgram", "Deepgram (STT/TTS)", VOICE, color="#13ef93", fields=[KEY()],
   auth={"headers": {"Authorization": "Token {api_key}"}}, test={"url": "https://api.deepgram.com/v1/projects"})
 T("elevenlabs", "ElevenLabs (TTS)", VOICE, color="#000000", fields=[KEY()],
@@ -307,6 +312,13 @@ T("ftp", "FTP", CLOUD, color="#64748b",
   fields=[F("host", "Host"), F("port", "Port", "number", default=21), F("username", "Username", default="anonymous"),
           KEY("Password", "password", required=False), F("tls", "FTPS (TLS)", "boolean", default=False)],
   test={"custom": "ftp"})
+T("ssh", "SSH / SFTP", CLOUD, color="#334155",
+  fields=[F("host", "Host"), F("port", "Port", "number", default=22), F("username", "Username"),
+          KEY("Password", "password", required=False),
+          F("private_key", "Private key (PEM / OpenSSH)", "textarea", secret=True, required=False,
+            help="Use a password, a private key, or both"),
+          KEY("Key passphrase", "passphrase", required=False)],
+  test={"custom": "ssh"})
 
 # ---------------------------------------------------------------------------
 # Search & data

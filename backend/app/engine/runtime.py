@@ -12,6 +12,8 @@ Semantics:
   `resume` continues from the Postgres checkpoint.
 - Sub-nodes (models, memory, tools) never run in the flow; their parent node
   instantiates them via `ctx.supply()`.
+- Graph state (`$state`, see engine/state.py) is a LangGraph channel with per-key reducers:
+  checkpointed with the run, combined across parallel branches at each step.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from ..config import get_settings
 from ..db import Execution, SessionLocal, Workflow
 from ..nodes import get_type
 from ..nodes.base import NodeContext, NodeError
+from . import state as gstate
 from .bus import bus
 
 log = logging.getLogger("debbuilder.runtime")
@@ -62,6 +65,8 @@ class WFState(TypedDict, total=False):
     outputs: Annotated[dict, _merge]
     trigger_items: list
     steps: Annotated[int, operator.add]
+    # The workflow's graph state; nodes write {key: [reducer, value]} updates.
+    state: Annotated[dict, gstate.apply_updates]
 
 
 def _now() -> datetime:
@@ -93,9 +98,50 @@ def _clip(v: Any, n: int = 4000) -> Any:
     return s if len(s) <= n else s[:n] + "…"
 
 
+# Sub-run payload limits: generous enough to show whole prompts (n8n shows them in full) without
+# letting one runaway tool result bloat the execution row.
+SUB_TEXT_MAX = 30_000
+SUB_MESSAGES_MAX = 200
+
+
+def _text(content: Any) -> str:
+    """Message content as text (providers may return a list of content parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p if isinstance(p, str) else str(p.get("text") or p.get("content") or "") if isinstance(p, dict) else str(p)
+                         for p in content)
+    return "" if content is None else str(content)
+
+
+def _message(m: Any) -> dict:
+    out = {"role": getattr(m, "type", "?"), "content": _clip(_text(getattr(m, "content", m)), SUB_TEXT_MAX)}
+    if getattr(m, "tool_calls", None):
+        out["tool_calls"] = [{"name": t.get("name"), "args": _jsonable(t.get("args"))} for t in m.tool_calls]
+    if getattr(m, "type", None) == "tool":
+        out["name"] = getattr(m, "name", None)
+    return out
+
+
+def _payload(v: Any) -> Any:
+    """Structured tool arguments stay structured (shown as JSON); anything huge becomes clipped text."""
+    v = _jsonable(v)
+    if isinstance(v, str):
+        return _clip(v, SUB_TEXT_MAX)
+    return v if len(json.dumps(v, default=str)) <= SUB_TEXT_MAX else _clip(v, SUB_TEXT_MAX)
+
+
+def public_sub_run(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if not k.startswith("_")}
+
+
 class TokenStreamer(AsyncCallbackHandler):
-    """Streams LLM tokens to the execution channel and records every LLM / tool
-    call as a 'sub-run' (n8n's AI logs view)."""
+    """Streams LLM tokens to the execution channel and records every LLM / tool call (and memory
+    steps reported by nodes) as a 'sub-run': the n8n-style log tree under the node.
+
+    Each sub-run has an `id` and a `parent` (the tool call it happened inside: a sub-agent's model
+    calls sit under that agent's tool call) and names the canvas node it came from (supply() tags
+    models and tools with `db_node_*` metadata)."""
 
     def __init__(self, ctx: NodeContext, stream: bool = True):
         self.ctx = ctx
@@ -103,34 +149,62 @@ class TokenStreamer(AsyncCallbackHandler):
         self.parents: dict[str, str | None] = {}
         self.open: dict[str, dict] = {}
 
-    def _depth(self, run_id, parent_run_id) -> int:
+    def _parent(self, run_id, parent_run_id) -> str | None:
         self.parents[str(run_id)] = str(parent_run_id) if parent_run_id else None
-        depth, cur = 0, self.parents.get(str(run_id))
-        while cur:
-            if cur in self.open and self.open[cur]["type"] == "tool":
-                depth += 1
+        cur = self.parents.get(str(run_id))
+        while cur and cur not in self.open:
             cur = self.parents.get(cur)
-        return depth
+        return cur
 
-    def _start(self, run_id, parent_run_id, entry: dict) -> None:
-        entry.update(depth=self._depth(run_id, parent_run_id), started_at=_now().isoformat(), status="running",
-                     _t0=time.perf_counter())
-        self.open[str(run_id)] = entry
+    def _publish(self, entry: dict) -> None:
+        self.ctx.publish({"type": "sub_run", "sub_run": _jsonable(public_sub_run(entry))})
+
+    def _add(self, entry: dict, parent: str | None) -> dict:
+        entry.update(parent=parent, depth=(self.open[parent]["depth"] + 1) if parent in self.open else 0,
+                     started_at=_now().isoformat(), status="running", _t0=time.perf_counter())
+        self.open[entry["id"]] = entry
         self.ctx.sub_runs.append(entry)
+        self._publish(entry)
+        return entry
+
+    def _start(self, run_id, parent_run_id, entry: dict, kw: dict) -> None:
+        md = kw.get("metadata") or {}
+        node = {"node_id": md.get("db_node_id"), "node_name": md.get("db_node_name"), "node_type": md.get("db_node_type")}
+        self._add({"id": str(run_id), **{k: v for k, v in node.items() if v}, **entry}, self._parent(run_id, parent_run_id))
 
     def _end(self, run_id, **fields) -> None:
         entry = self.open.get(str(run_id))
         if entry:
             entry.update(fields, duration_ms=int((time.perf_counter() - entry.pop("_t0", time.perf_counter())) * 1000))
+            self._publish(entry)
 
+    # ---- steps nodes report themselves (memory load / save …) -------------
+    def manual_start(self, entry: dict, inside_node: str | None = None) -> dict:
+        """`inside_node`: a sub-node (e.g. an Agent Tool) whose running tool call this step belongs under."""
+        parent = None
+        if inside_node:
+            parent = next((e["id"] for e in reversed(self.ctx.sub_runs)
+                           if e.get("node_id") == inside_node and e["type"] == "tool" and e["status"] == "running"), None)
+        node = {k.removeprefix("db_"): entry.pop(k) for k in ("db_node_id", "db_node_name", "db_node_type") if k in entry}
+        entry["input"] = _payload(entry.get("input"))
+        entry.setdefault("name", node.get("node_name") or entry.get("action") or entry["type"])
+        return self._add({"id": uuid.uuid4().hex, **node, **entry}, parent)
+
+    def manual_end(self, entry: dict, **fields) -> None:
+        if "output" in fields:
+            fields["output"] = _payload(fields["output"])
+        self._end(entry["id"], status=fields.pop("status", "success"), **fields)
+
+    # ---- LangChain callbacks ----------------------------------------------
     async def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, **kw) -> None:
         self.parents[str(run_id)] = str(parent_run_id) if parent_run_id else None
 
     async def on_chat_model_start(self, serialized, messages, *, run_id, parent_run_id=None, **kw) -> None:
         params = kw.get("invocation_params") or {}
         model = params.get("model") or params.get("model_name") or (serialized or {}).get("kwargs", {}).get("model") or "LLM"
-        msgs = [{"role": getattr(m, "type", "?"), "content": _clip(getattr(m, "content", m), 1500)} for m in (messages[0] if messages else [])]
-        self._start(run_id, parent_run_id, {"type": "llm", "name": str(model), "input": msgs[-12:]})
+        msgs = [_message(m) for m in (messages[0] if messages else [])][-SUB_MESSAGES_MAX:]
+        name = (kw.get("metadata") or {}).get("db_node_name") or str(model)
+        self._start(run_id, parent_run_id, {"type": "llm", "name": name, "model": str(model), "input": msgs}, kw)
 
     async def on_llm_new_token(self, token: str, **kwargs) -> None:
         if self.stream and isinstance(token, str) and token:
@@ -140,26 +214,43 @@ class TokenStreamer(AsyncCallbackHandler):
         gen = response.generations[0][0] if response.generations and response.generations[0] else None
         msg = getattr(gen, "message", None)
         usage = getattr(msg, "usage_metadata", None) or (response.llm_output or {}).get("token_usage") or {}
-        out: dict = {"text": _clip(getattr(gen, "text", "") or "")}
+        out: dict = {"text": _clip(getattr(gen, "text", "") or "", SUB_TEXT_MAX)}
         if msg is not None and getattr(msg, "tool_calls", None):
-            out["tool_calls"] = [{"name": t["name"], "args": t.get("args")} for t in msg.tool_calls]
+            out["tool_calls"] = [{"name": t["name"], "args": _jsonable(t.get("args"))} for t in msg.tool_calls]
+        meta = getattr(msg, "response_metadata", None) or {}
+        fields = {}
+        if meta.get("model_name") or meta.get("model"):
+            fields["model"] = str(meta.get("model_name") or meta.get("model"))  # the model that actually answered
         self._end(run_id, status="success", output=out, tokens={
             "input": usage.get("input_tokens") or usage.get("prompt_tokens"),
             "output": usage.get("output_tokens") or usage.get("completion_tokens"),
             "total": usage.get("total_tokens"),
-        })
+        }, **fields)
 
     async def on_llm_error(self, error, *, run_id, **kw) -> None:
         self._end(run_id, status="error", error=str(error))
 
     async def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None, **kw) -> None:
-        self._start(run_id, parent_run_id, {"type": "tool", "name": (serialized or {}).get("name", "tool"),
-                                            "input": _clip(kw.get("inputs") or input_str, 2000)})
+        tool = (serialized or {}).get("name", "tool")
+        name = (kw.get("metadata") or {}).get("db_node_name") or tool
+        self._start(run_id, parent_run_id, {"type": "tool", "name": name, "tool": tool,
+                                            "input": _payload(kw.get("inputs") or input_str)}, kw)
 
     async def on_tool_end(self, output, *, run_id, **kw) -> None:
-        self._end(run_id, status="success", output=_clip(getattr(output, "content", output), 3000))
+        self._end(run_id, status="success", output=_payload(_text(getattr(output, "content", output))))
 
     async def on_tool_error(self, error, *, run_id, **kw) -> None:
+        self._end(run_id, status="error", error=str(error))
+
+    async def on_retriever_start(self, serialized, query, *, run_id, parent_run_id=None, **kw) -> None:
+        name = (kw.get("metadata") or {}).get("db_node_name") or (serialized or {}).get("name") or "Retriever"
+        self._start(run_id, parent_run_id, {"type": "retriever", "name": name, "input": {"query": _clip(query, SUB_TEXT_MAX)}}, kw)
+
+    async def on_retriever_end(self, documents, *, run_id, **kw) -> None:
+        self._end(run_id, status="success", output=_payload(
+            [{"pageContent": d.page_content, "metadata": d.metadata} for d in documents or []]))
+
+    async def on_retriever_error(self, error, *, run_id, **kw) -> None:
         self._end(run_id, status="error", error=str(error))
 
 
@@ -183,6 +274,7 @@ class Run:
             "mode": mode,
             "workflow_id": str(workflow.get("id")),
             "workflow_name": workflow.get("name"),
+            "owner_id": workflow.get("owner_id"),
             "vars": {v["key"]: v.get("value") for v in settings.get("variables", []) if v.get("key")},
         }
 
@@ -253,6 +345,7 @@ def _make_node_fn(nid: str, is_entry: bool):
         node = run.nodes[nid]
         nt = get_type(node["type"])
         run.state_outputs.update(payload.get("outputs") or {})
+        state = payload.get("state") or {}  # Send payloads carry the state as of dispatch
         inputs_by_handle: dict[str, list] = {}
         sources: list[dict] = []
         if "input" in payload:  # dispatched via Send
@@ -273,7 +366,7 @@ def _make_node_fn(nid: str, is_entry: bool):
                 if got:
                     sources.append({"node_id": e["source"], "port": e.get("sourceHandle") or "main",
                                     "handle": e.get("targetHandle") or "main", "count": len(got)})
-        return await _execute_node(run, node, nt, items, inputs_by_handle, sources)
+        return await _execute_node(run, node, nt, items, inputs_by_handle, sources, state)
 
     return fn
 
@@ -304,6 +397,7 @@ def _make_router(nid: str):
                             "input_handle": e.get("targetHandle") or "main",
                             "from": nid,
                             "from_port": e.get("sourceHandle") or "main",
+                            "state": state.get("state") or {},
                         },
                     )
                 )
@@ -385,7 +479,7 @@ def _trim(ports: dict, limit: int) -> dict:
 
 
 async def _execute_node(run: Run, node: dict, nt, items: list, inputs_by_handle: dict,
-                        sources: list | None = None) -> dict:
+                        sources: list | None = None, state: dict | None = None) -> dict:
     nid = node["id"]
     settings = node.get("settings") or {}
     started = time.perf_counter()
@@ -403,7 +497,7 @@ async def _execute_node(run: Run, node: dict, nt, items: list, inputs_by_handle:
     }
     run.publish({"type": "node_started", "node_id": nid, "name": node.get("name"), "started_at": started_at,
                  "run_index": record["run_index"]})
-    ctx = NodeContext(run, node, nt, items, inputs_by_handle)
+    ctx = NodeContext(run, node, nt, items, inputs_by_handle, graph_state=state or {})
 
     on_error = settings.get("on_error", "stop")  # stop | continue | error_output
     tries = max(1, int(settings.get("max_tries", 3))) if settings.get("retry_on_fail") else 1
@@ -443,7 +537,7 @@ async def _execute_node(run: Run, node: dict, nt, items: list, inputs_by_handle:
             outputs = {"error": [{**(it if isinstance(it, dict) else {}), "error": error} for it in (items or [{}])]}
         else:
             record.update(status="error", error=error, duration_ms=int((time.perf_counter() - started) * 1000),
-                          finished_at=_now().isoformat(), sub_runs=_jsonable(ctx.sub_runs))
+                          finished_at=_now().isoformat(), sub_runs=_jsonable([public_sub_run(e) for e in ctx.sub_runs]))
             _upsert_record(run, record)
             run.publish({"type": "node_finished", "node_id": nid, "status": "error", "error": error,
                          "duration_ms": record["duration_ms"], "finished_at": record["finished_at"]})
@@ -461,7 +555,11 @@ async def _execute_node(run: Run, node: dict, nt, items: list, inputs_by_handle:
         finished_at=_now().isoformat(),
     )
     if ctx.sub_runs:
-        record["sub_runs"] = _jsonable(ctx.sub_runs)
+        record["sub_runs"] = _jsonable([public_sub_run(e) for e in ctx.sub_runs])
+    if state or ctx.state_updates:  # the state after this node, for the log's State pane
+        record["state"] = _jsonable(gstate.public(gstate.apply_updates(state, ctx.state_updates)))
+        if ctx.state_updates:
+            record["state_updates"] = sorted(k for k in ctx.state_updates if not k.startswith("__"))
     _upsert_record(run, record)
     run.publish(
         {
@@ -478,7 +576,10 @@ async def _execute_node(run: Run, node: dict, nt, items: list, inputs_by_handle:
             "pinned": record.get("pinned", False),
         }
     )
-    return {"outputs": {nid: outputs}, "steps": 1}
+    result: dict = {"outputs": {nid: outputs}, "steps": 1}
+    if ctx.state_updates:
+        result["state"] = _jsonable(ctx.state_updates)
+    return result
 
 
 def _upsert_record(run: Run, record: dict) -> None:
@@ -501,6 +602,7 @@ def workflow_to_dict(wf: Workflow) -> dict:
     return {
         "id": str(wf.id),
         "name": wf.name,
+        "owner_id": str(wf.owner_id) if wf.owner_id else None,
         "nodes": wf.nodes or [],
         "edges": wf.edges or [],
         "settings": wf.settings or {},
@@ -571,7 +673,8 @@ async def execute_workflow(
         exec_id = str(ex.id)
 
     run = Run(workflow, exec_id, mode)
-    inp = {"outputs": {}, "trigger_items": _normalize_items(items) or [{}], "steps": 0}
+    inp = {"outputs": {}, "trigger_items": _normalize_items(items) or [{}], "steps": 0,
+           "state": gstate.initial_updates(workflow.get("settings"))}
     return await _launch(run, trigger["id"], inp, wait)
 
 
@@ -583,6 +686,9 @@ async def resume_execution(execution_id: str, value: Any, wait: bool = False) ->
         ex.status, ex.waiting_for = "running", None
         await s.commit()
         workflow, trigger_id, records, mode = ex.workflow_snapshot, ex.trigger_node, ex.node_runs, ex.mode
+        if "owner_id" not in workflow:  # snapshot taken before per-user workspaces
+            wf = await s.get(Workflow, ex.workflow_id)
+            workflow = {**workflow, "owner_id": str(wf.owner_id) if wf and wf.owner_id else None}
     run = Run(workflow, execution_id, mode, records)
     return await _launch(run, trigger_id, Command(resume=value), wait)
 
@@ -692,6 +798,9 @@ async def _run_error_workflow(workflow_id: str, run: Run, error: str | None) -> 
             if not wf:
                 return
             target = workflow_to_dict(wf)
+        if target["owner_id"] != run.meta.get("owner_id"):
+            log.warning("error workflow %s skipped: it belongs to another user", workflow_id)
+            return
         failed = next((r for r in reversed(run.records) if r["status"] == "error"), {})
         await execute_workflow(
             target,
@@ -736,7 +845,9 @@ def output_text(items: list[dict]) -> str:
     if not items:
         return ""
     first = items[0]
-    for key in ("output", "text", "response", "message", "answer", "content"):
+    if isinstance(first.get("output"), str):  # an explicit reply, even empty (e.g. a Voice Call Action speaks its own message)
+        return first["output"]
+    for key in ("text", "response", "message", "answer", "content"):
         v = first.get(key)
         if isinstance(v, str) and v:
             return v

@@ -14,6 +14,7 @@ export type Perm = 'workflow:read' | 'workflow:write' | 'workflow:execute' | 'ex
 interface AuthState {
   loading: boolean
   setupRequired: boolean
+  signupEnabled: boolean
   user: User | null
   refresh: () => Promise<void>
   setUser: (u: User | null) => void
@@ -22,18 +23,20 @@ interface AuthState {
 }
 
 const Ctx = createContext<AuthState>({
-  loading: true, setupRequired: false, user: null, refresh: async () => {}, setUser: () => {}, logout: async () => {}, can: () => false,
+  loading: true, setupRequired: false, signupEnabled: false, user: null, refresh: async () => {}, setUser: () => {}, logout: async () => {}, can: () => false,
 })
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
   const [setupRequired, setSetupRequired] = useState(false)
+  const [signupEnabled, setSignupEnabled] = useState(false)
   const [user, setUser] = useState<User | null>(null)
 
   const refresh = useCallback(async () => {
     try {
       const s = await auth.status()
       setSetupRequired(s.setup_required)
+      setSignupEnabled(s.signup_enabled)
       setUser(s.user)
     } catch {
       setUser(null)
@@ -56,15 +59,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const can = useCallback((p: Perm) => !!user && (PERMS[user.role] ?? []).includes(p), [user])
 
-  return <Ctx.Provider value={{ loading, setupRequired, user, refresh, setUser, logout, can }}>{children}</Ctx.Provider>
+  // Signing in as someone else (same tab) must not show the previous user's cached lists.
+  const userId = user?.id
+  useEffect(() => { window.dispatchEvent(new Event('auth:changed')) }, [userId])
+
+  return <Ctx.Provider value={{ loading, setupRequired, signupEnabled, user, refresh, setUser, logout, can }}>{children}</Ctx.Provider>
 }
 
 export const useAuth = () => useContext(Ctx)
 
+/** Mirror of backend/app/access.py: editors only see their own workspace. */
+export const readsAll = (u: User | null) => !!u && u.role !== 'editor'
+export const managesAll = (u: User | null) => !!u && (u.role === 'admin' || u.role === 'owner')
+
 export const ROLE_LABEL: Record<Role, string> = { owner: 'Owner', admin: 'Admin', editor: 'Editor', viewer: 'Viewer' }
 export const ROLE_HELP: Record<Role, string> = {
   owner: 'Everything, including managing admins and other owners',
-  admin: 'Manage users and see the audit log, plus everything an editor can do',
-  editor: 'Create, edit and run workflows; manage credentials',
-  viewer: 'Read-only access to workflows and executions',
+  admin: "Manage users, see the audit log, and see and manage every user's workflows",
+  editor: 'Own workspace: create, edit and run their own workflows and credentials',
+  viewer: "Read-only access to everyone's workflows and executions",
 }

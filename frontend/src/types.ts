@@ -5,7 +5,7 @@ export interface PropSpec {
   label: string
   type:
     | 'string' | 'text' | 'number' | 'boolean' | 'options' | 'combo' | 'json' | 'code'
-    | 'credential' | 'collection' | 'workflow'
+    | 'credential' | 'collection' | 'workflow' | 'section'
   default: unknown
   description?: string
   placeholder?: string
@@ -16,6 +16,7 @@ export interface PropSpec {
   fields?: PropSpec[]
   rows?: number
   language?: string
+  load_options?: 'models'
 }
 
 export interface NodeTypeSpec {
@@ -78,23 +79,44 @@ export interface Workflow {
   settings: {
     error_workflow_id?: string
     variables?: { key: string; value: string }[]
+    /** Graph state schema (LangGraph channels): each key with its reducer and default. */
+    state?: StateKey[]
   }
   updated_at: string
   created_at: string
   folder_id?: string | null
+  owner_id?: string | null
+  owner_name?: string | null
   node_count?: number
   trigger_types?: string[]
 }
 
+export interface LlmMessage { role: string; content: string; name?: string; tool_calls?: { name: string; args: unknown }[] }
+
+/** One LLM / tool / memory call inside an AI node: a row of the log tree (n8n's AI logs). */
+export type StateReducer = 'replace' | 'append' | 'add' | 'merge' | 'messages'
+export interface StateKey { key: string; reducer: StateReducer; default?: string }
+
 export interface SubRun {
-  type: 'llm' | 'tool'
+  /** Missing on executions recorded before the log tree (rebuilt from `depth`). */
+  id?: string
+  /** The tool call this ran inside (e.g. a sub-agent's model calls), or null at the top. */
+  parent?: string | null
+  type: 'llm' | 'tool' | 'memory' | 'retriever' | 'vector_store'
+  /** Canvas node name (or model / tool name for old records). */
   name: string
+  node_id?: string
+  node_name?: string
+  node_type?: string
+  model?: string
+  tool?: string
+  action?: string
   status: 'running' | 'success' | 'error'
   depth: number
   started_at: string
   duration_ms?: number
-  input?: { role: string; content: string }[] | string
-  output?: { text?: string; tool_calls?: { name: string; args: unknown }[] } | string
+  input?: LlmMessage[] | string | Record<string, unknown> | unknown[]
+  output?: { text?: string; tool_calls?: { name: string; args: unknown }[] } | string | Record<string, unknown> | unknown[]
   tokens?: { input?: number; output?: number; total?: number }
   error?: string
 }
@@ -114,6 +136,10 @@ export interface NodeRun {
   sources?: { node_id: string; port: string; handle: string; count: number }[]
   pinned?: boolean
   sub_runs?: SubRun[]
+  /** Graph state after this node ran (only when the workflow uses state). */
+  state?: Record<string, unknown>
+  /** Keys this node wrote. */
+  state_updates?: string[]
   error?: string | null
   run_index: number
 }
@@ -176,6 +202,8 @@ export interface Credential {
   testable?: boolean
   oauth2?: boolean
   oauth_connected?: boolean
+  owner_id?: string | null
+  owner_name?: string | null
   updated_at: string
   data?: Record<string, unknown>
 }
@@ -214,6 +242,7 @@ export interface ExecEvent {
   run_index?: number
   pinned?: boolean
   ts?: number
+  sub_run?: SubRun
 }
 
 export interface ListenerStatus {
@@ -224,10 +253,25 @@ export interface ListenerStatus {
   since: number
 }
 
+/** The LiveKit voice worker the backend runs for an active workflow's Voice Agent trigger. */
+export interface VoiceWorkerStatus {
+  kind: 'voice_worker'
+  state: 'starting' | 'running' | 'error' | 'stopped' | 'external'
+  error: string | null
+  agent_name: string
+  workflows: number
+  since: number
+  pid?: number | null
+  restarts?: number
+  logs: string[]
+}
+
 export interface Folder {
   id: string
   name: string
   parent_id: string | null
+  owner_id?: string | null
+  owner_name?: string | null
   workflow_count: number
   created_at: string
   updated_at: string
@@ -256,6 +300,7 @@ export type Role = 'owner' | 'admin' | 'editor' | 'viewer'
 export interface User {
   id: string
   email: string
+  username: string | null
   name: string
   role: Role
   mfa_enabled: boolean
@@ -264,9 +309,10 @@ export interface User {
   last_login_at: string | null
   created_at: string
   recovery_codes_left: number
+  workflow_count?: number  // admin user list only
 }
 
-export interface AuthStatus { setup_required: boolean; user: User | null }
+export interface AuthStatus { setup_required: boolean; signup_enabled: boolean; user: User | null }
 
 export interface AuthSessionInfo { id: string; created_at: string; last_seen_at: string; expires_at: string; ip: string; user_agent: string; current: boolean }
 
@@ -282,3 +328,15 @@ export interface LoginChallenge {
   methods: ('email' | 'totp' | 'recovery')[]
   resend_in: number
 }
+
+/** LiveKit SIP configuration of one LiveKit credential (protobuf JSON, snake_case). */
+export interface SipTrunk {
+  sip_trunk_id: string; name?: string; numbers?: string[]; address?: string; transport?: string
+  krisp_enabled?: boolean; allowed_addresses?: string[]; auth_username?: string; metadata?: string
+}
+export interface DispatchRule {
+  sip_dispatch_rule_id: string; name?: string; trunk_ids?: string[]; inbound_numbers?: string[]; krisp_enabled?: boolean
+  rule?: Record<string, Record<string, unknown>>
+  room_config?: { agents?: { agent_name?: string; metadata?: string }[] }
+}
+export interface Telephony { inbound: SipTrunk[]; outbound: SipTrunk[]; rules: DispatchRule[]; sip_uri: string }

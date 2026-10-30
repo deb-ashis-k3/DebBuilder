@@ -1,24 +1,26 @@
 """Sign-in, first-run setup, the signed-in user's own account (password, MFA, sessions, API keys)."""
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import secrets
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from ..config import get_settings
 from ..credentials import decrypt, encrypt
 from ..db import ApiKey, AuthSession, LoginChallenge, SessionLocal, User
 from ..services import mailer
 from ..security import (CSRF_COOKIE, LOCKOUT_AFTER, LOCKOUT_FOR, ROLES, SESSION_IDLE, _allowed_origin, audit,
-                        check_password_policy, clear_session_cookies, client_ip, create_session, current,
+                        check_password_policy, clean_username, clear_session_cookies, client_ip, create_session, current,
                         hash_password, new_recovery_codes, new_totp_secret, now, rate_limit, resolve, revoke_sessions,
                         role_rank, set_session_cookies, sha256, sign, totp_uri, unsign, verify_password, verify_totp)
 
@@ -32,10 +34,49 @@ MAX_SENDS = 5
 
 
 def user_json(u: User, role: str | None = None) -> dict:
-    return {"id": str(u.id), "email": u.email, "name": u.name, "role": role or u.role, "mfa_enabled": u.mfa_enabled,
+    return {"id": str(u.id), "email": u.email, "username": u.username, "name": u.name, "role": role or u.role, "mfa_enabled": u.mfa_enabled,
             "must_change_password": u.must_change_password, "disabled": u.disabled,
             "last_login_at": u.last_login_at, "created_at": u.created_at,
             "recovery_codes_left": len(u.recovery_codes or [])}
+
+
+async def find_user(s, ident: str) -> User | None:
+    """Look an account up by email or username (usernames never contain @)."""
+    ident = ident.strip().lower()
+    col = User.email if "@" in ident else User.username
+    return (await s.execute(select(User).where(col == ident))).scalar_one_or_none()
+
+
+async def ensure_username_free(s, username: str | None, except_id: uuid.UUID | None = None) -> None:
+    if not username:
+        return
+    other = (await s.execute(select(User).where(User.username == username))).scalar_one_or_none()
+    if other and other.id != except_id:
+        raise HTTPException(409, "That username is taken")
+
+
+_tasks: set[asyncio.Task] = set()
+
+
+def _background(coro) -> None:
+    t = asyncio.create_task(coro)
+    _tasks.add(t)  # keep a reference until done
+    t.add_done_callback(_tasks.discard)
+
+
+async def notify_password_changed(u: User, request: Request, how: str) -> None:
+    """Security notice to the account's address. Best effort: never fails the request."""
+    if not mailer.configured():
+        return
+    msg = mailer.password_changed_email(to=u.email, name=u.name, ip=client_ip(request),
+                                        user_agent=request.headers.get("user-agent", ""), how=how)
+
+    async def go():
+        try:
+            await mailer.send(u.email, *msg)
+        except mailer.MailError as e:
+            log.error("Password-changed notice to %s failed: %s", u.email, e)
+    _background(go())
 
 
 def _same_origin(request: Request) -> None:
@@ -65,42 +106,76 @@ async def status(request: Request):
     async with SessionLocal() as s:
         n = (await s.execute(select(func.count(User.id)))).scalar_one()
     p = await resolve(request) if n else None
-    return {"setup_required": n == 0, "user": user_json(p.user, p.role) if p else None}
+    return {"setup_required": n == 0, "signup_enabled": n == 0 or get_settings().allow_signup,
+            "user": user_json(p.user, p.role) if p else None}
 
 
 class SetupIn(BaseModel):
     email: str
     name: str = ""
+    username: str = ""
     password: str
 
 
 @router.post("/setup")
 async def setup(body: SetupIn, request: Request):
-    """Create the owner account. Only possible while no user exists."""
+    """Create the owner account. Only possible while no user exists (older clients; see signup)."""
+    async with SessionLocal() as s:
+        if (await s.execute(select(func.count(User.id)))).scalar_one():
+            raise HTTPException(409, "Setup is already complete. Sign in instead.")
+    return await signup(body, request)
+
+
+@router.post("/signup")
+async def signup(body: SetupIn, request: Request):
+    """Create an account from the sign-in page. The first one is the owner; later ones (if ALLOW_SIGNUP)
+    are editors with their own empty workspace."""
     _same_origin(request)
-    rate_limit(f"setup:{client_ip(request)}", 5, 60)
-    if not get_settings().allow_remote_setup and client_ip(request) not in ("127.0.0.1", "::1", "localhost"):
+    rate_limit(f"signup:{client_ip(request)}", 5, 60)
+    async with SessionLocal() as s:
+        first = not (await s.execute(select(func.count(User.id)))).scalar_one()
+    purpose = "setup" if first else "signup"
+    if first and not get_settings().allow_remote_setup and client_ip(request) not in ("127.0.0.1", "::1", "localhost"):
         raise HTTPException(403, "Create the owner account from the server itself (http://localhost), "
                                  "or set ALLOW_REMOTE_SETUP=true in backend/.env for the first setup.")
+    if not first and not get_settings().allow_signup:
+        raise HTTPException(403, "Sign-up is turned off. Ask an admin to add you.")
     email = body.email.strip().lower()
     if "@" not in email or len(email) > 320:
         raise HTTPException(400, "Enter a valid email address")
+    username = clean_username(body.username)
     check_password_policy(body.password, email, body.name)
+    # No account is saved yet: the details wait, encrypted, in a short-lived challenge and the account
+    # is created only when the emailed code is entered (see login_verify). An email that already has an
+    # account isn't revealed here: its owner gets the code, and only entering it says so.
+    code = f"{secrets.randbelow(1_000_000):06d}"
     async with SessionLocal() as s:
-        # Serialise concurrent setups so two "first" owners can't be created.
-        await s.execute(select(func.pg_advisory_xact_lock(4242)))
-        if (await s.execute(select(func.count(User.id)))).scalar_one():
+        if first and (await s.execute(select(func.count(User.id)))).scalar_one():
             raise HTTPException(409, "Setup is already complete. Sign in instead.")
-        u = User(email=email, name=body.name.strip()[:200], password_hash=hash_password(body.password), role="owner")
-        s.add(u)
+        await ensure_username_free(s, username)
+        await s.execute(delete(LoginChallenge).where(LoginChallenge.purpose == purpose, LoginChallenge.expires_at < now()))
+        ch = LoginChallenge(purpose=purpose, user_id=None, code_hash="", expires_at=now() + CODE_TTL, ip=client_ip(request),
+                            payload=encrypt({"email": email, "username": username, "name": body.name.strip()[:200],
+                                             "password_hash": hash_password(body.password)}))
+        s.add(ch)
+        await s.flush()
+        ch.code_hash = _code_hash(ch.id, code)
         await s.commit()
-        await s.refresh(u)
-    await audit("auth.setup", request, user=u, status=200)
-    return await _start_challenge(u, request)
+    pending = _pending(ch.payload)
+    try:
+        delivery = await _deliver(pending, code, request, purpose)
+    except HTTPException:
+        async with SessionLocal() as s:  # nothing to keep if the code couldn't be emailed
+            await s.execute(delete(LoginChallenge).where(LoginChallenge.id == ch.id))
+            await s.commit()
+        raise
+    await audit(f"auth.{purpose}_started", request, status=200, email=email, via=delivery)
+    return _challenge_response(ch, pending, purpose, delivery)
 
 
 class LoginIn(BaseModel):
-    email: str
+    login: str = ""  # email or username
+    email: str = ""  # older clients
     password: str
 
 
@@ -109,10 +184,10 @@ async def login(body: LoginIn, request: Request):
     _same_origin(request)
     ip = client_ip(request)
     rate_limit(f"login:ip:{ip}", get_settings().login_rate_limit, 60)
-    email = body.email.strip().lower()
-    rate_limit(f"login:user:{email}", 20, 300)
+    ident = (body.login or body.email).strip().lower()[:320]
+    rate_limit(f"login:user:{ident}", 20, 300)
     async with SessionLocal() as s:
-        u = (await s.execute(select(User).where(User.email == email))).scalar_one_or_none()
+        u = await find_user(s, ident) if ident else None
         if u and u.locked_until and u.locked_until > now():
             await audit("auth.login_locked", request, user=u, status=423)
             raise HTTPException(423, "Too many failed attempts. The account is locked for a few minutes.")
@@ -124,8 +199,8 @@ async def login(body: LoginIn, request: Request):
                 if u.failed_logins >= LOCKOUT_AFTER:
                     u.locked_until, u.failed_logins = now() + LOCKOUT_FOR, 0
                 await s.commit()
-            await audit("auth.login_failed", request, user=u, status=401, email=email, disabled=bool(u and u.disabled))
-            raise HTTPException(401, "Wrong email or password")
+            await audit("auth.login_failed", request, user=u, status=401, login=ident, disabled=bool(u and u.disabled))
+            raise HTTPException(401, "Wrong email, username or password")
     return await _start_challenge(u, request)
 
 
@@ -145,9 +220,12 @@ def _mask(email: str) -> str:
     return f"{shown}@{domain}"
 
 
-async def _deliver(u: User, code: str, request: Request) -> str:
-    """Email the code. Returns how it was delivered: "email" or "console" (dev fallback)."""
-    subject, text, html = mailer.code_email(code, client_ip(request), int(CODE_TTL.total_seconds() // 60))
+async def _deliver(u: User, code: str, request: Request, kind: str = "login") -> str:
+    """Email the code (kind: login | setup | signup | reset). Returns how it was delivered: "email" or "console" (dev fallback)."""
+    minutes = int(CODE_TTL.total_seconds() // 60)
+    who = dict(to=u.email, name=u.name, ip=client_ip(request), user_agent=request.headers.get("user-agent", ""), minutes=minutes)
+    subject, text, html = (mailer.reset_email(code, **who) if kind == "reset"
+                           else mailer.sign_in_email(code, first=kind in ("setup", "signup"), owner=kind == "setup", **who))
     fallback = get_settings().email_code_fallback == "log"
     if mailer.configured():
         try:
@@ -160,9 +238,22 @@ async def _deliver(u: User, code: str, request: Request) -> str:
             log.error("Sending the sign-in email failed (%s); using the console fallback", e)
     elif not fallback:
         raise HTTPException(503, "Email isn't configured on this server, so sign-in codes can't be sent. Ask an admin.")
-    log.warning("\n%s\n  EMAIL NOT CONFIGURED (set SMTP_HOST in backend/.env).\n  Sign-in code for %s: %s  (valid %d min)\n%s",
-                "=" * 64, u.email, code, CODE_TTL.total_seconds() // 60, "=" * 64)
+    log.warning("\n%s\n  EMAIL NOT CONFIGURED (set SMTP_HOST in backend/.env).\n  %s code for %s: %s  (valid %d min)\n%s",
+                "=" * 64, "Password reset" if kind == "reset" else "Sign-in", u.email, code, minutes, "=" * 64)
     return "console"
+
+
+def _pending(payload: str) -> SimpleNamespace:
+    """An account (owner setup or sign-up) waiting for its email code, shaped like a User for delivery and auditing."""
+    return SimpleNamespace(id=None, mfa_enabled=False, recovery_codes=[], disabled=False, **decrypt(payload))
+
+
+def _challenge_response(ch: LoginChallenge, u, purpose: str, delivery: str) -> dict:
+    methods = ["email"] + (["totp"] if u.mfa_enabled else []) + (["recovery"] if u.recovery_codes else [])
+    return {"verification_required": True,
+            "challenge": sign({"cid": str(ch.id), "uid": str(u.id or ""), "p": purpose}, ttl=int(CODE_TTL.total_seconds())),
+            "sent_to": _mask(u.email), "delivery": delivery, "methods": methods,
+            "resend_in": int(RESEND_AFTER.total_seconds())}
 
 
 async def _start_challenge(u: User, request: Request) -> dict:
@@ -173,21 +264,24 @@ async def _start_challenge(u: User, request: Request) -> dict:
         await s.flush()
         ch.code_hash = _code_hash(ch.id, code)
         await s.commit()
-    delivery = await _deliver(u, code, request)
+    delivery = await _deliver(u, code, request, "login")
     await audit("auth.code_sent", request, user=u, status=200, via=delivery)
-    methods = ["email"] + (["totp"] if u.mfa_enabled else []) + (["recovery"] if u.recovery_codes else [])
-    return {"verification_required": True, "challenge": sign({"cid": str(ch.id), "uid": str(u.id)}, ttl=int(CODE_TTL.total_seconds())),
-            "sent_to": _mask(u.email), "delivery": delivery, "methods": methods,
-            "resend_in": int(RESEND_AFTER.total_seconds())}
+    return _challenge_response(ch, u, "login", delivery)
 
 
-async def _load_challenge(token: str, s) -> tuple[LoginChallenge, User]:
+async def _load_challenge(token: str, s) -> tuple[LoginChallenge, User | SimpleNamespace]:
+    """A sign-in challenge (with its user) or a pending setup / sign-up (with the account still to be created)."""
     data = unsign(token)
-    if not data:
+    purpose = data.get("p", "login") if data else None
+    if purpose not in ("login", "setup", "signup"):
         raise HTTPException(401, "This sign-in attempt expired. Start again.")
     ch = await s.get(LoginChallenge, uuid.UUID(data["cid"]))
+    if not ch or ch.purpose != purpose or ch.consumed or ch.expires_at < now():
+        raise HTTPException(401, "This sign-in attempt expired. Start again.")
+    if purpose in ("setup", "signup"):
+        return ch, _pending(ch.payload)
     u = await s.get(User, uuid.UUID(data["uid"]))
-    if not ch or not u or ch.user_id != u.id or ch.consumed or ch.expires_at < now() or u.disabled:
+    if not u or ch.user_id != u.id or u.disabled:
         raise HTTPException(401, "This sign-in attempt expired. Start again.")
     return ch, u
 
@@ -218,13 +312,44 @@ async def login_verify(body: VerifyIn, request: Request):
             ch.attempts += 1
             if ch.attempts >= CODE_ATTEMPTS:
                 ch.consumed = True  # too many guesses: this challenge is dead, sign in again
+                ch.payload = None  # a dead setup keeps nothing
             await s.commit()
             await audit("auth.code_failed", request, user=u, status=401, method=body.method, attempts=ch.attempts)
             if ch.consumed:
                 raise HTTPException(401, "Too many wrong codes. Sign in again to get a new one.")
             raise HTTPException(401, f"Wrong code. {CODE_ATTEMPTS - ch.attempts} attempt{'s' if CODE_ATTEMPTS - ch.attempts != 1 else ''} left.")
         ch.consumed = True
-        await s.commit()
+        if ch.purpose == "setup":
+            # Code verified: only now is the owner account created.
+            ch.payload = None
+            await s.execute(select(func.pg_advisory_xact_lock(4242)))  # two pending setups can't both become owner
+            if (await s.execute(select(func.count(User.id)))).scalar_one():
+                await s.commit()
+                raise HTTPException(409, "Setup is already complete. Sign in instead.")
+            u = User(email=u.email, username=u.username, name=u.name, password_hash=u.password_hash, role="owner")
+            s.add(u)
+            # Any other setup attempts (other tabs, wrong addresses) are void now.
+            await s.execute(delete(LoginChallenge).where(LoginChallenge.purpose == "setup", LoginChallenge.id != ch.id))
+            await s.commit()
+            await s.refresh(u)
+            await audit("auth.setup", request, user=u, status=200)
+        elif ch.purpose == "signup":
+            # Code verified: the address works, so create the account (an editor with an empty workspace).
+            ch.payload = None
+            await s.execute(select(func.pg_advisory_xact_lock(4243)))  # same address in two tabs: one account
+            if (await s.execute(select(User.id).where(User.email == u.email))).first():
+                await s.commit()
+                raise HTTPException(409, "An account with this email already exists. Sign in, or use Forgot password.")
+            if u.username and (await s.execute(select(User.id).where(User.username == u.username))).first():
+                await s.commit()
+                raise HTTPException(409, "That username was just taken. Sign up again with another one.")
+            u = User(email=u.email, username=u.username, name=u.name, password_hash=u.password_hash, role="editor")
+            s.add(u)
+            await s.commit()
+            await s.refresh(u)
+            await audit("auth.signup", request, user=u, status=200)
+        else:
+            await s.commit()
     if body.method == "recovery":
         await audit("auth.recovery_code_used", request, user=u, status=200, left=len(u.recovery_codes))
     return await _login_response(u, request, method=body.method)
@@ -250,9 +375,125 @@ async def login_resend(body: ResendIn, request: Request):
         ch.code_hash, ch.sends, ch.attempts, ch.last_sent_at = _code_hash(ch.id, code), ch.sends + 1, 0, now()
         ch.expires_at = now() + CODE_TTL
         await s.commit()
-    delivery = await _deliver(u, code, request)
+    delivery = await _deliver(u, code, request, ch.purpose)
     await audit("auth.code_resent", request, user=u, status=200, via=delivery)
     return {"ok": True, "delivery": delivery, "resend_in": int(RESEND_AFTER.total_seconds())}
+
+
+# ---------------------------------------------------------------------------
+# Forgotten password: emailed code -> new password
+# The answers never reveal whether an account exists.
+# ---------------------------------------------------------------------------
+
+_fake_attempts: dict[str, int] = {}  # guesses against reset attempts for unknown accounts
+
+
+class ForgotIn(BaseModel):
+    login: str  # email or username
+
+
+@router.post("/password/forgot")
+async def forgot_password(body: ForgotIn, request: Request):
+    _same_origin(request)
+    ip = client_ip(request)
+    ident = body.login.strip().lower()[:320]
+    if not ident:
+        raise HTTPException(400, "Enter your email or username")
+    rate_limit(f"forgot:ip:{ip}", 10, 60)
+    rate_limit(f"forgot:id:{ident}", 1, 30)
+    rate_limit(f"forgot:id15:{ident}", 5, 900)
+    if not mailer.configured() and get_settings().email_code_fallback != "log":
+        raise HTTPException(503, "Email isn't configured on this server, so reset codes can't be sent. Ask an admin.")
+    cid = uuid.uuid4()
+    async with SessionLocal() as s:
+        u = await find_user(s, ident)
+        if u and u.disabled:
+            u = None
+        if u:
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            s.add(LoginChallenge(id=cid, user_id=u.id, purpose="reset", code_hash=_code_hash(cid, code),
+                                 expires_at=now() + CODE_TTL, ip=ip))
+            await s.commit()
+
+            # Sent in the background so the response time is the same for known and unknown accounts.
+            async def go(u=u, code=code):
+                try:
+                    await _deliver(u, code, request, "reset")
+                except HTTPException:
+                    pass  # already audited by _deliver
+            _background(go())
+    await audit("auth.password_reset_requested", request, user=u, status=200, login=ident)
+    return {"challenge": sign({"cid": str(cid), "uid": str(u.id if u else uuid.uuid4()), "p": "reset"}, ttl=int(CODE_TTL.total_seconds())),
+            "delivery": "email" if mailer.configured() else "console", "resend_in": int(RESEND_AFTER.total_seconds())}
+
+
+async def _reset_challenge(token: str, purpose: str, s) -> tuple[LoginChallenge | None, User | None, str]:
+    data = unsign(token)
+    if not data or data.get("p") != purpose:
+        raise HTTPException(401, "This password reset expired. Start again.")
+    ch = await s.get(LoginChallenge, uuid.UUID(data["cid"]))
+    u = await s.get(User, uuid.UUID(data["uid"]))
+    if ch and (not u or ch.purpose != "reset" or ch.user_id != u.id or ch.consumed or ch.expires_at < now() or u.disabled):
+        raise HTTPException(401, "This password reset expired. Start again.")
+    return ch, u, data["cid"]
+
+
+class ResetVerifyIn(BaseModel):
+    challenge: str
+    code: str
+
+
+@router.post("/password/reset/verify")
+async def reset_verify(body: ResetVerifyIn, request: Request):
+    """Check the emailed code; returns a short-lived token for choosing the new password."""
+    _same_origin(request)
+    rate_limit(f"reset:ip:{client_ip(request)}", 2 * get_settings().login_rate_limit, 60)
+    code = body.code.strip().replace(" ", "")
+    async with SessionLocal() as s:
+        ch, u, cid = await _reset_challenge(body.challenge, "reset", s)
+        if ch and len(code) == 6 and code.isdigit() and hmac.compare_digest(ch.code_hash, _code_hash(ch.id, code)):
+            return {"reset_token": sign({"cid": cid, "uid": str(u.id), "p": "reset-ok"}, ttl=int(CODE_TTL.total_seconds()))}
+        if ch:
+            ch.attempts += 1
+            ch.consumed = ch.attempts >= CODE_ATTEMPTS
+            attempts = ch.attempts
+            await s.commit()
+            await audit("auth.reset_code_failed", request, user=u, status=401, attempts=attempts)
+        else:  # unknown account: count guesses the same way
+            if len(_fake_attempts) > 10_000:
+                _fake_attempts.clear()
+            attempts = _fake_attempts[cid] = _fake_attempts.get(cid, 0) + 1
+    if attempts >= CODE_ATTEMPTS:
+        raise HTTPException(401, "Too many wrong codes. Start again to get a new one.")
+    left = CODE_ATTEMPTS - attempts
+    raise HTTPException(401, f"Wrong code. {left} attempt{'s' if left != 1 else ''} left.")
+
+
+class ResetIn(BaseModel):
+    reset_token: str
+    password: str
+
+
+@router.post("/password/reset")
+async def reset_password(body: ResetIn, request: Request):
+    _same_origin(request)
+    rate_limit(f"reset:ip:{client_ip(request)}", 2 * get_settings().login_rate_limit, 60)
+    async with SessionLocal() as s:
+        ch, u, _ = await _reset_challenge(body.reset_token, "reset-ok", s)
+        if not ch:
+            raise HTTPException(401, "This password reset expired. Start again.")
+        check_password_policy(body.password, u.email, u.name)
+        u.password_hash, u.must_change_password, u.password_changed_at = hash_password(body.password), False, now()
+        u.failed_logins, u.locked_until = 0, None
+        # This and every other outstanding code for the account stop working.
+        for other in (await s.execute(select(LoginChallenge).where(LoginChallenge.user_id == u.id,
+                                                                     LoginChallenge.consumed.is_(False)))).scalars():
+            other.consumed = True
+        await s.commit()
+    await revoke_sessions(u.id)  # sign out everywhere
+    await audit("auth.password_reset", request, user=u, status=200)
+    await notify_password_changed(u, request, "reset using a code sent to this address")
+    return {"ok": True}
 
 
 @router.post("/logout")
@@ -281,7 +522,8 @@ async def me(request: Request):
 
 
 class ProfileIn(BaseModel):
-    name: str
+    name: str | None = None
+    username: str | None = None  # "" removes it
 
 
 @router.put("/me")
@@ -289,7 +531,12 @@ async def update_me(body: ProfileIn, request: Request):
     p = current(request)
     async with SessionLocal() as s:
         u = await s.get(User, p.user.id)
-        u.name = body.name.strip()[:200]
+        if body.name is not None:
+            u.name = body.name.strip()[:200]
+        if body.username is not None:
+            username = clean_username(body.username)
+            await ensure_username_free(s, username, u.id)  # before assigning, or autoflush hits the unique index
+            u.username = username
         await s.commit()
         await s.refresh(u)
     return {"user": user_json(u)}
@@ -316,6 +563,7 @@ async def change_password(body: PasswordIn, request: Request):
         await s.commit()
     await revoke_sessions(p.user.id, except_id=p.session_id)  # sign out everywhere else
     await audit("auth.password_changed", request, p, status=200)
+    await notify_password_changed(u, request, "changed from your account settings")
     return {"ok": True}
 
 

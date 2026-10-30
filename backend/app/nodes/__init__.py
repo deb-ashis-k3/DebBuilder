@@ -10,7 +10,7 @@ def get_type(type_name: str) -> NodeType:
 
 def load_all() -> None:
     # Importing registers the node types.
-    from . import ai, core, integrations, listener_triggers, triggers, voice  # noqa: F401
+    from . import ai, core, files, integrations, listener_triggers, rag, services, telephony, transform, triggers, voice  # noqa: F401
 
 
 load_all()

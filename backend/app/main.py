@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from . import listeners, scheduler
+from . import listeners, scheduler, voice_workers
 from .api import admin, auth, credentials, executions, folders, hooks, voice, workflows, ws
 from .config import get_settings
 from .db import init_db
@@ -41,10 +41,12 @@ async def lifespan(app: FastAPI):
     scheduler.scheduler.start()
     await scheduler.load_all()
     await listeners.load_all()
+    await voice_workers.load_all()
     try:
         yield
     finally:
         await listeners.stop_all()
+        await voice_workers.stop_all()
         scheduler.scheduler.shutdown(wait=False)
         await pool.close()
 
@@ -61,7 +63,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for r in (auth.router, admin.router, workflows.router, folders.router, executions.router, credentials.router, credentials.oauth_router, hooks.router, voice.router, ws.router):
+for r in (auth.router, admin.router, workflows.router, folders.router, executions.router, executions.binary_router, credentials.router, credentials.oauth_router, hooks.router, voice.router, ws.router):
     app.include_router(r)
 
 

@@ -1,4 +1,4 @@
-import type { ApiKey, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, ListenerStatus, NodeTypeSpec, TestResult, User, Workflow } from './types'
+import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow } from './types'
 
 /** Double-submit CSRF token: the server sets the readable `db_csrf` cookie at sign-in. */
 export function csrfToken(): string {
@@ -28,15 +28,20 @@ async function req<T>(method: string, url: string, body?: unknown, headers: Reco
 
 export const auth = {
   status: () => req<AuthStatus>('GET', '/api/auth/status'),
-  setup: (b: { email: string; name: string; password: string }) => req<LoginChallenge>('POST', '/api/auth/setup', b),
+  /** Create an account (the owner on a new installation). Nothing is saved until the emailed code is entered. */
+  signup: (b: { email: string; name: string; username: string; password: string }) => req<LoginChallenge>('POST', '/api/auth/signup', b),
   /** Password step: never signs in directly; returns a challenge (code emailed to the user). */
-  login: (email: string, password: string) => req<LoginChallenge>('POST', '/api/auth/login', { email, password }),
+  login: (login: string, password: string) => req<LoginChallenge>('POST', '/api/auth/login', { login, password }),
   verify: (challenge: string, code: string, method: 'email' | 'totp' | 'recovery') =>
     req<{ user: User }>('POST', '/api/auth/login/verify', { challenge, code, method }),
   resend: (challenge: string) => req<{ delivery: string; resend_in: number }>('POST', '/api/auth/login/resend', { challenge }),
+  /** Forgotten password: always "sent" (the server never reveals whether the account exists). */
+  forgot: (login: string) => req<{ challenge: string; delivery: 'email' | 'console'; resend_in: number }>('POST', '/api/auth/password/forgot', { login }),
+  resetVerify: (challenge: string, code: string) => req<{ reset_token: string }>('POST', '/api/auth/password/reset/verify', { challenge, code }),
+  finishReset: (reset_token: string, password: string) => req('POST', '/api/auth/password/reset', { reset_token, password }),
   logout: () => req('POST', '/api/auth/logout'),
   me: () => req<{ user: User; via: string }>('GET', '/api/auth/me'),
-  updateMe: (name: string) => req<{ user: User }>('PUT', '/api/auth/me', { name }),
+  updateMe: (b: { name?: string; username?: string }) => req<{ user: User }>('PUT', '/api/auth/me', b),
   changePassword: (current_password: string, new_password: string) => req('POST', '/api/auth/password', { current_password, new_password }),
   mfaSetup: () => req<{ secret: string; otpauth_uri: string; qr: string; pending_token: string }>('POST', '/api/auth/mfa/setup'),
   mfaEnable: (pending_token: string, code: string) => req<{ recovery_codes: string[] }>('POST', '/api/auth/mfa/enable', { pending_token, code }),
@@ -50,8 +55,8 @@ export const auth = {
   revokeApiKey: (id: string) => req('DELETE', `/api/auth/api-keys/${id}`),
   // admin
   users: () => req<User[]>('GET', '/api/users'),
-  createUser: (b: { email: string; name: string; role: string }) => req<{ user: User; temporary_password: string | null }>('POST', '/api/users', b),
-  updateUser: (id: string, b: { name?: string; role?: string; disabled?: boolean }) => req<{ user: User }>('PUT', `/api/users/${id}`, b),
+  createUser: (b: { email: string; name: string; username: string; role: string }) => req<{ user: User; temporary_password: string | null }>('POST', '/api/users', b),
+  updateUser: (id: string, b: { name?: string; username?: string; role?: string; disabled?: boolean }) => req<{ user: User }>('PUT', `/api/users/${id}`, b),
   resetPassword: (id: string) => req<{ temporary_password: string }>('POST', `/api/users/${id}/reset-password`),
   resetMfa: (id: string) => req('POST', `/api/users/${id}/reset-mfa`),
   revokeUserSessions: (id: string) => req('POST', `/api/users/${id}/revoke-sessions`),
@@ -67,6 +72,8 @@ export const api = {
   workflows: () => req<Workflow[]>('GET', '/api/workflows'),
   workflow: (id: string) => req<Workflow>('GET', `/api/workflows/${id}`),
   listenerStatus: (id: string) => req<Record<string, ListenerStatus>>('GET', `/api/workflows/${id}/listeners`),
+  voiceWorkerStatus: (id: string) => req<Record<string, VoiceWorkerStatus>>('GET', `/api/workflows/${id}/listeners`),
+  restartVoiceWorker: (id: string, nodeId: string) => req<VoiceWorkerStatus>('POST', `/api/workflows/${id}/voice-worker/${nodeId}/restart`),
   createWorkflow: (wf: Partial<Workflow>) => req<Workflow>('POST', '/api/workflows', wf),
   updateWorkflow: (id: string, wf: Partial<Workflow>) => req<Workflow>('PUT', `/api/workflows/${id}`, wf),
   deleteWorkflow: (id: string) => req('DELETE', `/api/workflows/${id}`),
@@ -111,9 +118,21 @@ export const api = {
   oauthUrl: (credentialId: string) => req<{ url: string; redirect_uri: string }>('GET', `/api/oauth2/auth-url?credential_id=${credentialId}`),
   credentials: (type?: string) => req<Credential[]>('GET', `/api/credentials${type ? `?type=${type}` : ''}`),
   credential: (id: string) => req<Credential>('GET', `/api/credentials/${id}`),
+  /** Models the provider offers for this credential (chat model nodes' "From list"). */
+  credentialModels: (id: string, refresh = false) =>
+    req<{ models: { value: string; label: string; hint?: string }[] }>('GET', `/api/credentials/${id}/models${refresh ? '?refresh=true' : ''}`),
   createCredential: (c: { name: string; type: string; data: Record<string, unknown> }) => req<Credential>('POST', '/api/credentials', c),
   updateCredential: (id: string, c: { name?: string; data?: Record<string, unknown> }) => req<Credential>('PUT', `/api/credentials/${id}`, c),
   deleteCredential: (id: string) => req('DELETE', `/api/credentials/${id}`),
+
+  // Telephony (LiveKit SIP trunks / dispatch rules, Plivo wiring)
+  telephony: (credId: string) => req<Telephony>('GET', `/api/voice/telephony/${credId}`),
+  addInboundTrunk: (credId: string, b: Record<string, unknown>) => req<Record<string, unknown>>('POST', `/api/voice/telephony/${credId}/inbound`, b),
+  addOutboundTrunk: (credId: string, b: Record<string, unknown>) => req<Record<string, unknown>>('POST', `/api/voice/telephony/${credId}/outbound`, b),
+  addDispatchRule: (credId: string, b: Record<string, unknown>) => req<Record<string, unknown>>('POST', `/api/voice/telephony/${credId}/rules`, b),
+  deleteTrunk: (credId: string, id: string) => req('DELETE', `/api/voice/telephony/${credId}/trunks/${id}`),
+  deleteDispatchRule: (credId: string, id: string) => req('DELETE', `/api/voice/telephony/${credId}/rules/${id}`),
+  plivoConnect: (b: Record<string, unknown>) => req<Record<string, unknown>>('POST', '/api/voice/telephony/plivo-connect', b),
 
   chat: (workflowId: string, message: string, sessionId: string) =>
     req<{ execution_id: string }>('POST', `/api/chat/${workflowId}`, { message, session_id: sessionId },

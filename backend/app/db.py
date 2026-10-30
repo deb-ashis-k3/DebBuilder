@@ -26,6 +26,7 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)  # stored lower-case
+    username: Mapped[str | None] = mapped_column(String(32), unique=True, index=True, nullable=True)  # lower-case, optional
     name: Mapped[str] = mapped_column(String(200), default="")
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="editor")  # owner | admin | editor | viewer
@@ -81,7 +82,10 @@ class LoginChallenge(Base):
     __tablename__ = "login_challenges"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # None for a pending owner setup: the account doesn't exist until the code is verified.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True)
+    purpose: Mapped[str] = mapped_column(String(20), default="login", server_default="login")  # login | reset | setup
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)  # setup only: encrypted pending account
     code_hash: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -117,6 +121,9 @@ class Folder(Base):
     parent_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("folders.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=utcnow
@@ -137,6 +144,9 @@ class Workflow(Base):
     folder_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("folders.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=utcnow
@@ -150,6 +160,9 @@ class Credential(Base):
     name: Mapped[str] = mapped_column(String(200))
     type: Mapped[str] = mapped_column(String(100), index=True)
     data: Mapped[str] = mapped_column(Text)  # Fernet-encrypted JSON
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=utcnow
@@ -211,8 +224,21 @@ async def init_db() -> None:
         await conn.execute(text(
             "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS folder_id UUID REFERENCES folders(id) ON DELETE SET NULL"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflows_folder_id ON workflows (folder_id)"))
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(32)"))
+        await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users (username)"))
+        await conn.execute(text("ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS purpose VARCHAR(20) NOT NULL DEFAULT 'login'"))
+        await conn.execute(text("ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS payload TEXT"))
+        await conn.execute(text("ALTER TABLE login_challenges ALTER COLUMN user_id DROP NOT NULL"))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_executions_workflow_started ON executions (workflow_id, started_at DESC)"))
+        # Per-user workspaces: rows created before ownership existed belong to the first owner.
+        for table in ("workflows", "folders", "credentials"):
+            await conn.execute(text(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE SET NULL"))
+            await conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_owner_id ON {table} (owner_id)"))
+            await conn.execute(text(
+                f"UPDATE {table} SET owner_id = (SELECT id FROM users WHERE role = 'owner' ORDER BY created_at LIMIT 1) "
+                "WHERE owner_id IS NULL"))
 
 
 async def get_session():

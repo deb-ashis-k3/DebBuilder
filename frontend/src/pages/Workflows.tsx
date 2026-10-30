@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, downloadJson } from '../api'
 import { DeleteFolderDialog, ImportDialog, Menu, MoveDialog, PromptDialog, confirmDialog, errText, folderPath, folderSubtree } from '../components/Dialogs'
+import { OwnerBadge, OwnerFilter, useOwnerScope } from '../components/Owner'
 import { Select } from '../components/Select'
 import { Icon, fmtDate, toast, useCatalog } from '../lib'
 import type { Folder, Workflow } from '../types'
@@ -56,15 +57,23 @@ export default function Workflows() {
   }, [])
   useEffect(() => { setSel(new Set()) }, [folderId])
 
+  const owners = useOwnerScope('wf-owner')
   const folder = folders.find((f) => f.id === folderId) ?? null
   const crumbs = folderPath(folders, folderId)
   const searching = q.trim().length > 0
+  // Inside a folder everything belongs to the folder's owner, so the owner filter applies to Home and search.
+  const inScope = (o: { owner_id?: string | null }) => (folderId && !searching) || owners.visible(o)
+  // New items always belong to the caller, so they can't go into someone else's folder.
+  const canCreateHere = canWrite && (!folder || owners.isMine(folder))
+  const foldersOf = (ownerId?: string | null) => folders.filter((f) => f.owner_id === ownerId)
   const subfolders = folders.filter((f) => (searching ? f.name.toLowerCase().includes(q.toLowerCase()) : f.parent_id === folderId))
+    .filter(inScope)
     .sort((a, b) => a.name.localeCompare(b.name))
 
   const shown = useMemo(() => {
     const needle = q.toLowerCase()
     const rows = (list ?? []).filter((w) => (searching ? w.name.toLowerCase().includes(needle) : (w.folder_id ?? null) === folderId))
+      .filter(inScope)
       .filter((w) => !status || (status === 'active') === w.active)
     const by: Record<Sort, (a: Workflow, b: Workflow) => number> = {
       updated: (a, b) => b.updated_at.localeCompare(a.updated_at),
@@ -73,12 +82,13 @@ export default function Workflows() {
       name_desc: (a, b) => b.name.localeCompare(a.name),
     }
     return rows.sort(by[sort])
-  }, [list, q, searching, folderId, status, sort])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, q, searching, folderId, status, sort, owners.scope])
 
   const total = Object.values(stats).reduce((a, b) => a + b, 0)
   const statCards = [
-    { label: 'Workflows', value: list?.length ?? '–', icon: 'workflow', color: '#17a589' },
-    { label: 'Active', value: list?.filter((w) => w.active).length ?? '–', icon: 'radio', color: '#17a589' },
+    { label: 'Workflows', value: list?.length ?? '–', icon: 'workflow', color: 'var(--primary)' },
+    { label: 'Active', value: list?.filter((w) => w.active).length ?? '–', icon: 'radio', color: 'var(--primary)' },
     { label: 'Executions', value: total, icon: 'activity', color: '#71717a' },
     { label: 'Failed', value: stats.error ?? 0, icon: 'circle-alert', color: '#e5484d' },
     { label: 'Awaiting approval', value: stats.waiting ?? 0, icon: 'user-check', color: '#f59e0b' },
@@ -215,7 +225,7 @@ export default function Workflows() {
             {folder && <Menu items={folderMenu(folder)} title="Folder actions" />}
           </nav>
           <span className="spacer" />
-          {canWrite && <div className="wf-actions">
+          {canCreateHere && <div className="wf-actions">
             <button className="btn" title="New folder" onClick={() => setDialog({ kind: 'new-folder' })}><Icon name="folder-plus" size={15} /> <span className="btn-text">New folder</span></button>
             <button className="btn" title="Import workflows" onClick={() => setDialog({ kind: 'import' })}><Icon name="upload" size={15} /> <span className="btn-text">Import</span></button>
             <button className="btn primary" title="Create workflow" onClick={create}><Icon name="plus" size={15} /> <span className="btn-text">Create workflow</span></button>
@@ -226,6 +236,7 @@ export default function Workflows() {
             <Icon name="search" size={15} />
             <input className="input" placeholder={folderId ? 'Search all folders…' : 'Search workflows and folders…'} value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
+          {owners.show && (!folderId || searching) && <OwnerFilter className="wf-filter" value={owners.scope} onChange={owners.setScope} />}
           <Select className="wf-filter" value={status} onChange={setStatus} title="Status"
             options={[{ value: '', label: 'All statuses' }, { value: 'active', label: 'Active' }, { value: 'inactive', label: 'Inactive' }]} />
           <Select className="wf-filter" value={sort} onChange={(v) => { setSort(v as Sort); lsSet('wf-sort', v) }} title="Sort"
@@ -264,6 +275,7 @@ export default function Workflows() {
                     {f.workflow_count} workflow{f.workflow_count === 1 ? '' : 's'}{subCount(f) ? ` · ${subCount(f)} folder${subCount(f) === 1 ? '' : 's'}` : ''}
                   </div>
                 </div>
+                <OwnerBadge item={f} />
                 <Menu items={folderMenu(f)} title="Folder actions" />
               </div>
             ))}
@@ -276,7 +288,7 @@ export default function Workflows() {
             <div className="empty-art"><Icon name={searching ? 'search-x' : folderId ? 'folder-open' : 'sparkles'} size={28} /></div>
             <h3>{searching ? `Nothing matches “${q}”` : folderId ? 'This folder is empty' : 'No workflows yet'}</h3>
             {!searching && <p>{folderId ? 'Create a workflow here, add a subfolder, or drag workflows onto this folder.' : 'Start from scratch or pick a template below. It takes about a minute.'}</p>}
-            {!searching && canWrite && (
+            {!searching && canCreateHere && (
               <div className="row" style={{ justifyContent: 'center', gap: 8 }}>
                 <button className="btn primary" onClick={create}><Icon name="plus" size={16} /> Create workflow</button>
                 <button className="btn" onClick={() => setDialog({ kind: 'new-folder' })}><Icon name="folder-plus" size={16} /> New folder</button>
@@ -307,6 +319,7 @@ export default function Workflows() {
                   {w.node_count} nodes · updated {fmtDate(w.updated_at)}
                 </div>
               </div>
+              <OwnerBadge item={w} />
               {w.active ? <span className="badge success">Active</span> : <span className="badge">Inactive</span>}
               <Menu items={workflowMenu(w)} title="Workflow actions" />
             </div>
@@ -344,7 +357,7 @@ export default function Workflows() {
           onSubmit={async (name) => { await api.updateFolder(dialog.folder.id, { name }); await load() }} />
       )}
       {dialog?.kind === 'move-folder' && (
-        <MoveDialog title={`Move folder "${dialog.folder.name}"`} folders={folders} current={dialog.folder.parent_id}
+        <MoveDialog title={`Move folder "${dialog.folder.name}"`} folders={foldersOf(dialog.folder.owner_id)} current={dialog.folder.parent_id}
           exclude={folderSubtree(folders, dialog.folder.id)} onClose={() => setDialog(null)} onPick={(t) => moveFolder(dialog.folder, t)} />
       )}
       {dialog?.kind === 'delete-folder' && (
@@ -353,7 +366,8 @@ export default function Workflows() {
       )}
       {dialog?.kind === 'move-workflows' && (
         <MoveDialog title={`Move ${dialog.ids.length === 1 ? `"${list?.find((w) => w.id === dialog.ids[0])?.name}"` : `${dialog.ids.length} workflows`}`}
-          folders={folders} current={dialog.current} onClose={() => setDialog(null)} onPick={(t) => move(dialog.ids, t)} />
+          folders={foldersOf(list?.find((w) => w.id === dialog.ids[0])?.owner_id)} current={dialog.current}
+          onClose={() => setDialog(null)} onPick={(t) => move(dialog.ids, t)} />
       )}
       {dialog?.kind === 'duplicate' && (
         <PromptDialog title="Duplicate workflow" label="Name" initial={`${dialog.wf.name} (copy)`} confirm="Duplicate" onClose={() => setDialog(null)}

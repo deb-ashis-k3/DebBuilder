@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from 'react'
 import { api } from '../api'
 import { Icon, fmtDuration, isVisible, outputPorts, toast, useCatalog } from '../lib'
-import type { CodeRuntime, Item, ListenerStatus, NodeRun, NodeSettings, RunState, WFNode } from '../types'
+import type { CodeRuntime, Item, ListenerStatus, NodeRun, NodeSettings, RunState, VoiceWorkerStatus, WFNode } from '../types'
 import { AiLogs } from './AiLogs'
 import { DataView } from './DataView'
 import { PropertyField } from './PropertyField'
@@ -136,7 +136,7 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
               {spec.listener ? (
                 <ListenerHelp nodeId={node.id} workflowId={workflowId} description={spec.description} />
               ) : spec.trigger ? (
-                <TriggerHelp type={node.type} params={params} workflowId={workflowId} origin={origin} />
+                <TriggerHelp type={node.type} nodeId={node.id} params={params} workflowId={workflowId} origin={origin} />
               ) : isSub ? (
                 <div className="muted small">Sub-nodes are configured here and used by the AI node they connect to. Expressions resolve against that node's input item.</div>
               ) : (
@@ -172,12 +172,12 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
                   {spec.properties.length === 0 && <div className="muted">This node has no parameters.</div>}
                   {spec.properties.filter((p) => isVisible(p, params)).map((p) => (
                     <Fragment key={p.name}>
-                      <PropertyField spec={p} value={params[p.name] ?? p.default} onChange={(v) => setParam(p.name, v)} />
+                      <PropertyField spec={p} value={params[p.name] ?? p.default} onChange={(v) => setParam(p.name, v)} params={params} />
                       {node.type === 'core.code' && p.name === 'language' && <CodeRuntimeHint language={String(params.language ?? 'python')} />}
                     </Fragment>
                   ))}
                   <div className="hint small muted" style={{ marginTop: 16 }}>
-                    Expressions: <code>{'{{ $json.field }}'}</code>, <code>{"{{ $('Node name').json.x }}"}</code>, <code>{'{{ $now }}'}</code>, <code>{'{{ $vars.key }}'}</code> (Jinja/Python syntax).
+                    Expressions: <code>{'{{ $json.field }}'}</code>, <code>{"{{ $('Node name').json.x }}"}</code>, <code>{'{{ $now }}'}</code>, <code>{'{{ $vars.key }}'}</code>, <code>{'{{ $state.key }}'}</code> (Jinja/Python syntax).
                   </div>
                 </>
               ) : (
@@ -302,7 +302,7 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
   )
 }
 
-function TriggerHelp({ type, params, workflowId, origin }: { type: string; params: Record<string, unknown>; workflowId: string; origin: string }) {
+function TriggerHelp({ type, nodeId, params, workflowId, origin }: { type: string; nodeId: string; params: Record<string, unknown>; workflowId: string; origin: string }) {
   const code = (s: string) => <pre className="json-item" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{s}</pre>
   switch (type) {
     case 'trigger.webhook':
@@ -334,8 +334,8 @@ function TriggerHelp({ type, params, workflowId, origin }: { type: string; param
     case 'trigger.voice':
       return (
         <div className="small">
-          <p>Click <b>Voice</b> in the editor to talk to this workflow in the browser. Requires the voice worker:</p>
-          {code('cd backend\nuv run --extra voice python voice/worker.py dev')}
+          <VoiceWorkerHelp nodeId={nodeId} workflowId={workflowId} agentName={String(params.agent_name || 'debbuilder-voice')} />
+          <p>Click <b>Voice</b> in the editor to talk to this workflow in the browser, or call a number routed to this agent (Phone page).</p>
           <p className="muted">Each user turn emits <code>{'{ text, session_id, room, phone? }'}</code>; the final node's <code>output</code> is spoken.</p>
         </div>
       )
@@ -392,6 +392,64 @@ function ListenerHelp({ nodeId, workflowId, description }: { nodeId: string; wor
       <p className="muted">
         <b>Execute step</b> waits for the next live event. Test runs don't acknowledge messages or join consumer groups, so production traffic is untouched.
       </p>
+    </div>
+  )
+}
+
+/** The voice worker the backend runs while the workflow is active (polled while the panel is open). */
+function VoiceWorkerHelp({ nodeId, workflowId, agentName }: { nodeId: string; workflowId: string; agentName: string }) {
+  const [st, setSt] = useState<VoiceWorkerStatus | null | undefined>(undefined)
+  const [showLogs, setShowLogs] = useState(false)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const load = () => api.voiceWorkerStatus(workflowId).then((r) => alive && setSt(r[nodeId] ?? null)).catch(() => alive && setSt(null))
+    load()
+    const t = window.setInterval(load, 3000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [workflowId, nodeId])
+
+  const restart = () => {
+    setBusy(true)
+    api.restartVoiceWorker(workflowId, nodeId).then(setSt).catch((e) => toast(String(e.message ?? e), 'error')).finally(() => setBusy(false))
+  }
+  const state = st?.state
+  const cls = state === 'running' ? 'listening' : state === 'error' ? 'error' : state === 'starting' ? 'starting' : 'off'
+  return (
+    <div className="listener-help voice-worker">
+      <div className={`listener-state ${cls}`}>
+        <span className="listener-dot" />
+        {st === undefined ? 'Checking…'
+          : !st ? 'Voice worker off: activate the workflow to start it'
+          : state === 'running' ? `Voice worker running · agent "${st.agent_name}"`
+          : state === 'starting' ? 'Starting the voice worker…'
+          : state === 'error' ? 'Voice worker problem'
+          : state === 'external' ? 'Workers are run separately (VOICE_WORKERS=off)' : 'Voice worker stopped'}
+        {st && state !== 'external' && (
+          <button className="btn ghost sm" style={{ marginLeft: 'auto' }} disabled={busy} onClick={restart} title="Restart the worker process">
+            <Icon name="rotate-ccw" size={13} /> Restart
+          </button>
+        )}
+      </div>
+      {st?.error && <div className="error-box small" style={{ marginTop: 8 }}>{st.error}</div>}
+      {st && state !== 'external' && (
+        <div className="listener-stats">
+          {st.pid ? <span>PID <b>{st.pid}</b></span> : null}
+          <span>Up since: <b>{ago(st.since)}</b></span>
+          {st.workflows > 1 && <span>Shared by <b>{st.workflows}</b> workflows</span>}
+          {!!st.restarts && <span>Restarts: <b>{st.restarts}</b></span>}
+          {st.logs.length > 0 && <button className="link-btn" onClick={() => setShowLogs((v) => !v)}>{showLogs ? 'Hide' : 'Show'} log</button>}
+        </div>
+      )}
+      {showLogs && st && <pre className="worker-log">{st.logs.join('\n')}</pre>}
+      {state === 'external' ? (
+        <pre className="json-item" style={{ whiteSpace: 'pre-wrap' }}>{`cd backend\nAGENT_NAME=${agentName} uv run --extra voice python voice/worker.py start`}</pre>
+      ) : (
+        <p className="muted">
+          The backend starts a LiveKit worker for agent <b>{agentName}</b> when you <b>activate</b> the workflow, restarts it if it
+          stops, and stops it when no active workflow uses that agent. Saving a change restarts it.
+        </p>
+      )}
     </div>
   )
 }

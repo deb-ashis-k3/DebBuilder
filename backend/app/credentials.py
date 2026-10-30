@@ -76,13 +76,20 @@ def fmt(template: str, data: dict) -> str:
     return template.format_map(values)
 
 
-async def load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None) -> tuple[str, dict]:
-    """Return (type, decrypted data with defaults) or raise ValueError."""
+async def load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None,
+                          owner_id: str | uuid.UUID | None) -> tuple[str, dict]:
+    """Return (type, decrypted data with defaults) or raise ValueError.
+
+    `owner_id` is the owner of the workflow that needs it: workflows only get their owner's
+    credentials, so nobody can run someone else's API keys by pasting a credential id."""
     if not cred_id:
         raise ValueError("No credential selected")
-    cred = await session.get(Credential, uuid.UUID(str(cred_id)))
-    if not cred:
-        raise ValueError(f"Credential {cred_id} not found")
+    try:
+        cred = await session.get(Credential, uuid.UUID(str(cred_id)))
+    except ValueError:
+        cred = None
+    if not cred or (str(cred.owner_id) if cred.owner_id else None) != (str(owner_id) if owner_id else None):
+        raise ValueError(f"Credential {cred_id} not found in the workflow owner's credentials")
     return cred.type, with_defaults(cred.type, decrypt(cred.data))
 
 

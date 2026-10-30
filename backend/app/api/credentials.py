@@ -8,12 +8,16 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
+from .. import voice_workers
 from ..credential_tests import test_credential
 from ..credentials import (
     CREDENTIAL_TYPES, MASK, OAUTH_TOKEN_KEY, categories, decrypt, encrypt, mask, oauth2_authorize_url,
     oauth2_exchange_code, oauth2_redirect_uri, public_types, with_defaults,
 )
-from ..db import AsyncSession, Credential, SessionLocal, get_session
+from ..access import check, manages_all, owned, owner_names, principal
+from ..db import AsyncSession, Credential, SessionLocal, User, get_session
+from ..model_lists import list_models
+from ..security import Principal
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
 oauth_router = APIRouter(prefix="/api/oauth2", tags=["oauth2"])
@@ -25,15 +29,20 @@ class CredentialIn(BaseModel):
     data: dict | None = None
 
 
+class MoveIn(BaseModel):
+    owner_id: str
+
+
 class TestIn(BaseModel):
     type: str
     data: dict = {}
     id: str | None = None  # merge stored secrets for masked fields
 
 
-def serialize(c: Credential, with_data: bool = False) -> dict:
+def serialize(c: Credential, with_data: bool = False, owner_name: str | None = None) -> dict:
     t = CREDENTIAL_TYPES.get(c.type, {})
     d = {"id": str(c.id), "name": c.name, "type": c.type, "created_at": c.created_at, "updated_at": c.updated_at,
+         "owner_id": str(c.owner_id) if c.owner_id else None, "owner_name": owner_name,
          "type_label": t.get("label", c.type), "category": t.get("category"), "color": t.get("color"),
          "testable": bool(t.get("test")), "oauth2": bool(t.get("auth", {}).get("oauth2"))}
     if with_data or d["oauth2"]:
@@ -56,19 +65,30 @@ async def types():
 
 
 @router.get("")
-async def list_credentials(type: str | None = None, session: AsyncSession = Depends(get_session)):
-    q = select(Credential).order_by(desc(Credential.updated_at))
+async def list_credentials(type: str | None = None, session: AsyncSession = Depends(get_session),
+                           p: Principal = Depends(principal)):
+    q = select(Credential).where(*owned(p, Credential.owner_id)).order_by(desc(Credential.updated_at))
     if type:
         q = q.where(Credential.type.in_(type.split(",")))
-    return [serialize(c) for c in (await session.execute(q)).scalars()]
+    rows = (await session.execute(q)).scalars().all()
+    names = await owner_names(session, [c.owner_id for c in rows])
+    out = [serialize(c, owner_name=names.get(c.owner_id)) for c in rows]
+    if any(c.owner_id != p.user.id for c in rows):
+        # Users can share a display name; admins seeing others' credentials need to tell them apart.
+        ids = {c.owner_id for c in rows if c.owner_id}
+        emails = dict((await session.execute(select(User.id, User.email).where(User.id.in_(ids)))).all())
+        for d, c in zip(out, rows):
+            d["owner_email"] = emails.get(c.owner_id)
+    return out
 
 
 @router.post("")
-async def create_credential(body: CredentialIn, session: AsyncSession = Depends(get_session)):
+async def create_credential(body: CredentialIn, session: AsyncSession = Depends(get_session),
+                            p: Principal = Depends(principal)):
     if body.type not in CREDENTIAL_TYPES:
         raise HTTPException(400, "Unknown credential type")
     c = Credential(name=body.name or CREDENTIAL_TYPES[body.type]["label"], type=body.type,
-                   data=encrypt(_clean(body.type, body.data or {})))
+                   data=encrypt(_clean(body.type, body.data or {})), owner_id=p.user.id)
     session.add(c)
     await session.commit()
     await session.refresh(c)
@@ -76,43 +96,62 @@ async def create_credential(body: CredentialIn, session: AsyncSession = Depends(
 
 
 @router.post("/test")
-async def test_unsaved(body: TestIn):
-    """Test form values before/without saving. Masked secrets are taken from the stored credential."""
+async def test_unsaved(body: TestIn, p: Principal = Depends(principal)):
+    """Test form values before/without saving. Masked secrets are taken from the stored credential,
+    so only someone who may edit it can do that (the form could point its URL anywhere)."""
     if body.type not in CREDENTIAL_TYPES:
         raise HTTPException(400, "Unknown credential type")
     data = {k: v for k, v in body.data.items() if v != MASK}
     if body.id:
         async with SessionLocal() as s:
-            stored = await s.get(Credential, uuid.UUID(body.id))
-            if stored:
-                data = {**decrypt(stored.data), **data}
+            stored = await _get(s, body.id, p, write=True)
+            data = {**decrypt(stored.data), **data}
     return await test_credential(body.type, _clean(body.type, data) | ({OAUTH_TOKEN_KEY: data[OAUTH_TOKEN_KEY]} if OAUTH_TOKEN_KEY in data else {}), body.id)
 
 
-async def _get(session: AsyncSession, cred_id: str) -> Credential:
+async def _get(session: AsyncSession, cred_id: str, p: Principal, write: bool = False) -> Credential:
     try:
         c = await session.get(Credential, uuid.UUID(cred_id))
     except ValueError:
         c = None
     if not c:
         raise HTTPException(404, "Credential not found")
+    check(p, c.owner_id, "Credential", write)
     return c
 
 
+async def _serialize_one(session: AsyncSession, c: Credential, with_data: bool = False) -> dict:
+    return serialize(c, with_data, (await owner_names(session, [c.owner_id])).get(c.owner_id))
+
+
 @router.post("/{cred_id}/test")
-async def test_saved(cred_id: str, session: AsyncSession = Depends(get_session)):
-    c = await _get(session, cred_id)
+async def test_saved(cred_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    c = await _get(session, cred_id, p, write=True)
     return await test_credential(c.type, decrypt(c.data), cred_id)
 
 
+@router.get("/{cred_id}/models")
+async def credential_models(cred_id: str, refresh: bool = False, session: AsyncSession = Depends(get_session),
+                            p: Principal = Depends(principal)):
+    """Models this credential can use, for the chat model nodes' picker. Uses the stored key, so
+    the same rule as testing applies: only someone who may edit the credential."""
+    c = await _get(session, cred_id, p, write=True)
+    try:
+        models = await list_models(c.type, decrypt(c.data), cred_id, c.updated_at.isoformat(), refresh)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"models": models}
+
+
 @router.get("/{cred_id}")
-async def get_credential(cred_id: str, session: AsyncSession = Depends(get_session)):
-    return serialize(await _get(session, cred_id), with_data=True)
+async def get_credential(cred_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    return await _serialize_one(session, await _get(session, cred_id, p), with_data=True)
 
 
 @router.put("/{cred_id}")
-async def update_credential(cred_id: str, body: CredentialIn, session: AsyncSession = Depends(get_session)):
-    c = await _get(session, cred_id)
+async def update_credential(cred_id: str, body: CredentialIn, session: AsyncSession = Depends(get_session),
+                            p: Principal = Depends(principal)):
+    c = await _get(session, cred_id, p, write=True)
     if body.name:
         c.name = body.name
     if body.data is not None:
@@ -126,13 +165,35 @@ async def update_credential(cred_id: str, body: CredentialIn, session: AsyncSess
         c.data = encrypt(current)
     await session.commit()
     await session.refresh(c)
-    return serialize(c)
+    voice_workers.credential_changed(cred_id)
+    return await _serialize_one(session, c)
+
+
+@router.post("/{cred_id}/move")
+async def move_credential(cred_id: str, body: MoveIn, session: AsyncSession = Depends(get_session),
+                          p: Principal = Depends(principal)):
+    """Give a credential to another user (admins), like n8n's "Move": only its owner's workflows can use it."""
+    if not manages_all(p):
+        raise HTTPException(403, "Only admins can move credentials between users")
+    c = await _get(session, cred_id, p, write=True)
+    try:
+        target = await session.get(User, uuid.UUID(body.owner_id))
+    except ValueError:
+        target = None
+    if not target:
+        raise HTTPException(404, "User not found")
+    c.owner_id = target.id
+    await session.commit()
+    await session.refresh(c)
+    voice_workers.credential_changed(cred_id)
+    return await _serialize_one(session, c)
 
 
 @router.delete("/{cred_id}")
-async def delete_credential(cred_id: str, session: AsyncSession = Depends(get_session)):
-    await session.delete(await _get(session, cred_id))
+async def delete_credential(cred_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    await session.delete(await _get(session, cred_id, p, write=True))
     await session.commit()
+    voice_workers.credential_changed(cred_id)
     return {"ok": True}
 
 
@@ -144,10 +205,10 @@ _STATES: dict[str, tuple[str, float]] = {}
 
 
 @oauth_router.get("/auth-url")
-async def auth_url(credential_id: str):
+async def auth_url(credential_id: str, p: Principal = Depends(principal)):
     async with SessionLocal() as s:
-        c = await s.get(Credential, uuid.UUID(credential_id))
-        if not c or not CREDENTIAL_TYPES.get(c.type, {}).get("auth", {}).get("oauth2"):
+        c = await _get(s, credential_id, p, write=True)
+        if not CREDENTIAL_TYPES.get(c.type, {}).get("auth", {}).get("oauth2"):
             raise HTTPException(404, "OAuth2 credential not found")
         data = with_defaults(c.type, decrypt(c.data))
     if not data.get("auth_url") or not data.get("client_id"):

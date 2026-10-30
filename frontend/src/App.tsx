@@ -4,8 +4,9 @@ import { AuthProvider, ROLE_LABEL, useAuth } from './auth'
 import { ConfirmHost } from './components/Dialogs'
 import { CatalogProvider, Icon, Toaster } from './lib'
 import Credentials from './pages/Credentials'
+import Phone from './pages/Phone'
 import Editor from './pages/Editor'
-import { ForcePasswordChange, LoginScreen, SetupScreen } from './pages/AuthScreens'
+import { ForcePasswordChange, LoginScreen } from './pages/AuthScreens'
 import { ExecutionDetail, ExecutionList } from './pages/Executions'
 import Settings from './pages/Settings'
 import Workflows from './pages/Workflows'
@@ -107,6 +108,7 @@ function Shell({ children, compact = false }: { children: React.ReactNode; compa
         {link('/executions', 'history', 'Executions', (p) => p.startsWith('/executions'))}
         <div className="nav-section">Configure</div>
         {link('/credentials', 'key-round', 'Credentials')}
+        {link('/phone', 'phone', 'Phone')}
         {link('/settings/account', 'settings', 'Settings', (p) => p.startsWith('/settings'))}
         <UserChip collapsed={collapsed} />
       </nav>
@@ -131,9 +133,8 @@ function UserChip({ collapsed }: { collapsed: boolean }) {
 
 /** Nothing but the sign-in screens renders until the server confirms a session. */
 function AuthGate() {
-  const { loading, setupRequired, user } = useAuth()
+  const { loading, user } = useAuth()
   if (loading) return <div className="auth-wrap"><div className="spin"><Icon name="loader-circle" size={26} /></div></div>
-  if (setupRequired) return <SetupScreen />
   if (!user) return <LoginScreen />
   if (user.must_change_password) return <ForcePasswordChange />
   return (
@@ -144,6 +145,7 @@ function AuthGate() {
           <Route path="/executions/:id" element={<Shell><ExecutionDetail /></Shell>} />
           <Route path="/executions" element={<Shell><ExecutionList /></Shell>} />
           <Route path="/credentials" element={<Shell><Credentials /></Shell>} />
+          <Route path="/phone" element={<Shell><Phone /></Shell>} />
           <Route path="/settings/:tab?" element={<Shell><Settings /></Shell>} />
           <Route path="*" element={<Shell><Workflows /></Shell>} />
       </Routes>

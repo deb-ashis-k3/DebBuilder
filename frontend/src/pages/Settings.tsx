@@ -40,10 +40,12 @@ function OneTimeSecret({ label, value, onDone }: { label: string; value: string;
 function Profile() {
   const { user, setUser } = useAuth()
   const [name, setName] = useState(user?.name ?? '')
+  const [username, setUsername] = useState(user?.username ?? '')
   return (
-    <Section title="Profile" desc={<>Signed in as <b>{user?.email}</b> · role <b>{user && ROLE_LABEL[user.role]}</b></>}>
-      <form className="row set-row" onSubmit={async (e) => { e.preventDefault(); try { setUser((await auth.updateMe(name)).user); toast('Saved') } catch (x) { toast(errText(x), 'error') } }}>
-        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" />
+    <Section title="Profile" desc={<>Signed in as <b>{user?.email}</b> · role <b>{user && ROLE_LABEL[user.role]}</b>. You can sign in with your email or your username.</>}>
+      <form className="row set-row" style={{ flexWrap: 'wrap' }} onSubmit={async (e) => { e.preventDefault(); try { setUser((await auth.updateMe({ name, username })).user); toast('Saved') } catch (x) { toast(errText(x), 'error') } }}>
+        <input className="input" style={{ flex: '1 1 180px' }} value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" aria-label="Name" />
+        <input className="input" style={{ flex: '1 1 160px' }} value={username} onChange={(e) => setUsername(e.target.value.toLowerCase())} placeholder="Username (optional)" aria-label="Username" maxLength={32} />
         <button className="btn">Save</button>
       </form>
     </Section>
@@ -217,6 +219,7 @@ function Users() {
   const [adding, setAdding] = useState(false)
   const [email, setEmail] = useState('')
   const [name, setName] = useState('')
+  const [username, setUsername] = useState('')
   const [role, setRole] = useState('editor')
   const [secret, setSecret] = useState<{ label: string; value: string } | null>(null)
   const load = () => auth.users().then(setList)
@@ -233,31 +236,33 @@ function Users() {
         <form className="row set-row card-inset" style={{ flexWrap: 'wrap' }} onSubmit={async (e) => {
           e.preventDefault()
           await act(async () => {
-            const r = await auth.createUser({ email, name, role })
+            const r = await auth.createUser({ email, name, username, role })
             if (r.temporary_password) setSecret({ label: `Temporary password for ${email}. Share it securely.`, value: r.temporary_password })
-            setEmail(''); setName(''); setAdding(false)
+            setEmail(''); setName(''); setUsername(''); setAdding(false)
           }, 'User added')
         }}>
           <input className="input" style={{ flex: '1 1 200px' }} type="email" placeholder="email@company.com" value={email} onChange={(e) => setEmail(e.target.value)} required autoFocus />
           <input className="input" style={{ flex: '1 1 140px' }} placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} />
+          <input className="input" style={{ flex: '1 1 130px' }} placeholder="Username (optional)" value={username} onChange={(e) => setUsername(e.target.value.toLowerCase())} maxLength={32} />
           <Select style={{ width: 140 }} value={role} onChange={setRole} options={roleOptions} title="Role" />
           <button className="btn primary">Add</button>
         </form>
       )}
       <div className="table-wrap"><table className="table">
-        <thead><tr><th>User</th><th>Role</th><th className="hide-sm">2FA</th><th className="hide-md">Last sign-in</th><th>Status</th><th /></tr></thead>
+        <thead><tr><th>User</th><th>Role</th><th className="hide-sm">Workflows</th><th className="hide-sm">2FA</th><th className="hide-md">Last sign-in</th><th>Status</th><th /></tr></thead>
         <tbody>
           {list.map((u) => {
             const self = u.id === me?.id
             const locked = u.role === 'owner' && !isOwner
             return (
               <tr key={u.id}>
-                <td><b>{u.name || u.email.split('@')[0]}</b>{self && <span className="muted small"> (you)</span>}<div className="muted small">{u.email}</div></td>
+                <td><b>{u.name || u.email.split('@')[0]}</b>{self && <span className="muted small"> (you)</span>}<div className="muted small">{u.email}{u.username && <> · @{u.username}</>}</div></td>
                 <td style={{ minWidth: 130 }}>
                   {self || locked ? <span className="badge">{ROLE_LABEL[u.role]}</span> : (
                     <Select value={u.role} options={roleOptions} onChange={(r) => act(() => auth.updateUser(u.id, { role: r }), `${u.email} is now ${ROLE_LABEL[r as Role]}`)} />
                   )}
                 </td>
+                <td className="hide-sm">{u.workflow_count ?? 0}</td>
                 <td className="hide-sm">{u.mfa_enabled ? <span className="badge success">On</span> : <span className="badge">Off</span>}</td>
                 <td className="muted small hide-md">{u.last_login_at ? fmtDate(u.last_login_at) : 'never'}</td>
                 <td>{u.disabled ? <span className="badge error">Disabled</span> : u.must_change_password ? <span className="badge waiting">Pending</span> : <span className="badge success">Active</span>}</td>
@@ -276,7 +281,7 @@ function Users() {
                       { label: 'Sign out everywhere', icon: 'log-out', onClick: () => act(() => auth.revokeUserSessions(u.id), 'Signed out') },
                       { divider: true, label: '' },
                       { label: 'Delete user', icon: 'trash-2', danger: true, onClick: async () => {
-                        if (await confirmDialog({ title: `Delete ${u.email}?`, message: 'Their sessions and API keys are removed. Workflows stay.', confirmLabel: 'Delete', danger: true })) await act(() => auth.deleteUser(u.id), 'User deleted')
+                        if (await confirmDialog({ title: `Delete ${u.email}?`, message: 'Their sessions and API keys are removed. Their workflows, folders and credentials are transferred to you, and active workflows keep running.', confirmLabel: 'Delete', danger: true })) await act(() => auth.deleteUser(u.id), 'User deleted. Their workflows are now yours')
                       } },
                     ]} />
                   )}

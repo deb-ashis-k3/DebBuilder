@@ -3,7 +3,7 @@ import { Icon } from '../lib'
 import type { Item } from '../types'
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
-type Mode = 'schema' | 'table' | 'json'
+type Mode = 'schema' | 'table' | 'json' | 'binary'
 
 function joinPath(base: string, key: string | number) {
   if (typeof key === 'number') return `${base}[${key}]`
@@ -153,13 +153,16 @@ export function DataView({ items, base = '$json', empty, actions, defaultMode = 
   }, [items, q])
   const schema = useMemo(() => (mode === 'schema' ? buildSchema(filtered.slice(0, 50), base) : []), [filtered, base, mode])
   const pick = (m: Mode) => { setMode(m); localStorageSet('dv-mode', m) }
+  const hasFiles = useMemo(() => (items ?? []).some((it) => Object.values(fileRefs(it)).length > 0), [items])
+  const modes: Mode[] = hasFiles ? ['schema', 'table', 'json', 'binary'] : ['schema', 'table', 'json']
+  const effMode: Mode = mode === 'binary' && !hasFiles ? 'schema' : mode
 
   return (
     <div className="dataview">
       <div className="dv-bar">
         <div className="tabs">
-          {(['schema', 'table', 'json'] as Mode[]).map((m) => (
-            <button key={m} className={`tab ${mode === m ? 'active' : ''}`} onClick={() => pick(m)}>{m === 'json' ? 'JSON' : m[0].toUpperCase() + m.slice(1)}</button>
+          {modes.map((m) => (
+            <button key={m} className={`tab ${effMode === m ? 'active' : ''}`} onClick={() => pick(m)}>{m === 'json' ? 'JSON' : m[0].toUpperCase() + m.slice(1)}</button>
           ))}
         </div>
         {!!items?.length && (
@@ -179,10 +182,47 @@ export function DataView({ items, base = '$json', empty, actions, defaultMode = 
       )}
       {!items || items.length === 0 ? (
         <div className="dv-empty">{empty ?? 'No data'}</div>
-      ) : mode === 'table' ? <Table items={filtered} base={base} />
-        : mode === 'schema' ? <div className="schema">{schema.map((n) => <SchemaRow key={String(n.key)} n={n} depth={0} />)}</div>
+      ) : effMode === 'table' ? <Table items={filtered} base={base} />
+        : effMode === 'binary' ? <FilesView items={filtered} />
+        : effMode === 'schema' ? <div className="schema">{schema.map((n) => <SchemaRow key={String(n.key)} n={n} depth={0} />)}</div>
         : filtered.slice(0, 100).map((it, i) => <div key={i} className="json-item json"><JsonNode value={it} path={base} depth={0} /></div>)}
-      {mode === 'json' && filtered.length > 100 && <div className="muted small">Showing first 100 items</div>}
+      {effMode === 'json' && filtered.length > 100 && <div className="muted small">Showing first 100 items</div>}
+    </div>
+  )
+}
+
+/** A file carried by an item (backend app/binary.py): item.binary[property] = FileRef. */
+interface FileRef { id: string; fileName: string; mimeType: string; fileSize: number; fileExtension?: string }
+
+function fileRefs(it: Item): Record<string, FileRef> {
+  const b = (it as Record<string, unknown>)?.binary
+  if (!b || typeof b !== 'object') return {}
+  return Object.fromEntries(Object.entries(b as Record<string, FileRef>).filter(([, v]) => v && typeof v === 'object' && /^[0-9a-f]{32}$/.test(v.id ?? '')))
+}
+
+const fileUrl = (f: FileRef, download = false) =>
+  `/api/binary/${f.id}?${new URLSearchParams({ name: f.fileName, mime: f.mimeType, ...(download ? { download: 'true' } : {}) })}`
+
+function fmtSize(n: number) {
+  return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`
+}
+
+function FilesView({ items }: { items: Item[] }) {
+  return (
+    <div className="dv-files">
+      {items.slice(0, 100).map((it, i) => Object.entries(fileRefs(it)).map(([prop, f]) => (
+        <div key={`${i}-${prop}`} className="dv-file">
+          {f.mimeType.startsWith('image/') && !f.mimeType.includes('svg')
+            ? <img src={fileUrl(f)} alt={f.fileName} className="dv-file-thumb" loading="lazy" />
+            : <div className="dv-file-thumb icon"><Icon name="file" size={22} /></div>}
+          <div className="grow">
+            <div className="title">{f.fileName}</div>
+            <div className="muted small">item {i} · <code>$binary.{prop}</code> · {f.mimeType} · {fmtSize(f.fileSize)}</div>
+          </div>
+          <a className="btn sm" href={fileUrl(f)} target="_blank" rel="noreferrer">View</a>
+          <a className="btn sm" href={fileUrl(f, true)}>Download</a>
+        </div>
+      )))}
     </div>
   )
 }

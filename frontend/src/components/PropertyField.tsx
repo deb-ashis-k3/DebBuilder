@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { Icon, isExpr, isVisible, toast } from '../lib'
 import type { Credential, PropSpec, Workflow } from '../types'
@@ -9,6 +9,77 @@ import { Select } from './Select'
 let credCache: Credential[] | null = null
 let wfCache: Workflow[] | null = null
 const credListeners = new Set<(c: Credential[]) => void>()
+window.addEventListener('auth:changed', () => { credCache = null; wfCache = null; modelCache.clear() })
+
+// Provider model lists per credential (the server caches too; this avoids refetching per node).
+type ModelOption = { value: string; label: string; hint?: string }
+const modelCache = new Map<string, Promise<ModelOption[]>>()
+function loadModels(credId: string, refresh = false): Promise<ModelOption[]> {
+  if (refresh || !modelCache.has(credId)) {
+    const p = api.credentialModels(credId, refresh).then((r) => r.models)
+    p.catch(() => modelCache.delete(credId))  // retry next time
+    modelCache.set(credId, p)
+  }
+  return modelCache.get(credId)!
+}
+
+/** n8n-style model picker: "From list" asks the provider (via the node's credential), "By ID" is free text / expression. */
+function ModelPicker({ spec, value, onChange, credentialId }: { spec: PropSpec; value: unknown; onChange: (v: unknown) => void; credentialId: string | null }) {
+  const str = value == null ? '' : String(value)
+  const [mode, setMode] = useState<'list' | 'id'>(isExpr(value) ? 'id' : 'list')
+  // Tagged with its credential so switching credentials never shows the previous one's list.
+  const [result, setResult] = useState<{ cred: string; models: ModelOption[] | null; err: string } | null>(null)
+  const [loading, setLoading] = useState(false)
+  const current = result?.cred === credentialId ? result : null
+  const models = current?.models ?? null
+  const err = current?.err ?? ''
+
+  const load = useCallback(async (refresh = false) => {
+    if (!credentialId) return
+    setLoading(true)
+    try { setResult({ cred: credentialId, models: await loadModels(credentialId, refresh), err: '' }) }
+    catch (e) { setResult({ cred: credentialId, models: null, err: String(e instanceof Error ? e.message : e) }) }
+    finally { setLoading(false) }
+  }, [credentialId])
+  useEffect(() => { if (mode === 'list') load() }, [load, mode])
+
+  // Without a credential (or if loading failed) the node's suggestions still work offline.
+  const base: ModelOption[] = models ?? (spec.options ?? []).map((o) => ({ value: String(o.value), label: o.label }))
+  const options = str && !base.some((m) => m.value === str) ? [{ value: str, label: str, hint: 'current' }, ...base] : base
+  return (
+    <div className="model-picker">
+      <div className="row" style={{ gap: 6 }}>
+        <Select style={{ width: 112, flex: 'none' }} value={mode} onChange={(v) => setMode(v as 'list' | 'id')} title="How to choose the model"
+          options={[{ value: 'list', label: 'From list' }, { value: 'id', label: 'By ID' }]} />
+        {mode === 'list' ? (
+          <>
+            <Select style={{ flex: 1, minWidth: 0 }} value={str} onChange={(v) => onChange(v)} searchable
+              placeholder={loading ? 'Loading models…' : 'Select a model…'}
+              options={options.map((m) => ({ value: m.value, label: m.label, hint: m.hint !== m.label ? m.hint : undefined }))} />
+            <button type="button" className="btn icon" title="Reload models from the provider" disabled={!credentialId || loading} onClick={() => load(true)}>
+              <Icon name={loading ? 'loader-circle' : 'refresh-cw'} size={15} className={loading ? 'spin' : undefined} />
+            </button>
+          </>
+        ) : (
+          <input className={`input ${isExpr(value) ? 'expr' : ''}`} style={{ flex: 1, minWidth: 0 }} value={str}
+            placeholder="e.g. gpt-5-mini or {{ $json.model }}" onChange={(e) => onChange(e.target.value)} />
+        )}
+      </div>
+      {mode === 'list' && !credentialId && <div className="muted small" style={{ marginTop: 6 }}>Select a credential to load the models it can use.</div>}
+      {mode === 'list' && err && <div className="test-inline bad">Couldn’t load models: {err}. Pick “By ID” to type a model name.</div>}
+      {mode === 'list' && models && !err && <div className="muted small" style={{ marginTop: 6 }}>{models.length} model{models.length === 1 ? '' : 's'} available</div>}
+    </div>
+  )
+}
+
+// Owner of the workflow open in the editor. A workflow can only use its owner's credentials and
+// call its owner's workflows (enforced by the server), so pickers only offer those. Admins see
+// everyone's lists; without this they'd be offered items the run would reject.
+let pickerOwner: string | null | undefined
+let pickerMine = true  // new credentials belong to the caller, so only offer "create" in your own workflow
+export function setPickerOwner(ownerId: string | null | undefined, mine = true) { pickerOwner = ownerId; pickerMine = mine }
+const ofOwner = <T extends { owner_id?: string | null }>(items: T[]) =>
+  pickerOwner === undefined ? items : items.filter((x) => x.owner_id === pickerOwner)
 
 async function refreshCreds() {
   credCache = await api.credentials()
@@ -54,7 +125,7 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
   const creds = useCredentials()
   const [modal, setModal] = useState(false)
   const allowed = spec.credential_types ?? []
-  const options = creds.filter((c) => !allowed.length || allowed.includes(c.type))
+  const options = ofOwner(creds).filter((c) => !allowed.length || allowed.includes(c.type))
   return (
     <div className="row">
       <Select value={String(value ?? '')} onChange={(v) => onChange(v || null)} placeholder={options.length ? 'Select credential…' : 'No credentials yet'}
@@ -65,7 +136,7 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
           toast(r.message, r.ok ? 'info' : 'error')
         }}><Icon name="plug-zap" size={16} /></button>
       )}
-      <button className="btn icon" title="Create credential" onClick={() => setModal(true)}><Icon name="plus" /></button>
+      {pickerMine && <button className="btn icon" title="Create credential" onClick={() => setModal(true)}><Icon name="plus" /></button>}
       {modal && (
         <CredentialModal allowedTypes={allowed} onClose={() => setModal(false)}
           onSaved={async (c) => { setModal(false); await refreshCreds(); onChange(c.id) }} />
@@ -98,12 +169,17 @@ function Collection({ spec, value, onChange }: { spec: PropSpec; value: unknown;
   )
 }
 
-export function PropertyField({ spec, value, onChange }: { spec: PropSpec; value: unknown; onChange: (v: unknown) => void }) {
+export function PropertyField({ spec, value, onChange, params }: {
+  spec: PropSpec; value: unknown; onChange: (v: unknown) => void
+  /** The node's other parameters (e.g. its credential, for loading model lists). */
+  params?: Record<string, unknown>
+}) {
   const workflows = useWorkflows()
   const exprCapable = ['number', 'boolean', 'options'].includes(spec.type)
   const [exprMode, setExprMode] = useState(exprCapable && isExpr(value))
   const str = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   const exprCls = isExpr(value) ? 'expr' : ''
+  if (spec.type === 'section') return <div className="prop-section">{spec.label}</div>
 
   let control: React.ReactNode
   if (exprMode) {
@@ -140,6 +216,11 @@ export function PropertyField({ spec, value, onChange }: { spec: PropSpec; value
         break
       }
       case 'combo': {
+        if (spec.load_options === 'models') {
+          const cred = params?.credential
+          control = <ModelPicker spec={spec} value={value} onChange={onChange} credentialId={typeof cred === 'string' && cred && !isExpr(cred) ? cred : null} />
+          break
+        }
         const id = `dl-${spec.name}`
         control = (
           <>
@@ -155,7 +236,7 @@ export function PropertyField({ spec, value, onChange }: { spec: PropSpec; value
       case 'workflow':
         control = (
           <Select value={String(value ?? '')} onChange={(v) => onChange(v || null)} placeholder="Select workflow…"
-            options={workflows.map((w) => ({ value: w.id, label: w.name }))} />
+            options={ofOwner(workflows).map((w) => ({ value: w.id, label: w.name }))} />
         )
         break
       case 'collection':

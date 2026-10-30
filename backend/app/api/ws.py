@@ -1,19 +1,42 @@
 import asyncio
+import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from ..access import can_read
+from ..db import Execution, SessionLocal, Workflow
 from ..engine.bus import bus
 from ..security import _allowed_origin, resolve
 
 router = APIRouter()
 
 
-async def _pump(ws: WebSocket, channel: str, replay: bool) -> None:
+async def _owner(workflow_id: str | None = None, execution_id: str | None = None) -> tuple[bool, uuid.UUID | None]:
+    """(exists, owner id) of the workflow a channel belongs to."""
+    try:
+        async with SessionLocal() as s:
+            if execution_id:
+                ex = await s.get(Execution, uuid.UUID(execution_id))
+                if not ex:
+                    return False, None
+                workflow_id = str(ex.workflow_id)
+            wf = await s.get(Workflow, uuid.UUID(workflow_id))
+    except ValueError:
+        return False, None
+    return (wf is not None, wf.owner_id if wf else None)
+
+
+async def _pump(ws: WebSocket, channel: str, replay: bool, workflow_id: str | None = None,
+                execution_id: str | None = None) -> None:
     # The HTTP middleware doesn't see WebSockets: authenticate the handshake here
-    # (session cookie or API key) and refuse cross-site origins (CSWSH).
+    # (session cookie or API key), refuse cross-site origins (CSWSH) and other users' workflows.
     p = await resolve(ws)
     if p is None or not p.can("workflow:read") or not _allowed_origin(ws, ws.headers.get("origin") or ""):
         await ws.close(code=4401)
+        return
+    exists, owner = await _owner(workflow_id, execution_id)
+    if not exists or not can_read(p, owner):
+        await ws.close(code=4404)
         return
     await ws.accept()
     q, buffered = bus.subscribe(channel)
@@ -39,9 +62,9 @@ async def _pump(ws: WebSocket, channel: str, replay: bool) -> None:
 
 @router.websocket("/ws/executions/{execution_id}")
 async def ws_execution(ws: WebSocket, execution_id: str):
-    await _pump(ws, execution_id, replay=True)
+    await _pump(ws, execution_id, replay=True, execution_id=execution_id)
 
 
 @router.websocket("/ws/workflows/{workflow_id}")
 async def ws_workflow(ws: WebSocket, workflow_id: str):
-    await _pump(ws, f"wf:{workflow_id}", replay=False)
+    await _pump(ws, f"wf:{workflow_id}", replay=False, workflow_id=workflow_id)

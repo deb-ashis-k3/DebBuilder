@@ -5,12 +5,13 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
-from ..db import AuditLog, SessionLocal, User
-from ..security import (ROLES, audit, check_password_policy, current, hash_password, revoke_sessions, role_rank,
+from ..db import AuditLog, Credential, Folder, SessionLocal, User, Workflow
+from ..security import (ROLES, audit, check_password_policy, clean_username, current, hash_password, revoke_sessions, role_rank,
                         temp_password)
-from .auth import user_json
+from .auth import ensure_username_free, user_json
+from .hooks import invalidate_webhooks
 
 router = APIRouter(prefix="/api", tags=["admin"])
 
@@ -35,12 +36,14 @@ async def _owner_count(s) -> int:
 async def list_users():
     async with SessionLocal() as s:
         rows = (await s.execute(select(User).order_by(User.created_at))).scalars().all()
-    return [user_json(u) for u in rows]
+        counts = dict((await s.execute(select(Workflow.owner_id, func.count()).group_by(Workflow.owner_id))).all())
+    return [{**user_json(u), "workflow_count": counts.get(u.id, 0)} for u in rows]
 
 
 class NewUser(BaseModel):
     email: str
     name: str = ""
+    username: str = ""
     role: str = "editor"
     password: str | None = None
 
@@ -51,6 +54,7 @@ async def create_user(body: NewUser, request: Request):
     email = body.email.strip().lower()
     if "@" not in email:
         raise HTTPException(400, "Enter a valid email address")
+    username = clean_username(body.username)
     if body.role not in ROLES:
         raise HTTPException(400, f"Role must be one of {', '.join(ROLES)}")
     if not _can_manage(p.role, body.role):
@@ -62,7 +66,8 @@ async def create_user(body: NewUser, request: Request):
     async with SessionLocal() as s:
         if (await s.execute(select(User).where(User.email == email))).scalar_one_or_none():
             raise HTTPException(409, "A user with that email already exists")
-        u = User(email=email, name=body.name.strip()[:200], role=body.role, password_hash=hash_password(pw),
+        await ensure_username_free(s, username)
+        u = User(email=email, username=username, name=body.name.strip()[:200], role=body.role, password_hash=hash_password(pw),
                  must_change_password=True)
         s.add(u)
         await s.commit()
@@ -73,6 +78,7 @@ async def create_user(body: NewUser, request: Request):
 
 class UserPatch(BaseModel):
     name: str | None = None
+    username: str | None = None  # "" removes it
     role: str | None = None
     disabled: bool | None = None
 
@@ -102,6 +108,10 @@ async def update_user(user_id: str, body: UserPatch, request: Request):
             u.disabled = body.disabled
         if body.name is not None:
             u.name = body.name.strip()[:200]
+        if body.username is not None:
+            username = clean_username(body.username)
+            await ensure_username_free(s, username, u.id)  # before assigning, or autoflush hits the unique index
+            u.username = username
         await s.commit()
         await s.refresh(u)
     if body.disabled or body.role:
@@ -169,10 +179,17 @@ async def delete_user(user_id: str, request: Request):
         if u.role == "owner" and await _owner_count(s) <= 1:
             raise HTTPException(400, "The last owner can't be deleted")
         email = u.email
+        # Their workspace (workflows, folders, credentials) moves to the admin deleting them, so
+        # active workflows keep running with the same credentials.
+        moved = {}
+        for model in (Workflow, Folder, Credential):
+            res = await s.execute(update(model).where(model.owner_id == u.id).values(owner_id=p.user.id))
+            moved[model.__tablename__] = res.rowcount
         await s.delete(u)
         await s.commit()
-    await audit("user.deleted", request, p, status=200, target=email)
-    return {"ok": True}
+    invalidate_webhooks()  # cached webhook routes carry the owner
+    await audit("user.deleted", request, p, status=200, target=email, transferred_to=p.user.email, **moved)
+    return {"ok": True, "transferred": moved}
 
 
 @router.get("/audit")

@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Res
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from ..access import can_manage
 from ..credentials import decrypt
 from ..db import Credential, SessionLocal, Workflow
 from ..engine.runtime import execute_workflow, load_workflow, output_text, workflow_to_dict
@@ -186,10 +187,11 @@ async def chat(wf_id: str, body: ChatIn, request: Request):
     node = next((n for n in wf["nodes"] if n["type"] == "trigger.chat" and not n.get("disabled")), None)
     if not node:
         raise HTTPException(400, "Workflow has no Chat Trigger")
-    # Signed-in users who may run workflows can always chat (editor panel); anyone else only if the
-    # Chat Trigger is marked public. (A client header used to bypass this check.)
+    # Signed-in users who may run this workflow can always chat (editor panel); anyone else only if
+    # the Chat Trigger is marked public. (A client header used to bypass this check.)
     p = getattr(request.state, "principal", None)
-    if not (p and p.can("workflow:execute")) and not (node.get("parameters") or {}).get("public"):
+    owner = uuid.UUID(wf["owner_id"]) if wf.get("owner_id") else None
+    if not (p and p.can("workflow:execute") and can_manage(p, owner)) and not (node.get("parameters") or {}).get("public"):
         raise HTTPException(403, "Public chat is disabled on this Chat Trigger")
     item = {"message": body.message, "chatInput": body.message, "session_id": body.session_id or str(uuid.uuid4()),
             **body.metadata}
@@ -205,9 +207,10 @@ async def chat(wf_id: str, body: ChatIn, request: Request):
 
 
 async def _whatsapp_creds() -> list[tuple[str, dict]]:
+    """[(credential id, data incl. "_owner_id")]: a trigger only uses its workflow owner's credential."""
     async with SessionLocal() as s:
         rows = (await s.execute(select(Credential).where(Credential.type == "whatsapp"))).scalars().all()
-    return [(str(c.id), decrypt(c.data)) for c in rows]
+    return [(str(c.id), {**decrypt(c.data), "_owner_id": str(c.owner_id) if c.owner_id else None}) for c in rows]
 
 
 @router.get("/api/whatsapp/webhook")
@@ -231,7 +234,7 @@ async def whatsapp_receive(request: Request):
     for wf, node in await _workflows_with("trigger.whatsapp"):
         params = node.get("parameters") or {}
         cred = creds.get(str(params.get("credential")))
-        if not cred:
+        if not cred or cred["_owner_id"] != wf.get("owner_id"):
             continue
         if cred.get("app_secret") and not verify_signature(cred["app_secret"], raw, request.headers.get("x-hub-signature-256")):
             log.warning("WhatsApp signature mismatch for workflow %s", wf["id"])

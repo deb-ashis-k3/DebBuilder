@@ -4,10 +4,14 @@ import { CredentialModal, TypeTile, useCredentialCatalog } from '../components/C
 import { Icon, fmtDate, toast } from '../lib'
 import type { Credential, TestResult } from '../types'
 import { confirmDialog, errText } from '../components/Dialogs'
-import { useAuth } from '../auth'
+import { OwnerBadge, OwnerFilter, useOwnerScope } from '../components/Owner'
+import { managesAll, useAuth } from '../auth'
 
 export default function Credentials() {
-  const canWrite = useAuth().can('credential:write')
+  const { can, user } = useAuth()
+  const owners = useOwnerScope('cred-owner')
+  // Editing, testing or deleting needs ownership (or admin); viewers only see names.
+  const canEdit = (c: Credential) => can('credential:write') && (owners.isMine(c) || managesAll(user))
   const catalog = useCredentialCatalog()
   const [list, setList] = useState<Credential[] | null>(null)
   const [edit, setEdit] = useState<Credential | 'new' | null>(null)
@@ -26,12 +30,13 @@ export default function Credentials() {
     }
   }
   const testAll = async () => {
-    const targets = (list ?? []).filter((c) => c.testable)
+    const targets = shown.filter((c) => c.testable && canEdit(c))
     await Promise.all(targets.map(test))
     toast(`Tested ${targets.length} credential(s)`)
   }
 
-  const shown = (list ?? []).filter((c) => `${c.name} ${c.type_label} ${c.category}`.toLowerCase().includes(q.toLowerCase()))
+  const shown = (list ?? []).filter((c) => owners.visible(c) && `${c.name} ${c.type_label} ${c.category} ${c.owner_name ?? ''}`.toLowerCase().includes(q.toLowerCase()))
+  const canWrite = can('credential:write')
   const total = catalog ? Object.keys(catalog.types).length : 0
 
   return (
@@ -45,9 +50,12 @@ export default function Credentials() {
         <p className="page-sub"><Icon name="shield-check" size={14} /> {total} services supported: LLMs, voice, messaging, email, databases, CRMs, payments, cloud and any OAuth2 / HTTP API. Encrypted at rest.</p>
 
         {list && list.length > 0 && (
-          <div className="search" style={{ maxWidth: 340, marginBottom: 14 }}>
-            <Icon name="search" size={15} />
-            <input className="input" placeholder="Search your credentials…" value={q} onChange={(e) => setQ(e.target.value)} />
+          <div className="row" style={{ gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
+            <div className="search" style={{ maxWidth: 340, flex: '1 1 220px' }}>
+              <Icon name="search" size={15} />
+              <input className="input" placeholder="Search credentials…" value={q} onChange={(e) => setQ(e.target.value)} />
+            </div>
+            {owners.show && <OwnerFilter value={owners.scope} onChange={owners.setScope} />}
           </div>
         )}
 
@@ -64,17 +72,18 @@ export default function Credentials() {
           {shown.map((c, i) => {
             const r = results[c.id]
             return (
-              <div key={c.id} className="list-item" style={{ animationDelay: `${i * 30}ms` }} onClick={() => canWrite && setEdit(c)}>
+              <div key={c.id} className="list-item" style={{ animationDelay: `${i * 30}ms` }} onClick={() => canEdit(c) && setEdit(c)}>
                 <TypeTile label={c.type_label} color={c.color ?? '#6366f1'} />
                 <div className="grow">
                   <div className="title">{c.name}</div>
                   <div className="muted small">{c.type_label} · {c.category} · updated {fmtDate(c.updated_at)}</div>
                   {r && r !== 'testing' && <div className={`test-inline ${r.ok ? 'ok' : 'bad'}`}>{r.message}</div>}
                 </div>
+                <OwnerBadge item={c} />
                 {c.oauth2 && (c.oauth_connected ? <span className="badge success">Connected</span> : <span className="badge waiting">Not connected</span>)}
                 {r === 'testing' && <span className="badge running">Testing</span>}
                 {r && r !== 'testing' && <span className={`badge ${r.ok ? 'success' : 'error'}`}>{r.ok ? 'Working' : 'Failed'}</span>}
-                <div className="actions">
+                {canEdit(c) && <div className="actions">
                   {c.testable && (
                     <button className="btn ghost sm" title="Test connection" onClick={(e) => { e.stopPropagation(); test(c) }}>
                       <Icon name="plug-zap" size={15} /> Test
@@ -85,7 +94,7 @@ export default function Credentials() {
                     if (!await confirmDialog({ title: `Delete credential "${c.name}"?`, message: 'Workflows that use it will fail until you pick another credential.', confirmLabel: 'Delete', danger: true })) return
                     try { await api.deleteCredential(c.id); toast('Credential deleted'); load() } catch (err) { toast(errText(err), 'error') }
                   }}><Icon name="trash-2" size={15} /></button>
-                </div>
+                </div>}
               </div>
             )
           })}

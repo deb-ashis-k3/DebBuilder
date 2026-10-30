@@ -6,6 +6,8 @@ import type { RunState, WFNode } from '../types'
 export interface FlowNodeData extends Record<string, unknown> {
   node: WFNode
   run?: RunState
+  /** Sub-nodes: calls their AI node made through them in the last execution. */
+  sub?: { status: 'running' | 'success' | 'error'; count: number; duration_ms: number }
 }
 
 const pct = (i: number, n: number) => `${((i + 1) / (n + 1)) * 100}%`
@@ -25,7 +27,7 @@ function FlowNodeImpl({ id, data, selected }: NodeProps & { data: FlowNodeData }
   const wide = spec.ai_inputs.length > 0
   const ins = inputPorts(spec)
   const outs = outputPorts(spec, node)
-  const st = data.run?.status
+  const st = data.run?.status ?? data.sub?.status
   const cls = ['fnode', spec.trigger && 'trigger', isSub && 'sub', wide && 'wide', selected && 'selected',
     node.disabled && 'disabled', st && `st-${st}`].filter(Boolean).join(' ')
   const counts = data.run?.counts
@@ -64,7 +66,9 @@ function FlowNodeImpl({ id, data, selected }: NodeProps & { data: FlowNodeData }
         {isSub && <Handle id={spec.provides!} type="source" position={Position.Top} className="ai ai-top" />}
 
         {node.pin_data != null && <div className="fnode-pin" title="Output is pinned"><Icon name="pin" size={11} strokeWidth={2.6} /></div>}
-        {st === 'success' && <div className="fnode-status success"><Icon name="check" size={13} strokeWidth={3} /></div>}
+        {st === 'success' && <div className={`fnode-status success ${data.sub && data.sub.count > 1 ? 'count' : ''}`}>
+          <Icon name="check" size={13} strokeWidth={3} />{data.sub && data.sub.count > 1 && <span>{data.sub.count}</span>}
+        </div>}
         {st === 'error' && <div className="fnode-status error"><Icon name="x" size={13} strokeWidth={3} /></div>}
         {st === 'waiting' && <div className="fnode-status waiting"><Icon name="pause" size={12} strokeWidth={3} /></div>}
       </div>

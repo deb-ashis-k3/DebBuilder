@@ -3,6 +3,7 @@
   uv run python -m app.cli list-users
   uv run python -m app.cli reset-password owner@example.com   # prints a temporary password
   uv run python -m app.cli disable-mfa owner@example.com
+  uv run python -m app.cli test-email you@example.com         # checks the SMTP settings
 """
 
 import asyncio
@@ -15,6 +16,25 @@ async def main(argv: list[str]) -> int:
     from .db import User, init_db, SessionLocal
     from .security import hash_password, revoke_sessions, temp_password
 
+    if argv[:1] == ["test-email"] and len(argv) > 1:
+        from .config import get_settings
+        from .services import mailer
+        st = get_settings()
+        if not mailer.configured():
+            print("SMTP_HOST isn't set in backend/.env")
+            return 1
+        print(f"Sending via {st.smtp_host}:{st.smtp_port} ({st.smtp_security}) as {st.smtp_user or '(no login)'} ...")
+        try:
+            await mailer.send(argv[1], *mailer.sign_in_email("123456", to=argv[1], name="", ip="127.0.0.1",
+                                                            user_agent="DebBuilder CLI test", minutes=10))
+        except mailer.MailError as e:
+            print(f"Failed: {e}")
+            if "535" in str(e) or "Username and Password" in str(e):
+                print("Gmail rejected the login: SMTP_USER must be the full Gmail address and SMTP_PASSWORD the app password "
+                      "(not your normal password), with 2-Step Verification on.")
+            return 1
+        print(f"Sent. Check the inbox (and spam) of {argv[1]}.")
+        return 0
     await init_db()
     if not argv or argv[0] not in ("list-users", "reset-password", "disable-mfa") or (argv[0] != "list-users" and len(argv) < 2):
         print(__doc__)

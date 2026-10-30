@@ -5,13 +5,15 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, select
 
-from .. import listeners, scheduler
+from .. import listeners, scheduler, voice_workers
+from ..access import check, owned, owner_names, principal
 from .hooks import invalidate_webhooks
 from ..db import AsyncSession, Folder, Workflow, get_session
 from ..engine.runtime import execute_workflow, workflow_to_dict
 from ..nodes import REGISTRY
+from ..security import Principal
 from ..templates import TEMPLATES
 
 router = APIRouter(prefix="/api", tags=["workflows"])
@@ -54,9 +56,10 @@ class RunIn(BaseModel):
     workflow: dict | None = None
 
 
-def serialize(wf: Workflow, full: bool = True) -> dict[str, Any]:
+def serialize(wf: Workflow, full: bool = True, owner_name: str | None = None) -> dict[str, Any]:
     d = {
         "id": str(wf.id), "name": wf.name, "description": wf.description, "active": wf.active,
+        "owner_id": str(wf.owner_id) if wf.owner_id else None, "owner_name": owner_name,
         "tags": wf.tags or [], "created_at": wf.created_at, "updated_at": wf.updated_at,
         "folder_id": str(wf.folder_id) if wf.folder_id else None,
         "node_count": len(wf.nodes or []),
@@ -67,14 +70,19 @@ def serialize(wf: Workflow, full: bool = True) -> dict[str, Any]:
     return d
 
 
-async def _get(session: AsyncSession, wf_id: str) -> Workflow:
+async def _get(session: AsyncSession, wf_id: str, p: Principal, write: bool = False) -> Workflow:
     try:
         wf = await session.get(Workflow, uuid.UUID(wf_id))
     except ValueError:
         wf = None
     if not wf:
         raise HTTPException(404, "Workflow not found")
+    check(p, wf.owner_id, "Workflow", write)
     return wf
+
+
+async def _serialize_one(session: AsyncSession, wf: Workflow) -> dict[str, Any]:
+    return serialize(wf, owner_name=(await owner_names(session, [wf.owner_id])).get(wf.owner_id))
 
 
 def _validate(nodes: list[dict]) -> None:
@@ -92,10 +100,15 @@ def _uuid(v: str | None) -> uuid.UUID | None:
         raise HTTPException(400, f"Invalid id '{v}'") from e
 
 
-async def _folder(session: AsyncSession, folder_id: str | None) -> uuid.UUID | None:
+async def _folder(session: AsyncSession, folder_id: str | None, owner_id: uuid.UUID | None) -> uuid.UUID | None:
+    """A workflow can only sit in a folder of the same owner."""
     fid = _uuid(folder_id)
-    if fid and not await session.get(Folder, fid):
-        raise HTTPException(404, "Folder not found")
+    if fid:
+        f = await session.get(Folder, fid)
+        if not f:
+            raise HTTPException(404, "Folder not found")
+        if f.owner_id != owner_id:
+            raise HTTPException(400, "That folder belongs to another user's workspace")
     return fid
 
 
@@ -122,26 +135,32 @@ async def code_runtimes():
 
 
 @router.get("/workflows")
-async def list_workflows(session: AsyncSession = Depends(get_session)):
-    rows = (await session.execute(select(Workflow).order_by(desc(Workflow.updated_at)))).scalars().all()
-    return [serialize(w, full=False) for w in rows]
+async def list_workflows(session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    q = select(Workflow).where(*owned(p, Workflow.owner_id)).order_by(desc(Workflow.updated_at))
+    rows = (await session.execute(q)).scalars().all()
+    names = await owner_names(session, [w.owner_id for w in rows])
+    return [serialize(w, full=False, owner_name=names.get(w.owner_id)) for w in rows]
 
 
 @router.post("/workflows/move")
-async def move_workflows(body: IdsIn, session: AsyncSession = Depends(get_session)):
-    fid = await _folder(session, body.folder_id)
+async def move_workflows(body: IdsIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     ids = [_uuid(i) for i in body.ids]
-    await session.execute(update(Workflow).where(Workflow.id.in_(ids)).values(folder_id=fid))
+    q = select(Workflow).where(Workflow.id.in_(ids), *owned(p, Workflow.owner_id, write=True))
+    rows = (await session.execute(q)).scalars().all()
+    for wf in rows:
+        wf.folder_id = await _folder(session, body.folder_id, wf.owner_id)
     await session.commit()
-    return {"ok": True, "moved": len(ids)}
+    return {"ok": True, "moved": len(rows)}
 
 
 @router.post("/workflows/delete")
-async def delete_workflows(body: IdsIn, session: AsyncSession = Depends(get_session)):
-    rows = (await session.execute(select(Workflow).where(Workflow.id.in_([_uuid(i) for i in body.ids])))).scalars().all()
+async def delete_workflows(body: IdsIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    q = select(Workflow).where(Workflow.id.in_([_uuid(i) for i in body.ids]), *owned(p, Workflow.owner_id, write=True))
+    rows = (await session.execute(q)).scalars().all()
     for wf in rows:
         scheduler.remove_workflow(str(wf.id))
         listeners.remove_workflow(str(wf.id))
+        voice_workers.remove_workflow(str(wf.id))
         await session.delete(wf)
     await session.commit()
     invalidate_webhooks()
@@ -149,9 +168,10 @@ async def delete_workflows(body: IdsIn, session: AsyncSession = Depends(get_sess
 
 
 @router.get("/workflows/export")
-async def export_workflows(ids: str | None = None, folder_id: str | None = None, session: AsyncSession = Depends(get_session)):
+async def export_workflows(ids: str | None = None, folder_id: str | None = None, session: AsyncSession = Depends(get_session),
+                           p: Principal = Depends(principal)):
     """Bulk export: comma separated ids, or every workflow in a folder (and its subfolders)."""
-    q = select(Workflow).order_by(Workflow.name)
+    q = select(Workflow).where(*owned(p, Workflow.owner_id)).order_by(Workflow.name)
     if ids:
         q = q.where(Workflow.id.in_([_uuid(i) for i in ids.split(",") if i]))
     elif folder_id:
@@ -163,7 +183,7 @@ async def export_workflows(ids: str | None = None, folder_id: str | None = None,
 
 
 @router.post("/workflows/import")
-async def import_workflows(body: ImportIn, session: AsyncSession = Depends(get_session)):
+async def import_workflows(body: ImportIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     data = body.data
     if body.url:
         try:
@@ -182,12 +202,12 @@ async def import_workflows(body: ImportIn, session: AsyncSession = Depends(get_s
         raise HTTPException(400, "This looks like an n8n export. n8n nodes aren't compatible; rebuild it with DebBuilder nodes.")
     for w in items:
         _validate(w["nodes"])
-    fid = await _folder(session, body.folder_id)
+    fid = await _folder(session, body.folder_id, p.user.id)
     created = []
     for w in items:
         wf = Workflow(name=str(w.get("name") or "Imported workflow")[:200], description=w.get("description") or "",
                       nodes=w["nodes"], edges=w.get("edges") or [], settings=w.get("settings") or {},
-                      tags=w.get("tags") or [], folder_id=fid)
+                      tags=w.get("tags") or [], folder_id=fid, owner_id=p.user.id)
         session.add(wf)
         created.append(wf)
     await session.commit()
@@ -197,29 +217,30 @@ async def import_workflows(body: ImportIn, session: AsyncSession = Depends(get_s
 
 
 @router.post("/workflows")
-async def create_workflow(body: WorkflowIn, session: AsyncSession = Depends(get_session)):
+async def create_workflow(body: WorkflowIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     nodes = body.nodes or []
     _validate(nodes)
     wf = Workflow(name=body.name or "My workflow", description=body.description or "", nodes=nodes,
                   edges=body.edges or [], settings=body.settings or {}, tags=body.tags or [],
-                  folder_id=await _folder(session, body.folder_id))
+                  folder_id=await _folder(session, body.folder_id, p.user.id), owner_id=p.user.id)
     session.add(wf)
     await session.commit()
     await session.refresh(wf)
-    return serialize(wf)
+    return await _serialize_one(session, wf)
 
 
 @router.get("/workflows/{wf_id}")
-async def get_workflow(wf_id: str, session: AsyncSession = Depends(get_session)):
-    return serialize(await _get(session, wf_id))
+async def get_workflow(wf_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    return await _serialize_one(session, await _get(session, wf_id, p))
 
 
 @router.put("/workflows/{wf_id}")
-async def update_workflow(wf_id: str, body: WorkflowIn, session: AsyncSession = Depends(get_session)):
-    wf = await _get(session, wf_id)
+async def update_workflow(wf_id: str, body: WorkflowIn, session: AsyncSession = Depends(get_session),
+                          p: Principal = Depends(principal)):
+    wf = await _get(session, wf_id, p, write=True)
     data = body.model_dump(exclude_none=True)
     if "folder_id" in body.model_fields_set:  # explicit null = move to the top level
-        data["folder_id"] = await _folder(session, body.folder_id)
+        data["folder_id"] = await _folder(session, body.folder_id, wf.owner_id)
     if "nodes" in data:
         _validate(data["nodes"])
     for k, v in data.items():
@@ -228,48 +249,66 @@ async def update_workflow(wf_id: str, body: WorkflowIn, session: AsyncSession = 
     await session.refresh(wf)
     scheduler.sync_workflow(wf)
     listeners.sync_workflow(wf)
+    voice_workers.sync_workflow(wf)
     invalidate_webhooks()
-    return serialize(wf)
+    return await _serialize_one(session, wf)
 
 
 @router.delete("/workflows/{wf_id}")
-async def delete_workflow(wf_id: str, session: AsyncSession = Depends(get_session)):
-    wf = await _get(session, wf_id)
+async def delete_workflow(wf_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    wf = await _get(session, wf_id, p, write=True)
     await session.delete(wf)
     await session.commit()
     scheduler.remove_workflow(wf_id)
     listeners.remove_workflow(wf_id)
+    voice_workers.remove_workflow(wf_id)
     invalidate_webhooks()
     return {"ok": True}
 
 
 @router.get("/workflows/{wf_id}/listeners")
-async def listener_status(wf_id: str):
-    """Live state of this workflow's listener triggers (Kafka, Redis, …), keyed by node id."""
-    return listeners.status(wf_id)
+async def listener_status(wf_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    """Live state of this workflow's listener triggers (Kafka, Redis, …) and voice workers, keyed by node id."""
+    await _get(session, wf_id, p)
+    return {**listeners.status(wf_id), **voice_workers.status(wf_id)}
+
+
+@router.post("/workflows/{wf_id}/voice-worker/{node_id}/restart")
+async def restart_voice_worker(wf_id: str, node_id: str, session: AsyncSession = Depends(get_session),
+                               p: Principal = Depends(principal)):
+    await _get(session, wf_id, p, write=True)
+    if not await voice_workers.restart(wf_id, node_id):
+        raise HTTPException(409, "No voice worker for this trigger: activate the workflow first")
+    return voice_workers.status(wf_id).get(node_id)
 
 
 @router.get("/workflows/{wf_id}/export")
-async def export_workflow(wf_id: str, session: AsyncSession = Depends(get_session)):
-    return export_dict(await _get(session, wf_id))
+async def export_workflow(wf_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    return export_dict(await _get(session, wf_id, p))
 
 
 @router.post("/workflows/{wf_id}/duplicate")
-async def duplicate_workflow(wf_id: str, body: DuplicateIn | None = None, session: AsyncSession = Depends(get_session)):
-    src = await _get(session, wf_id)
+async def duplicate_workflow(wf_id: str, body: DuplicateIn | None = None, session: AsyncSession = Depends(get_session),
+                             p: Principal = Depends(principal)):
+    """The copy belongs to the caller. Credentials stay with their owner, so a copy of someone
+    else's workflow needs the caller's own credentials picked before it runs."""
+    src = await _get(session, wf_id, p)
     body = body or DuplicateIn()
-    folder = await _folder(session, body.folder_id) if "folder_id" in body.model_fields_set else src.folder_id
+    if "folder_id" in body.model_fields_set:
+        folder = await _folder(session, body.folder_id, p.user.id)
+    else:
+        folder = src.folder_id if src.owner_id == p.user.id else None
     wf = Workflow(name=(body.name or f"{src.name} (copy)")[:200], description=src.description, nodes=src.nodes,
-                  edges=src.edges, settings=src.settings, tags=src.tags, folder_id=folder)
+                  edges=src.edges, settings=src.settings, tags=src.tags, folder_id=folder, owner_id=p.user.id)
     session.add(wf)
     await session.commit()
     await session.refresh(wf)
-    return serialize(wf)
+    return await _serialize_one(session, wf)
 
 
 @router.post("/workflows/{wf_id}/run")
-async def run_workflow(wf_id: str, body: RunIn, session: AsyncSession = Depends(get_session)):
-    wf = await _get(session, wf_id)
+async def run_workflow(wf_id: str, body: RunIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
+    wf = await _get(session, wf_id, p, write=True)
     graph = workflow_to_dict(wf)
     if body.workflow:
         _validate(body.workflow.get("nodes", []))
@@ -288,13 +327,13 @@ async def list_templates():
 
 
 @router.post("/templates/{template_id}")
-async def create_from_template(template_id: str, session: AsyncSession = Depends(get_session)):
+async def create_from_template(template_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     t = TEMPLATES.get(template_id)
     if not t:
         raise HTTPException(404, "Template not found")
     wf = Workflow(name=t["name"], description=t["description"], nodes=t["nodes"], edges=t["edges"],
-                  settings=t.get("settings", {}), tags=t.get("tags", []))
+                  settings=t.get("settings", {}), tags=t.get("tags", []), owner_id=p.user.id)
     session.add(wf)
     await session.commit()
     await session.refresh(wf)
-    return serialize(wf)
+    return await _serialize_one(session, wf)

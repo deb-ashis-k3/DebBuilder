@@ -2,10 +2,12 @@
 
 Inside braces you can use (the `$` prefix is optional):
   $json            current input item
+  $binary          files on the current item ($binary.data.fileName / mimeType / fileSize)
   $input.all / $input.first / $input.item
   $('Node Name').json / .items             output of an earlier node (by name)
   $node['Node Name'].json                   same, n8n v0 syntax
   $now, $today, $execution.id, $workflow.id/name, $env.VAR, $vars.key
+  $state.key       the workflow's graph state (Settings → State, Update State node)
 A string that is exactly one `{{ expr }}` returns the native value (dict, list,
 number...); mixed text renders as a string.
 """
@@ -84,10 +86,12 @@ def build_context(
     item_index: int,
     node_outputs: dict[str, list[dict]],
     meta: dict,
+    state: dict | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     return {
         "json": item or {},
+        "binary": (item or {}).get("binary") or {},
         "input": {"all": items, "first": items[0] if items else {}, "item": item or {}, "last": items[-1] if items else {}},
         "items": items,
         "itemIndex": item_index,
@@ -100,6 +104,7 @@ def build_context(
         "execution": {"id": meta.get("execution_id"), "mode": meta.get("mode")},
         "workflow": {"id": meta.get("workflow_id"), "name": meta.get("workflow_name")},
         "vars": meta.get("vars", {}),
+        "state": state or {},
         "env": _Env(),
         "uuid": lambda: str(uuid.uuid4()),
         "len": len, "str": str, "int": int, "float": float, "bool": bool,
