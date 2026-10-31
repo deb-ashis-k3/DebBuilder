@@ -8,6 +8,7 @@ import copy
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import struct
 import time
@@ -16,6 +17,15 @@ from datetime import datetime, timedelta, timezone
 
 from .base import NodeContext, NodeError, NodeType, prop, register
 from .core import DATA, get_path, set_path
+
+
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\"}
+
+
+def unescape_sep(text: str) -> str:
+    """Interpret only the escapes \\n, \\t, \\r, \\0 and \\\\ typed in a form field; every other character (é, →, 中) stays as is."""
+    return re.sub(r"\\([ntr0\\])", lambda m: _ESCAPES[m.group(1)], str(text))
+
 
 CMP = dict(group="data", color="#14b8a6")
 
@@ -128,7 +138,7 @@ def _tidy(n: float):
 async def _summarize(ctx: NodeContext):
     by = [f.strip() for f in str(ctx.param("split_by") or "").split(",") if f.strip()]
     aggs = [r for r in ctx.raw_params.get("aggregations") or [] if r.get("field") or r.get("aggregation") == "count"]
-    sep = (ctx.param("separator") or ", ").encode().decode("unicode_escape")
+    sep = unescape_sep(ctx.param("separator") or ", ")
     groups: dict[str, list] = {}
     keys: dict[str, dict] = {}
     for it in ctx.items:
@@ -346,6 +356,8 @@ async def _totp(ctx: NodeContext):
     out = []
     for i, it in enumerate(ctx.items or [{}]):
         p = ctx.params(i)
+        if not str(p.get("secret") or "").strip():
+            raise NodeError("TOTP secret is empty (base32, e.g. JBSWY3DPEHPK3PXP)", ctx.name)
         try:
             code = totp(str(p.get("secret") or ""), int(p.get("digits") or 6), int(p.get("period") or 30), p.get("algorithm") or "sha1")
         except (ValueError, TypeError) as e:
@@ -491,7 +503,30 @@ register(NodeType(
 
 
 def _ics_text(s: str) -> str:
-    return str(s).replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    s = str(s).replace("\r\n", "\n").replace("\r", "\n")
+    return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def _ics_value(s: str) -> str:
+    """A value that is not TEXT (URL, address): no CR/LF, so it can't start a new property."""
+    return re.sub(r"[\r\n]+", "", str(s))
+
+
+def _ics_fold(line: str) -> str:
+    """RFC 5545 3.1: lines longer than 75 octets continue on the next line after CRLF + space (UTF-8 safe)."""
+    raw = line.encode("utf-8")
+    if len(raw) <= 75:
+        return line
+    parts, cur, size, limit = [], [], 0, 75
+    for ch in line:
+        n = len(ch.encode("utf-8"))
+        if size + n > limit:
+            parts.append("".join(cur))
+            cur, size, limit = [], 0, 74  # continuation lines start with a space
+        cur.append(ch)
+        size += n
+    parts.append("".join(cur))
+    return "\r\n ".join(parts)
 
 
 def _ics_time(v, all_day: bool) -> str:
@@ -507,7 +542,17 @@ async def _ical(ctx: NodeContext):
         p = ctx.params(i)
         all_day = bool(p.get("all_day"))
         start = p.get("start") or datetime.now(timezone.utc).isoformat()
-        end = p.get("end") or (datetime.fromisoformat(str(start).replace("Z", "+00:00")) + timedelta(hours=1)).isoformat()
+        try:
+            start_dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(str(p["end"]).replace("Z", "+00:00")) if p.get("end") else None
+        except ValueError as e:
+            raise NodeError(f"Start / end must be ISO dates, e.g. 2024-05-01T09:00:00Z ({e})", ctx.name) from e
+        if all_day:
+            # DTEND of an all-day event is exclusive (RFC 5545): the day after the last day
+            last = end_dt.date() if end_dt and end_dt.date() >= start_dt.date() else start_dt.date()
+            start, end = start_dt.date().isoformat(), (last + timedelta(days=1)).isoformat()
+        else:
+            end = (end_dt or start_dt + timedelta(hours=1)).isoformat()
         lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//DebBuilder//iCalendar//EN", "BEGIN:VEVENT",
                  f"UID:{uuid.uuid4()}@debbuilder", f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
                  f"DTSTART{';VALUE=DATE' if all_day else ''}:{_ics_time(start, all_day)}",
@@ -515,11 +560,12 @@ async def _ical(ctx: NodeContext):
                  f"SUMMARY:{_ics_text(p.get('title') or 'Event')}"]
         for key, field in (("DESCRIPTION", "description"), ("LOCATION", "location"), ("URL", "url")):
             if p.get(field):
-                lines.append(f"{key}:{_ics_text(p[field])}")
-        for a in [x.strip() for x in str(p.get("attendees") or "").split(",") if x.strip()]:
-            lines.append(f"ATTENDEE;RSVP=TRUE:mailto:{a}")
+                lines.append(f"{key}:{_ics_value(p[field]) if key == 'URL' else _ics_text(p[field])}")
+        for a in [re.sub(r"[\r\n;:,\"<>\s]+", "", x) for x in re.split(r"[,\r\n]+", str(p.get("attendees") or ""))]:
+            if a:
+                lines.append(f"ATTENDEE;RSVP=TRUE:mailto:{a}")
         lines += ["END:VEVENT", "END:VCALENDAR"]
-        ref = ctx.put_file("\r\n".join(lines).encode(), p.get("file_name") or "invite.ics", "text/calendar")
+        ref = ctx.put_file(("\r\n".join(_ics_fold(x) for x in lines) + "\r\n").encode(), p.get("file_name") or "invite.ics", "text/calendar")
         out.append({**{k: v for k, v in it.items() if k != "binary"}, "binary": {**(it.get("binary") or {}), "data": ref}})
     return {"main": out}
 
@@ -528,7 +574,7 @@ register(NodeType(
     type="data.ical", label="iCalendar", icon="calendar-plus",
     description="Create an .ics calendar invite file (attach it to an email, upload it…).",
     properties=[prop("title", "Title", "string", "{{ $json.title }}"), prop("start", "Start (ISO)", "string", "{{ $json.start }}"),
-                prop("end", "End (ISO, empty = start + 1 h)", "string", ""), prop("all_day", "All-day", "boolean", False),
+                prop("end", "End (ISO, empty = start + 1 h)", "string", ""), prop("all_day", "All-day (end = last day, inclusive)", "boolean", False),
                 prop("description", "Description", "text", "", rows=2), prop("location", "Location", "string", ""),
                 prop("url", "URL", "string", ""), prop("attendees", "Attendee emails (comma separated)", "string", ""),
                 prop("file_name", "File name", "string", "invite.ics")],

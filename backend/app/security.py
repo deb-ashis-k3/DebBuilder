@@ -12,6 +12,7 @@
   one route policy table. Anything not listed is denied (default deny).
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -66,21 +67,21 @@ _COMMON = {
 
 def password_problems(pw: str, email: str = "", name: str = "") -> list[str]:
     """NIST 800-63B style: length and blocklist, no arbitrary composition rules."""
-    out = []
+    out = []  # each reads after "Password must …"
     if len(pw) < 12:
-        out.append("at least 12 characters")
+        out.append("be at least 12 characters")
     if len(pw) > 128:
-        out.append("at most 128 characters")
+        out.append("be at most 128 characters")
     low = pw.lower()
     if low in _COMMON or any(low.startswith(c) and len(low) - len(c) < 4 for c in _COMMON):
-        out.append("not a common password")
+        out.append("not be a common password")
     local = email.split("@")[0].lower()
     if len(local) >= 4 and local in low:
-        out.append("must not contain your email name")
+        out.append("not contain your email name")
     if name and len(name) >= 4 and name.lower().replace(" ", "") in low.replace(" ", ""):
-        out.append("must not contain your name")
+        out.append("not contain your name")
     if len(set(pw)) < 5:
-        out.append("too many repeated characters")
+        out.append("not repeat the same few characters")
     return out
 
 
@@ -100,7 +101,8 @@ def clean_username(raw: str | None) -> str | None:
 def check_password_policy(pw: str, email: str = "", name: str = "") -> None:
     problems = password_problems(pw, email, name)
     if problems:
-        raise HTTPException(400, "Password must be " + ", ".join(problems))
+        last = problems.pop()
+        raise HTTPException(400, "Password must " + (", ".join(problems) + " and " if problems else "") + last)
 
 
 def hash_password(pw: str) -> str:
@@ -112,6 +114,16 @@ def verify_password(stored: str | None, pw: str) -> bool:
         return _ph.verify(stored or _DUMMY_HASH, pw) and stored is not None
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
+
+
+# Argon2 takes ~70 ms of CPU and 64 MiB per call: off the event loop, so a burst of sign-ins doesn't stall
+# every other request. Request handlers use these; hash_password / verify_password stay for scripts (cli.py).
+async def hash_password_async(pw: str) -> str:
+    return await asyncio.to_thread(hash_password, pw)
+
+
+async def verify_password_async(stored: str | None, pw: str) -> bool:
+    return await asyncio.to_thread(verify_password, stored, pw)
 
 
 def temp_password() -> str:
@@ -402,6 +414,17 @@ def _allowed_origin(request: Request, origin: str) -> bool:
     return origin.rstrip("/") in allowed or origin.split("://", 1)[-1] == host
 
 
+def _referer_origin(referer: str) -> str:
+    """scheme://host[:port] of a Referer header ("" if absent or unparsable)."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(referer)
+    except ValueError:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme in ("http", "https") and parts.netloc else ""
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path, method = request.url.path, request.method
@@ -418,8 +441,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse({"detail": "Sign in required"}, status_code=401)
         if principal is not None:
             if principal.via == "session" and method in _UNSAFE:
-                # CSRF: same-origin + double-submit token.
-                if not _allowed_origin(request, request.headers.get("origin") or ""):
+                # CSRF: same-origin (Origin, else Referer; neither = refused) + double-submit token.
+                source = request.headers.get("origin") or _referer_origin(request.headers.get("referer") or "")
+                if not source:
+                    return JSONResponse({"detail": "Cross-origin request blocked: a request signed in with the session "
+                                         "cookie must send an Origin (or Referer) header of this site. Scripts can "
+                                         "use an API key (X-API-Key) instead."}, status_code=403)
+                if not _allowed_origin(request, source):
                     return JSONResponse({"detail": "Cross-origin request blocked"}, status_code=403)
                 sent, cookie = request.headers.get("x-csrf-token") or "", request.cookies.get(CSRF_COOKIE) or ""
                 if not cookie or not hmac.compare_digest(sent, cookie):
@@ -449,7 +477,8 @@ def _secure_headers(resp, path: str):
     h.setdefault("X-Frame-Options", "DENY")
     if get_settings().public_base_url.startswith("https"):
         h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    if not path.startswith(("/api/", "/webhook", "/ws/", "/form/")) and h.get("content-type", "").startswith("text/html"):
+    # Hosted forms (/form/) get it too: they use inline styles (allowed) and no script.
+    if not path.startswith(("/api/", "/webhook", "/ws/")) and h.get("content-type", "").startswith("text/html"):
         h.setdefault("Content-Security-Policy", _CSP)
     if path.startswith("/api/"):
         h.setdefault("Cache-Control", "no-store")

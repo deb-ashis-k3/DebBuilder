@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .credential_catalog import CATEGORY_ORDER, TYPES
 from .db import Credential, SessionLocal
+from .netguard import guarded_client
 
 CREDENTIAL_TYPES = TYPES
 LLM_CREDENTIAL_TYPES = ["openai", "anthropic", "google_genai", "ollama"]
@@ -82,14 +83,22 @@ def fmt(template: str, data: dict) -> str:
 CACHE_SECONDS = 30
 _cache: dict[tuple[str, str | None], tuple[float, str, dict]] = {}
 _loading: dict[tuple[str, str | None], "asyncio.Future"] = {}
+# Bumped by every forget: a fetch that was already running when a credential changed must not put the old
+# data back into the cache when it finishes (it would be served for another CACHE_SECONDS).
+_generation = 0
 
 
 def forget_credential(cred_id: str | None = None) -> None:
+    global _generation
+    _generation += 1
     if cred_id is None:
         _cache.clear()
+        _loading.clear()
         return
     for k in [k for k in _cache if k[0] == str(cred_id)]:
         _cache.pop(k, None)
+    for k in [k for k in _loading if k[0] == str(cred_id)]:
+        _loading.pop(k, None)  # later callers start a fresh fetch instead of joining the stale one
 
 
 async def load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None,
@@ -101,15 +110,19 @@ async def load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None
     # single-flight: concurrent executions needing the same credential share one query
     pending = _loading.get(key)
     if pending is None:
+        started = _generation
+
         async def fetch() -> tuple[str, dict]:  # its own session: the first caller's may close while others wait
             async with SessionLocal() as own:
-                return await _load_credential(own, cred_id, owner_id)
+                ctype, data = await _load_credential(own, cred_id, owner_id)
+            if started == _generation:  # nothing changed meanwhile: safe to cache
+                if len(_cache) > 10_000:
+                    _cache.clear()
+                _cache[key] = (time.monotonic() + CACHE_SECONDS, ctype, data)
+            return ctype, data
         pending = _loading[key] = asyncio.ensure_future(fetch())
-        pending.add_done_callback(lambda _: _loading.pop(key, None))
+        pending.add_done_callback(lambda f: _loading.pop(key, None) if _loading.get(key) is f else None)
     ctype, data = await asyncio.shield(pending)
-    if len(_cache) > 10_000:
-        _cache.clear()
-    _cache[key] = (time.monotonic() + CACHE_SECONDS, ctype, data)
     return ctype, dict(data)
 
 
@@ -197,7 +210,7 @@ async def _token_request(data: dict, form: dict) -> dict:
         headers["Authorization"] = "Basic " + base64.b64encode(raw).decode()
     else:
         form = {**form, "client_id": data["client_id"], "client_secret": data["client_secret"]}
-    async with httpx.AsyncClient(timeout=30) as c:
+    async with guarded_client(timeout=30) as c:  # the token URL is user-provided: public addresses only
         r = await c.post(data["token_url"], data=form, headers=headers)
     try:
         body = r.json()
@@ -223,23 +236,52 @@ async def oauth2_exchange_code(data: dict, code: str) -> dict:
     return await _token_request(data, form)
 
 
-async def oauth2_access_token(cred_type: str, data: dict, cred_id: str | None) -> str:
-    tok = data.get(OAUTH_TOKEN_KEY) or {}
-    fresh = tok.get("access_token") and (not tok.get("expires_at") or tok["expires_at"] > time.time())
-    if fresh:
-        return tok["access_token"]
+def _fresh(tok: dict) -> bool:
+    return bool(tok.get("access_token")) and (not tok.get("expires_at") or tok["expires_at"] > time.time())
+
+
+async def _new_token(data: dict, tok: dict) -> dict:
     if data.get("grant_type") == "client_credentials":
         form = {"grant_type": "client_credentials", **({"scope": data["scope"]} if data.get("scope") else {})}
-        tok = await _token_request(data, form)
-    elif tok.get("refresh_token"):
+        return await _token_request(data, form)
+    if tok.get("refresh_token"):
         new = await _token_request(data, {"grant_type": "refresh_token", "refresh_token": tok["refresh_token"]})
-        tok = {**new, "refresh_token": new.get("refresh_token") or tok["refresh_token"]}
-    else:
-        raise ValueError("Not connected. Open the credential and click 'Connect my account'.")
-    if cred_id:
-        stored = {k: v for k, v in data.items()}
-        stored[OAUTH_TOKEN_KEY] = tok
-        await _save_data(cred_id, stored)
-        forget_credential(cred_id)  # the cached copy still holds the expired token
+        return {**new, "refresh_token": new.get("refresh_token") or tok["refresh_token"]}
+    raise ValueError("Not connected. Open the credential and click 'Connect my account'.")
+
+
+# One refresh per credential at a time (per process): many executions finding the same expired token would
+# otherwise all refresh it, and providers that rotate refresh tokens revoke all but one of them.
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _stored_token(cred_id: str) -> dict | None:
+    try:
+        async with SessionLocal() as s:
+            cred = await s.get(Credential, uuid.UUID(str(cred_id)))
+            return (decrypt(cred.data).get(OAUTH_TOKEN_KEY) or {}) if cred else None
+    except ValueError:
+        return None
+
+
+async def oauth2_access_token(cred_type: str, data: dict, cred_id: str | None) -> str:
+    tok = data.get(OAUTH_TOKEN_KEY) or {}
+    if _fresh(tok):
+        return tok["access_token"]
+    if not cred_id:  # an unsaved credential being tested: nothing to share or store
+        tok = await _new_token(data, tok)
+        data[OAUTH_TOKEN_KEY] = tok
+        return tok["access_token"]
+    lock = _refresh_locks.setdefault(str(cred_id), asyncio.Lock())
+    async with lock:
+        latest = await _stored_token(cred_id)  # someone else may have refreshed while we waited
+        if latest and _fresh(latest):
+            tok = latest
+        else:
+            tok = await _new_token(data, latest or tok)  # newest refresh token (providers may rotate it)
+            stored = {k: v for k, v in data.items()}
+            stored[OAUTH_TOKEN_KEY] = tok
+            await _save_data(cred_id, stored)
+            forget_credential(cred_id)  # the cached copy still holds the expired token
     data[OAUTH_TOKEN_KEY] = tok
     return tok["access_token"]

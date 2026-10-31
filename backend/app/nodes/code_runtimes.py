@@ -1,6 +1,7 @@
 """Multi-language support for the Code node.
 
-Python runs in-process (see core._code). Every other language runs as a subprocess with
+Python runs in the warm sandbox pool (see sandbox.py / core._code). Every other language runs as a subprocess
+(minimal environment, memory cap, process-tree kill on timeout: sandbox.run_limited) with
 the same contract, n8n-style:
 
 - inputs:  ``items`` (list of objects), ``item`` + ``index`` (the current item in
@@ -28,6 +29,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
+
+from .sandbox import Timeout, minimal_env, run_limited
 
 # ---------------------------------------------------------------------------
 # Default code per language
@@ -474,22 +477,25 @@ def run_code(language: str, code: str, items: list[dict], *, mode: str, vars: di
             script_name = lang.filename or f"code{lang.ext}"
             source, offset = _render(lang, code)
         script = tmp / script_name
-        script.write_text(source, encoding="utf-8", newline="\n")
+        # Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page: the BOM keeps non-ASCII literals intact.
+        enc = "utf-8-sig" if (lang and lang.key == "powershell") or script_name.lower().endswith(".ps1") else "utf-8"
+        script.write_text(source, encoding=enc, newline="\n")
         out_file, in_file = tmp / "output.json", tmp / "input.json"
 
         def invoke(payload: dict, extra_env: dict) -> tuple[subprocess.CompletedProcess, list]:
             in_file.write_text(json.dumps(payload, default=str), encoding="utf-8")
             out_file.unlink(missing_ok=True)
-            env = {**os.environ, "DEBBUILDER_INPUT": in_file.as_posix(), "DEBBUILDER_OUTPUT": out_file.as_posix(),
-                   "ITEMS_FILE": in_file.as_posix(), "PYTHONIOENCODING": "utf-8", **extra_env}
+            # Allowlisted environment only: the server's secrets (ENCRYPTION_KEY, DATABASE_URL, ...) never reach user code.
+            env = minimal_env(tmp, {"DEBBUILDER_INPUT": in_file.as_posix(), "DEBBUILDER_OUTPUT": out_file.as_posix(),
+                                    "ITEMS_FILE": in_file.as_posix(), **extra_env})
             items_json = json.dumps(payload["items"], default=str)
             if len(items_json) < 24000:  # Windows caps the environment block at 32K
                 env["ITEMS"] = items_json
             argv = command.replace("{file}", f'"{script.as_posix()}"') if custom else lang.argv(exe, script.as_posix())
             try:
-                proc = subprocess.run(argv, cwd=tmp, env=env, capture_output=True, text=True, encoding="utf-8",
-                                      errors="replace", timeout=timeout, shell=custom)
-            except subprocess.TimeoutExpired as e:
+                # Memory cap (CODE_MEMORY_MB) and, on timeout, the whole process tree is killed.
+                proc = run_limited(argv, cwd=tmp, env=env, timeout=timeout, shell=custom)
+            except Timeout as e:
                 raise CodeError(f"Timed out after {timeout:.0f}s (raise 'Timeout' in the node settings)") from e
             except OSError as e:
                 raise CodeError(f"Could not start the runtime: {e}") from e

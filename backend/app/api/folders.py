@@ -4,7 +4,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 
 from .. import cluster
 from ..access import check, owned, owner_names, principal
@@ -42,18 +42,21 @@ async def _get(session: AsyncSession, folder_id: str, p: Principal, write: bool 
     return f
 
 
-async def _subtree(session: AsyncSession, root: uuid.UUID) -> list[uuid.UUID]:
-    """The folder and all its descendants."""
-    rows = (await session.execute(select(Folder.id, Folder.parent_id))).all()
-    children: dict[uuid.UUID | None, list[uuid.UUID]] = {}
-    for fid, pid in rows:
-        children.setdefault(pid, []).append(fid)
-    out, stack = [], [root]
-    while stack:
-        cur = stack.pop()
-        out.append(cur)
-        stack.extend(children.get(cur, []))
-    return out
+async def _subtree(session: AsyncSession, root: uuid.UUID, owner_id: uuid.UUID | None) -> list[uuid.UUID]:
+    """The folder and all its descendants, within one owner's workspace. UNION (not UNION ALL) drops rows already
+    seen, so even a cycle in the data ends the recursion."""
+    rows = await session.execute(text(
+        "WITH RECURSIVE t(id) AS (SELECT id FROM folders WHERE id = :root AND owner_id = :owner "
+        "UNION SELECT f.id FROM folders f JOIN t ON f.parent_id = t.id WHERE f.owner_id = :owner) SELECT id FROM t"),
+        {"root": root, "owner": owner_id})
+    return list(rows.scalars())
+
+
+async def _lock_tree(session: AsyncSession, owner_id: uuid.UUID | None) -> None:
+    """Serialize folder moves within a workspace (until commit): two concurrent moves (A into B, B into A) would
+    each pass the cycle check against the other's old state."""
+    key = (owner_id.int if owner_id else 0) & 0x7FFF_FFFF_FFFF_FFFF
+    await session.execute(select(func.pg_advisory_xact_lock(key)))
 
 
 async def _check_parent(session: AsyncSession, parent: uuid.UUID | None, owner_id: uuid.UUID | None,
@@ -66,7 +69,7 @@ async def _check_parent(session: AsyncSession, parent: uuid.UUID | None, owner_i
         raise HTTPException(404, "Parent folder not found")
     if pf.owner_id != owner_id:
         raise HTTPException(400, "That folder belongs to another user's workspace")
-    if moving and parent in await _subtree(session, moving):
+    if moving and parent in await _subtree(session, moving, owner_id):
         raise HTTPException(400, "A folder can't be moved into itself or one of its subfolders")
 
 
@@ -103,6 +106,7 @@ async def update_folder(folder_id: str, body: FolderIn, session: AsyncSession = 
         f.name = body.name.strip()[:200]
     if "parent_id" in body.model_fields_set:
         parent = _uuid(body.parent_id)
+        await _lock_tree(session, f.owner_id)
         await _check_parent(session, parent, f.owner_id, moving=f.id)
         f.parent_id = parent
     await session.commit()
@@ -120,7 +124,7 @@ async def delete_folder(folder_id: str, mode: str = "move", session: AsyncSessio
         await session.execute(update(Workflow).where(Workflow.folder_id == f.id).values(folder_id=f.parent_id))
         await session.execute(update(Folder).where(Folder.parent_id == f.id).values(parent_id=f.parent_id))
     elif mode == "delete":
-        ids = await _subtree(session, f.id)
+        ids = await _subtree(session, f.id, f.owner_id)
         doomed = (await session.execute(select(Workflow).where(Workflow.folder_id.in_(ids)))).scalars().all()
         for wf in doomed:
             await session.delete(wf)

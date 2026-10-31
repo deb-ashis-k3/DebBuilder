@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..credentials import load_credential
 from ..db import SessionLocal
-from ..engine.expressions import build_context, evaluate
+from ..engine.expressions import ExprScope, evaluate
 
 if TYPE_CHECKING:
     from ..engine.runtime import Run
@@ -176,10 +176,22 @@ class NodeContext:
         params.update(self.node.get("parameters") or {})
         return params
 
+    def _expr_scope(self, items: Items) -> ExprScope:
+        """What expressions share across this node's items, built once per node execution: earlier nodes'
+        outputs by name, the `$('Node')` / `$input` wrappers, $state. Rebuilding them per item made a field
+        over n items that references a node with m items cost O(n*m). Rebuilt only when another node's output
+        lands meanwhile (parallel branches) or the items change."""
+        outputs = getattr(self.run, "state_outputs", None)
+        key = (len(outputs) if outputs is not None else None, len(items))
+        cached = self.__dict__.get("_scope")
+        if cached is None or cached[0] != key or cached[1].items is not items:
+            cached = self._scope = (key, ExprScope(items, self.run.outputs_by_name(), self.run.meta, state=self.state))
+        return cached[1]
+
     def expr_context(self, i: int = 0) -> dict:
         items = self.parent_items if self.parent_items is not None else self.items
         item = self.parent_item if self.parent_item is not None else (items[i] if i < len(items) else {})
-        return build_context(item, items, i, self.run.outputs_by_name(), self.run.meta, state=self.state)
+        return self._expr_scope(items).context(item, i)
 
     def param(self, name: str, i: int = 0, default: Any = None) -> Any:
         raw = self.raw_params.get(name, default)
@@ -192,7 +204,10 @@ class NodeContext:
         # No {{ }} anywhere: the values are the same for every item, so evaluate once (a node handling
         # thousands of items otherwise rebuilt the expression context per item for nothing).
         static = getattr(self, "_static_params", None)
-        if static is None and not _has_expression(raw):
+        dynamic = self.__dict__.get("_dynamic_params")
+        if dynamic is None:  # scanned once per node execution, not per item
+            dynamic = self._dynamic_params = _has_expression(raw)
+        if static is None and not dynamic:
             ctx = self.expr_context(0)
             static = self._static_params = {k: evaluate(v, ctx) for k, v in raw.items()}
         if static is not None:

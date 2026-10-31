@@ -317,7 +317,9 @@ T("ssh", "SSH / SFTP", CLOUD, color="#334155",
           KEY("Password", "password", required=False),
           F("private_key", "Private key (PEM / OpenSSH)", "textarea", secret=True, required=False,
             help="Use a password, a private key, or both"),
-          KEY("Key passphrase", "passphrase", required=False)],
+          KEY("Key passphrase", "passphrase", required=False),
+          F("host_key", "Host key (optional)", "textarea", required=False,
+            help="The server's public key (e.g. 'ssh-ed25519 AAAA…'). When set, connections to any other key are refused.")],
   test={"custom": "ssh"})
 
 # ---------------------------------------------------------------------------

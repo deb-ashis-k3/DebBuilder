@@ -14,66 +14,115 @@ from sqlalchemy import select
 from ..access import can_manage
 from ..credentials import decrypt
 from ..db import Credential, SessionLocal, Workflow
-from ..engine.runtime import execute_workflow, load_workflow, output_text, workflow_to_dict
+from ..engine.errors import Overloaded
+from ..engine.runtime import execute_workflow, output_text, workflow_to_dict
 from ..services.whatsapp import parse_webhook, verify_signature
 
 log = logging.getLogger("debbuilder.hooks")
 router = APIRouter(tags=["hooks"])
 
 
-# (method, path) -> (workflow dict, webhook node) for active workflows. Rebuilt lazily after
-# any workflow change (invalidate_webhooks) instead of scanning every workflow per request.
-_webhook_routes: dict[tuple[str, str], tuple[dict, dict]] | None = None
+def busy(e: Overloaded) -> JSONResponse:
+    """Admission control refused the execution (MAX_QUEUED_EXECUTIONS): 503, and when to retry."""
+    return JSONResponse({"detail": str(e)}, status_code=503, headers={"Retry-After": str(e.retry_after)})
 
 
+class _Routes:
+    """Production entry points of active workflows, rebuilt lazily after any change (invalidate_webhooks) instead
+    of scanning every workflow per request:
+      webhooks: (METHOD, path) -> (workflow dict, webhook node)
+      whatsapp: phone_number_id -> [(workflow dict, trigger node, decrypted credential)]: a WhatsApp message
+                then decrypts nothing and looks at only the workflows of the number it was sent to."""
+
+    def __init__(self, webhooks: dict, whatsapp: dict):
+        self.webhooks, self.whatsapp = webhooks, whatsapp
+
+
+_routes: _Routes | None = None
 _routes_loading: asyncio.Task | None = None
 _routes_version = 0
 
 
 def invalidate_webhooks() -> None:
-    global _webhook_routes, _routes_version
-    _webhook_routes = None
+    """Called on every workflow, credential or user change (cluster._apply), on every replica."""
+    global _routes, _routes_version
+    _routes = None
     _routes_version += 1  # a rebuild already running started before this change: don't keep its result
 
 
-async def _load_routes() -> dict[tuple[str, str], tuple[dict, dict]]:
-    routes: dict[tuple[str, str], tuple[dict, dict]] = {}
+async def _load_routes() -> _Routes:
+    webhooks: dict[tuple[str, str], tuple[dict, dict]] = {}
     for wf, n in await _workflows_with("trigger.webhook", active_only=True):
         p = n.get("parameters") or {}
-        routes.setdefault((p.get("method", "POST").upper(), p.get("path", "").strip("/")), (wf, n))
-    return routes
+        key = (str(p.get("method") or "POST").upper(), str(p.get("path") or "").strip("/"))
+        if key in webhooks:  # publishing refuses this now; older data may still have it
+            log.warning("Workflows %s and %s both listen on %s /webhook/%s; %s gets the requests",
+                        webhooks[key][0]["id"], wf["id"], *key, webhooks[key][0]["id"])
+            continue
+        webhooks[key] = (wf, n)
+    whatsapp: dict[str, list[tuple[dict, dict, dict]]] = {}
+    hits = await _workflows_with("trigger.whatsapp", active_only=True)
+    cred_ids = set()
+    for _, n in hits:
+        try:
+            cred_ids.add(uuid.UUID(str((n.get("parameters") or {}).get("credential"))))
+        except ValueError:
+            pass
+    creds: dict[str, dict] = {}
+    if cred_ids:
+        async with SessionLocal() as s:
+            rows = (await s.execute(select(Credential).where(Credential.id.in_(cred_ids),
+                                                             Credential.type == "whatsapp"))).scalars().all()
+        for c in rows:
+            try:
+                creds[str(c.id)] = {**decrypt(c.data), "_owner_id": str(c.owner_id) if c.owner_id else None}
+            except Exception:  # noqa: BLE001 - one unreadable credential must not break every WhatsApp trigger
+                log.warning("WhatsApp credential %s can't be decrypted", c.id)
+    for wf, n in hits:
+        cred = creds.get(str((n.get("parameters") or {}).get("credential")))
+        if cred and cred["_owner_id"] == wf.get("owner_id"):  # a trigger only uses its workflow owner's credential
+            whatsapp.setdefault(str(cred.get("phone_number_id")), []).append((wf, n, cred))
+    return _Routes(webhooks, whatsapp)
 
 
-async def _active_webhook(method: str, path: str) -> tuple[dict, dict] | None:
-    """Production webhook routes come from a cache rebuilt after any workflow change. The rebuild is
-    single-flight: under load hundreds of requests arrive while the cache is empty (startup, a save), and
-    each querying the database on its own exhausted the connection pool and Postgres' client limit."""
-    global _webhook_routes, _routes_loading
-    while _webhook_routes is None:
+async def _current_routes() -> _Routes:
+    """Single-flight rebuild: under load hundreds of requests arrive while the cache is empty (startup, a publish),
+    and each querying the database on its own exhausted the connection pool and Postgres' client limit."""
+    global _routes_loading
+    while _routes is None:
         if _routes_loading is None or _routes_loading.done():
             version = _routes_version
 
             async def build() -> None:
-                global _webhook_routes
+                global _routes
                 routes = await _load_routes()
                 if version == _routes_version:
-                    _webhook_routes = routes
+                    _routes = routes
             _routes_loading = asyncio.get_running_loop().create_task(build())
         await asyncio.shield(_routes_loading)
-    return _webhook_routes.get((method, path.strip("/")))
+    return _routes
 
 
-async def _workflows_with(trigger_type: str, active_only: bool = True) -> list[tuple[dict, dict]]:
+async def _active_webhook(method: str, path: str) -> tuple[dict, dict] | None:
+    return (await _current_routes()).webhooks.get((method, path.strip("/")))
+
+
+async def _workflows_with(trigger_type: str, active_only: bool = True,
+                          owner_id: uuid.UUID | None = None) -> list[tuple[dict, dict]]:
+    """Workflows with an enabled trigger of this type. active_only: production (the published version) of active
+    workflows; otherwise the drafts of `owner_id`'s workflows (test webhooks)."""
     async with SessionLocal() as s:
         q = select(Workflow)
         if active_only:
             q = q.where(Workflow.active.is_(True))
+        else:
+            q = q.where(Workflow.owner_id == owner_id, Workflow.nodes.contains([{"type": trigger_type}]))
         rows = (await s.execute(q)).scalars().all()
     hits = []
     for wf in rows:
-        for n in wf.nodes or []:
+        for n in (wf.live_nodes if active_only else wf.nodes or []):
             if n.get("type") == trigger_type and not n.get("disabled"):
-                hits.append((workflow_to_dict(wf), n))
+                hits.append((workflow_to_dict(wf, live=active_only), n))
     return hits
 
 
@@ -85,10 +134,13 @@ async def _workflows_with(trigger_type: str, active_only: bool = True) -> list[t
 async def _handle_webhook(path: str, request: Request, test: bool):
     method = request.method.upper()
     if test:
-        matches = [
-            (wf, n) for wf, n in await _workflows_with("trigger.webhook", active_only=False)
-            if (n.get("parameters") or {}).get("path", "").strip("/") == path.strip("/")
-            and (n.get("parameters") or {}).get("method", "POST").upper() == method
+        # Test webhooks run a draft: only the signed-in owner of that workflow may trigger it (everyone else gets
+        # the same 404 as for a path nobody listens on).
+        p = getattr(request.state, "principal", None)
+        matches = [] if p is None else [
+            (wf, n) for wf, n in await _workflows_with("trigger.webhook", active_only=False, owner_id=p.user.id)
+            if str((n.get("parameters") or {}).get("path") or "").strip("/") == path.strip("/")
+            and str((n.get("parameters") or {}).get("method") or "POST").upper() == method
         ]
     else:
         hit = await _active_webhook(method, path)
@@ -103,7 +155,7 @@ async def _handle_webhook(path: str, request: Request, test: bool):
         if request.headers.get(name.strip()) != value.strip():
             raise HTTPException(401, "Unauthorized")
 
-    raw = await request.body()
+    raw = await request.body()  # size capped by the request body limit (main._BodyLimit)
     try:
         body = json.loads(raw) if raw else {}
     except ValueError:
@@ -113,8 +165,11 @@ async def _handle_webhook(path: str, request: Request, test: bool):
 
     mode = params.get("respond", "last_node")
     # /webhook-test runs are test runs ("manual", as in n8n): the editor canvas follows them, not production ones.
-    res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="manual" if test else "webhook",
-                                 wait=mode != "immediately")
+    try:
+        res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="manual" if test else "webhook",
+                                     wait=mode != "immediately")
+    except Overloaded as e:
+        return busy(e)
     if mode == "immediately":
         return JSONResponse({"message": "Workflow started", "execution_id": res["execution_id"]}, status_code=202)
     if res.get("response"):
@@ -136,7 +191,7 @@ async def webhook(path: str, request: Request):
 
 @router.api_route("/webhook-test/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def webhook_test(path: str, request: Request):
-    """Same as /webhook but also matches inactive workflows (for building)."""
+    """Same as /webhook but runs the caller's own draft (inactive workflows too, for building)."""
     return await _handle_webhook(path, request, test=True)
 
 
@@ -151,15 +206,30 @@ input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #c
 button{margin-top:24px;width:100%;padding:12px;border:0;border-radius:8px;background:#ff6d5a;color:#fff;font-weight:600;font-size:15px;cursor:pointer}"""
 
 
-async def _form_node(wf_id: str) -> tuple[dict, dict]:
+async def _live_workflow(wf_id: str) -> dict | None:
+    """What production runs, only for an active, published workflow (public entry points never reach drafts)."""
     try:
-        wf = await load_workflow(wf_id)
-    except ValueError as e:
-        raise HTTPException(404, "Form not found") from e
-    node = next((n for n in wf["nodes"] if n["type"] == "trigger.form" and not n.get("disabled")), None)
+        key = uuid.UUID(wf_id)
+    except ValueError:
+        return None
+    async with SessionLocal() as s:
+        wf = await s.get(Workflow, key)
+        if not wf or not wf.active or not wf.published_version_id:
+            return None
+        return workflow_to_dict(wf, live=True)
+
+
+async def _form_node(wf_id: str) -> tuple[dict, dict]:
+    wf = await _live_workflow(wf_id)
+    node = next((n for n in (wf or {}).get("nodes", []) if n["type"] == "trigger.form" and not n.get("disabled")), None)
     if not node:
         raise HTTPException(404, "Form not found")
     return wf, node
+
+
+def _card(title: str, message: str) -> str:
+    return (f"<!doctype html><html><head><meta charset=utf-8><style>{FORM_CSS}</style></head><body><div class=card>"
+            f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p></div></body></html>")
 
 
 @router.get("/form/{wf_id}", response_class=HTMLResponse)
@@ -184,9 +254,13 @@ async def form_page(wf_id: str):
 async def form_submit(wf_id: str, request: Request, background: BackgroundTasks):
     wf, node = await _form_node(wf_id)
     data = dict(await request.form())
-    await execute_workflow(wf, trigger_node_id=node["id"], items=[data], mode="webhook", wait=False)
-    msg = html.escape((node.get("parameters") or {}).get("success_message") or "Thanks!")
-    return f"<!doctype html><html><head><meta charset=utf-8><style>{FORM_CSS}</style></head><body><div class=card><h1>✓</h1><p>{msg}</p></div></body></html>"
+    try:
+        await execute_workflow(wf, trigger_node_id=node["id"], items=[data], mode="webhook", wait=False)
+    except Overloaded as e:
+        return HTMLResponse(_card("Busy", "The server is busy right now. Go back and submit again in a moment."),
+                            status_code=503, headers={"Retry-After": str(e.retry_after)})
+    msg = (node.get("parameters") or {}).get("success_message") or "Thanks!"
+    return _card("✓", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -203,22 +277,36 @@ class ChatIn(BaseModel):
 
 @router.post("/api/chat/{wf_id}")
 async def chat(wf_id: str, body: ChatIn, request: Request):
+    # Its owner (signed in, allowed to run workflows) may always chat: the editor's chat panel (header
+    # x-debbuilder-editor: 1) tests the draft. Everyone else talks to the published version of an active workflow
+    # whose Chat Trigger is marked public.
+    p = getattr(request.state, "principal", None)
     try:
-        wf = await load_workflow(wf_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from e
+        key = uuid.UUID(wf_id)
+    except ValueError:
+        raise HTTPException(404, "Workflow not found") from None
+    async with SessionLocal() as s:
+        row = await s.get(Workflow, key)
+        if row is None:
+            raise HTTPException(404, "Workflow not found")
+        owner = bool(p and p.can("workflow:execute") and can_manage(p, row.owner_id))
+        if owner and request.headers.get("x-debbuilder-editor") == "1":
+            wf = workflow_to_dict(row)
+        elif owner or (row.active and row.published_version_id):
+            wf = workflow_to_dict(row, live=True)
+        else:
+            raise HTTPException(404, "Workflow not found")  # unpublished / inactive: not reachable from outside
     node = next((n for n in wf["nodes"] if n["type"] == "trigger.chat" and not n.get("disabled")), None)
     if not node:
         raise HTTPException(400, "Workflow has no Chat Trigger")
-    # Signed-in users who may run this workflow can always chat (editor panel); anyone else only if
-    # the Chat Trigger is marked public. (A client header used to bypass this check.)
-    p = getattr(request.state, "principal", None)
-    owner = uuid.UUID(wf["owner_id"]) if wf.get("owner_id") else None
-    if not (p and p.can("workflow:execute") and can_manage(p, owner)) and not (node.get("parameters") or {}).get("public"):
+    if not owner and not (node.get("parameters") or {}).get("public"):
         raise HTTPException(403, "Public chat is disabled on this Chat Trigger")
     item = {"message": body.message, "chatInput": body.message, "session_id": body.session_id or str(uuid.uuid4()),
             **body.metadata}
-    res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="chat", wait=body.wait)
+    try:
+        res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="chat", wait=body.wait)
+    except Overloaded as e:
+        return busy(e)
     if body.wait:
         res["reply"] = output_text(res.get("output") or [])
     return res
@@ -230,10 +318,16 @@ async def chat(wf_id: str, body: ChatIn, request: Request):
 
 
 async def _whatsapp_creds() -> list[tuple[str, dict]]:
-    """[(credential id, data incl. "_owner_id")]: a trigger only uses its workflow owner's credential."""
+    """[(credential id, data incl. "_owner_id")] of every WhatsApp credential (the rare verification handshake only)."""
     async with SessionLocal() as s:
         rows = (await s.execute(select(Credential).where(Credential.type == "whatsapp"))).scalars().all()
-    return [(str(c.id), {**decrypt(c.data), "_owner_id": str(c.owner_id) if c.owner_id else None}) for c in rows]
+    out = []
+    for c in rows:
+        try:
+            out.append((str(c.id), {**decrypt(c.data), "_owner_id": str(c.owner_id) if c.owner_id else None}))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 @router.get("/api/whatsapp/webhook")
@@ -241,7 +335,7 @@ async def whatsapp_verify(request: Request):
     q = request.query_params
     if q.get("hub.mode") == "subscribe":
         token = q.get("hub.verify_token")
-        if any(c.get("verify_token") == token for _, c in await _whatsapp_creds()):
+        if token and any(c.get("verify_token") == token for _, c in await _whatsapp_creds()):
             return PlainTextResponse(q.get("hub.challenge", ""))
     raise HTTPException(403, "Verification failed")
 
@@ -249,24 +343,31 @@ async def whatsapp_verify(request: Request):
 @router.post("/api/whatsapp/webhook")
 async def whatsapp_receive(request: Request):
     raw = await request.body()
-    payload = json.loads(raw or b"{}")
-    events = parse_webhook(payload)
+    try:
+        payload = json.loads(raw or b"{}")
+        events = parse_webhook(payload) if isinstance(payload, dict) else None
+    except (ValueError, TypeError, AttributeError, KeyError):
+        events = None
+    if events is None:
+        raise HTTPException(400, "Expected a WhatsApp Cloud API webhook (JSON)")
     if not events:
         return {"ok": True}
-    creds = dict(await _whatsapp_creds())
-    for wf, node in await _workflows_with("trigger.whatsapp"):
-        params = node.get("parameters") or {}
-        cred = creds.get(str(params.get("credential")))
-        if not cred or cred["_owner_id"] != wf.get("owner_id"):
-            continue
-        if cred.get("app_secret") and not verify_signature(cred["app_secret"], raw, request.headers.get("x-hub-signature-256")):
-            log.warning("WhatsApp signature mismatch for workflow %s", wf["id"])
-            continue
-        for ev in events:
-            if ev.get("phone_number_id") != cred.get("phone_number_id"):
-                continue
-            if ev["event"] == "status" and params.get("events", "messages") != "all":
-                continue
-            await execute_workflow(wf, trigger_node_id=node["id"], items=[ev], mode="whatsapp", wait=False)
+    routes = await _current_routes()
+    signature = request.headers.get("x-hub-signature-256")
+    try:
+        for number in {ev.get("phone_number_id") for ev in events}:
+            for wf, node, cred in routes.whatsapp.get(str(number), []):
+                params = node.get("parameters") or {}
+                if cred.get("app_secret") and not verify_signature(cred["app_secret"], raw, signature):
+                    log.warning("WhatsApp signature mismatch for workflow %s", wf["id"])
+                    continue
+                for ev in events:
+                    if ev.get("phone_number_id") != cred.get("phone_number_id"):
+                        continue
+                    if ev["event"] == "status" and params.get("events", "messages") != "all":
+                        continue
+                    await execute_workflow(wf, trigger_node_id=node["id"], items=[ev], mode="whatsapp", wait=False)
+    except Overloaded as e:
+        return busy(e)  # Meta retries the delivery later
     # Meta retries unless we answer 200 quickly; executions run in the background.
     return {"ok": True}

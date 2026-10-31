@@ -13,6 +13,7 @@ import httpx
 
 from .credential_catalog import TYPES
 from .credentials import OAUTH_TOKEN_KEY, fmt, oauth2_access_token, request_auth, with_defaults
+from .netguard import BlockedURL, guarded_client
 
 Result = dict  # {"ok": bool, "message": str}
 TESTERS: dict[str, Callable[[dict, str | None], Awaitable[Result]]] = {}
@@ -64,6 +65,8 @@ async def test_credential(cred_type: str, data: dict, cred_id: str | None = None
         if "custom" in test:
             return await asyncio.wait_for(TESTERS[test["custom"]](data, cred_id, cred_type=cred_type, test=test), timeout=25)
         return await _http_test(cred_type, data, cred_id, test)
+    except BlockedURL as e:  # outbound guard (OUTBOUND_ALLOW_PRIVATE / OUTBOUND_ALLOWED_HOSTS)
+        return fail(str(e))
     except TimeoutError:
         return fail("Timed out: host unreachable or firewall blocking the connection")
     except httpx.ConnectError as e:
@@ -84,7 +87,7 @@ async def _http_test(cred_type: str, data: dict, cred_id: str | None, test: dict
     headers, params, auth = await request_auth(cred_type, data, cred_id)
     headers.update({k: fmt(v, data) for k, v in test.get("headers", {}).items()})
     body = json.loads(fmt(json.dumps(test["json"]), data)) if "json" in test else None
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+    async with guarded_client(timeout=20, follow_redirects=True) as c:
         r = await c.request(test.get("method", "GET"), url, headers=headers, params=params or None, json=body, auth=auth)
     if r.status_code >= 400:
         return fail(_http_error(r))
@@ -294,7 +297,7 @@ async def _livekit(d, _id, **_):
 @tester("paypal")
 async def _paypal(d, _id, **_):
     base = "https://api-m.sandbox.paypal.com" if d.get("environment") == "sandbox" else "https://api-m.paypal.com"
-    async with httpx.AsyncClient(timeout=20) as c:
+    async with guarded_client(timeout=20) as c:
         r = await c.post(f"{base}/v1/oauth2/token", data={"grant_type": "client_credentials"},
                          auth=(d["client_id"], d["client_secret"]))
     return ok() if r.status_code == 200 else fail(_http_error(r))
@@ -306,7 +309,7 @@ async def _oauth2(d, cred_id, cred_type="oauth2", test=None, **_):
         return fail("Not connected yet. Click 'Connect my account' to authorize.")
     token = await oauth2_access_token(cred_type, d, cred_id)
     if test and test.get("url"):
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with guarded_client(timeout=20) as c:
             r = await c.get(test["url"], headers={"Authorization": f"Bearer {token}"})
         if r.status_code >= 400:
             return fail(_http_error(r))
@@ -332,7 +335,7 @@ async def _google_sa(d, _id, **_):
                              "aud": sa.get("token_uri", "https://oauth2.googleapis.com/token"), "iat": now, "exp": now + 600}).encode())
     key = serialization.load_pem_private_key(sa["private_key"].encode(), password=None)
     sig = b64(key.sign(f"{header}.{claims}".encode(), padding.PKCS1v15(), hashes.SHA256()))
-    async with httpx.AsyncClient(timeout=20) as c:
+    async with guarded_client(timeout=20) as c:
         r = await c.post(sa.get("token_uri", "https://oauth2.googleapis.com/token"),
                          data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": f"{header}.{claims}.{sig}"})
     return ok(f"Authenticated as {sa['client_email']}") if r.status_code == 200 else fail(_http_error(r))
@@ -359,7 +362,7 @@ async def _aws(d, _id, **_):
         k = hmac.new(k, part.encode(), hashlib.sha256).digest()
     sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = f"AWS4-HMAC-SHA256 Credential={d['access_key_id']}/{scope}, SignedHeaders={signed}, Signature={sig}"
-    async with httpx.AsyncClient(timeout=20) as c:
+    async with guarded_client(timeout=20) as c:
         r = await c.post(f"https://{host}/", content=body, headers=headers)
     if r.status_code != 200:
         return fail(_http_error(r))

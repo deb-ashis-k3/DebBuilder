@@ -4,6 +4,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -187,6 +188,57 @@ export function fmtDuration(ms?: number | null) {
 
 
 
+
+// Dialogs: Esc closes the topmost one, focus goes back to whatever opened it.
+const dialogStack: symbol[] = [];
+
+/** For a modal / panel: Esc closes it (only the topmost one when they stack), focus moves into it when it opens
+ *  and back to the element that opened it when it closes. Inner widgets (dropdowns, autocomplete, a maximised
+ *  code editor) handle Esc first: they stop the event or mark it handled with preventDefault(). Attach the
+ *  returned ref to the dialog element. */
+export function useDialog<T extends HTMLElement = HTMLDivElement>(onClose: () => void) {
+  const ref = useRef<T>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
+  // Read during the first render: by the time effects run, an autoFocus field inside the dialog has focus.
+  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  if (openerRef.current === undefined)
+    openerRef.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+  useEffect(() => {
+    const id = Symbol("dialog");
+    dialogStack.push(id);
+    const opener = openerRef.current;
+    const raf = requestAnimationFrame(() => {
+      const el = ref.current;
+      if (el && !el.contains(document.activeElement)) {
+        if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "-1");
+        el.focus({ preventScroll: true });
+      }
+    });
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || dialogStack[dialogStack.length - 1] !== id) return;
+      // An open native <select> / IME composition owns this Esc.
+      if (e.isComposing) return;
+      e.preventDefault();
+      close.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKey);
+      const i = dialogStack.indexOf(id);
+      if (i >= 0) dialogStack.splice(i, 1);
+      // Give focus back to the opener (if it's still on the page and nothing else took focus).
+      if (opener && opener.isConnected) {
+        requestAnimationFrame(() => {
+          const a = document.activeElement;
+          if (!a || a === document.body || !a.isConnected) opener.focus({ preventScroll: true });
+        });
+      }
+    };
+  }, []);
+  return ref;
+}
 
 type ToastFn = (msg: string, kind?: "info" | "error") => void;
 let pushToast: ToastFn = () => {};

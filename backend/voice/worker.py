@@ -260,7 +260,9 @@ async def entrypoint(ctx: JobContext) -> None:
             log.error("no workflow for agent %s / number %s; hanging up", AGENT_NAME, meta.get("dialed_number"))
             await ctx.delete_room()
             return
-        r = await http.get(f"{API}/api/voice/config/{workflow_id}", headers=HEADERS)
+        # draft: a test call from the editor runs the draft; phone calls run the published version
+        r = await http.get(f"{API}/api/voice/config/{workflow_id}", headers=HEADERS,
+                           params={"draft": "true"} if meta.get("draft") else None)
         r.raise_for_status()
         cfg = r.json()
 

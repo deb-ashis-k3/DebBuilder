@@ -6,7 +6,7 @@ import {
 import '@xyflow/react/dist/style.css'
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, downloadJson, openSocket } from '../api'
+import { ApiError, api, conflictOf, downloadJson, openSocket } from '../api'
 import { EdgeActionsCtx, edgeTypes, type EdgeActions } from '../components/CanvasEdge'
 import { ChatPanel } from '../components/ChatPanel'
 import { Menu, MoveDialog, PromptDialog, confirmDialog, folderPath } from '../components/Dialogs'
@@ -16,8 +16,8 @@ import { nodeTypes, type FlowNodeData } from '../components/FlowNode'
 import { NodeDetails } from '../components/NodeDetails'
 import { Palette } from '../components/Palette'
 import { PropertyField } from '../components/PropertyField'
-import { Icon, defaultParams, newId, toast, uniqueName, useCatalog } from '../lib'
-import type { ExecEvent, Execution, Folder, Item, NodeRun, NodeTypeSpec, RunState, StateKey, WFEdge, WFNode, Workflow } from '../types'
+import { Icon, defaultParams, newId, toast, uniqueName, useCatalog, useDialog } from '../lib'
+import type { ExecEvent, Execution, Folder, Item, NodeRun, NodeTypeSpec, RunState, StateKey, WFEdge, WFNode, Workflow, WorkflowVersion } from '../types'
 import { WorkflowExecutionsView } from './Executions'
 import { useAuth } from '../auth'
 import { CanvasContextMenu, SelectionToolbar, type MenuTarget } from '../canvas/CanvasMenus'
@@ -28,6 +28,7 @@ import '../pages.css'  // styles for pages loaded on demand
 const AUTOSAVE_MS = 800        // after the last change (a drag only saves once you let go)
 const AUTOSAVE_RETRY_MS = 5000
 const VoicePanel = lazy(() => import('../components/VoicePanel').then((m) => ({ default: m.VoicePanel })))
+const VersionCompare = lazy(() => import('../components/VersionCompare').then((m) => ({ default: m.VersionCompare })))
 
 type RFNode = Node<FlowNodeData>
 
@@ -54,22 +55,40 @@ const fromRF = (nodes: RFNode[]): WFNode[] =>
 const edgesFromRF = (edges: Edge[]): WFEdge[] =>
   edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? 'main', targetHandle: e.targetHandle ?? 'main' }))
 
-/** Group an execution's ordered node runs per node: latest run drives the canvas, all runs feed the NDV. */
-export function runStateFromRuns(runs: NodeRun[]): Record<string, RunState> {
-  const out: Record<string, RunState> = {}
+/** Group an execution's ordered node runs per node: latest run drives the canvas, all runs feed the NDV.
+ *  Linear in the number of runs. With `prev` (the last result), a node whose runs didn't change keeps its
+ *  RunState object, so canvas nodes and the open panel don't re-render for every event of a long loop. */
+export function runStateFromRuns(runs: NodeRun[], prev?: Record<string, RunState>): Record<string, RunState> {
+  const groups = new Map<string, NodeRun[]>()
   for (const r of runs) {
-    const prev = out[r.node_id]
-    const all = [...(prev?.runs ?? []), r]
-    out[r.node_id] = {
+    const g = groups.get(r.node_id)
+    if (g) g.push(r)
+    else groups.set(r.node_id, [r])
+  }
+  const out: Record<string, RunState> = {}
+  for (const [id, all] of groups) {
+    const old = prev?.[id]
+    if (old?.runs && old.runs.length === all.length && old.runs[all.length - 1] === all[all.length - 1] && old.runs.every((x, i) => x === all[i])) {
+      out[id] = old
+      continue
+    }
+    const r = all[all.length - 1]
+    let duration = 0
+    for (const x of all) duration += x.duration_ms ?? 0
+    out[id] = {
       status: r.status, input: r.input, output: r.output, error: r.error, started_at: r.started_at, pinned: r.pinned,
       // Canvas shows total time across loop iterations, like n8n.
-      duration_ms: all.reduce((a, x) => a + (x.duration_ms ?? 0), 0),
+      duration_ms: duration,
       counts: r.item_counts ?? Object.fromEntries(Object.entries(r.output ?? {}).map(([k, v]) => [k, v.length])),
       runs: all,
     }
   }
   return out
 }
+
+/** Undo history is capped by size as well as steps (large workflows can be several MB per snapshot). */
+const HISTORY_MAX_STEPS = 100
+const HISTORY_MAX_CHARS = 16_000_000  // ~32 MB of UTF-16 across past + future
 
 export const runStateFromExecution = (ex: Execution) => runStateFromRuns(ex.node_runs ?? [])
 
@@ -102,6 +121,11 @@ function EditorInner() {
   const changes = useRef(0)
   const savedVersion = useRef(0)  // `changes` value the server has
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved')
+  // Optimistic concurrency: the server's revision of what this tab last loaded / saved. A save from another tab or
+  // session bumps it, and ours is then refused (409) instead of silently overwriting theirs.
+  const revision = useRef<number | undefined>(undefined)
+  const [conflict, setConflict] = useState<Workflow | null>(null)
+  const conflictRef = useRef<Workflow | null>(null)
   const autosave = useRef<{ timer?: number; inflight: boolean; again: boolean }>({ inflight: false, again: false })
   const flushRef = useRef<() => Promise<void>>(async () => {})
   const touched = () => {
@@ -124,6 +148,9 @@ function EditorInner() {
     if (!el || !ns.length) return
     const READABLE = 0.55, PAD_X = 40, PAD_TOP = 84, PAD_BOTTOM = 96
     const W = el.clientWidth, H = el.clientHeight
+    // Hidden (Executions tab) or not laid out yet: nothing to fit, and an animated move on a zero-size
+    // canvas interpolates through NaN (SVG errors). The resize observer fits once it has a size again.
+    if (W <= 0 || H <= 0) return
     const b = rf.getNodesBounds(ns)
     const fitAll = Math.min(1, (W - 2 * PAD_X) / Math.max(b.width, 1), (H - PAD_TOP - PAD_BOTTOM) / Math.max(b.height, 1))
     if (fitAll >= READABLE) {
@@ -152,8 +179,23 @@ function EditorInner() {
   const [palette, setPalette] = useState<{ pending?: Pending } | null>(null)
   const [openNode, setOpenNode] = useState<string | null>(null)
   const [execRuns, setExecRuns] = useState<NodeRun[]>([])
+  // Live events arrive one websocket message at a time (thousands in a long loop): apply them once per frame.
+  const runQueue = useRef<{ fns: ((rs: NodeRun[]) => NodeRun[])[]; raf?: number }>({ fns: [] })
+  const updateRuns = useCallback((fn: (rs: NodeRun[]) => NodeRun[]) => {
+    const q = runQueue.current
+    q.fns.push(fn)
+    if (q.raf !== undefined) return
+    q.raf = requestAnimationFrame(() => {
+      q.raf = undefined
+      const fns = q.fns
+      q.fns = []
+      setExecRuns((rs) => fns.reduce((acc, f) => f(acc), rs))
+    })
+  }, [])
+  useEffect(() => () => { if (runQueue.current.raf !== undefined) cancelAnimationFrame(runQueue.current.raf) }, [])
   const [execMeta, setExecMeta] = useState<ExecMeta | null>(null)
-  const runData = useMemo(() => runStateFromRuns(execRuns), [execRuns])
+  const runDataRef = useRef<Record<string, RunState>>({})
+  const runData = useMemo(() => (runDataRef.current = runStateFromRuns(execRuns, runDataRef.current)), [execRuns])
   const nodeNames = useMemo(() => Object.fromEntries(nodes.map((n) => [n.id, n.data.node.name])), [nodes])
   const [execId, setExecId] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
@@ -163,6 +205,10 @@ function EditorInner() {
   const [logLines, setLogLines] = useState<string[]>([])
   const [logFocus, setLogFocus] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  /** Compare view: [before, after] ('draft' or version ids), the versions to pick from and the editor graph then. */
+  const [compare, setCompare] = useState<{ pair: [string, string]; versions: WorkflowVersion[]; draft: { nodes: WFNode[]; edges: WFEdge[] } } | null>(null)
+  const [publishing, setPublishing] = useState(false)
   const listeners = useRef(new Set<(ev: ExecEvent) => void>())
   const execRef = useRef<string | null>(null)
   const panelRef = useRef<'chat' | 'voice' | null>(null)
@@ -175,6 +221,9 @@ function EditorInner() {
     api.workflow(id).then((w) => {
       if (!alive) return
       setWf(w)
+      revision.current = w.revision
+      conflictRef.current = null
+      setConflict(null)
       setNodes(w.nodes.map((n) => toRF(n)))
       setEdges(w.edges.map(edgeToRF))
       setDirty(false)
@@ -209,7 +258,7 @@ function EditorInner() {
         if (!test) return
         execRef.current = ev.execution_id
         setExecId(ev.execution_id)
-        setExecRuns([])
+        updateRuns(() => [])
         setExecMeta({ id: ev.execution_id, status: 'running', mode: ev.mode, started_at: new Date((ev.ts ?? Date.now() / 1000) * 1000).toISOString() })
         setWaiting(null)
         setRunning(true)
@@ -220,12 +269,12 @@ function EditorInner() {
       const sameRun = (r: NodeRun) => r.node_id === ev.node_id && (ev.run_index == null || r.run_index === ev.run_index)
       if (ev.type === 'node_started' && ev.node_id) {
         const n = rf.getNode(ev.node_id) as RFNode | undefined
-        setExecRuns((rs) => [...rs, {
+        updateRuns((rs) => [...rs, {
           node_id: ev.node_id!, name: ev.name ?? n?.data.node.name ?? ev.node_id!, type: n?.data.node.type ?? '',
           status: 'running', started_at: ev.started_at ?? new Date().toISOString(), run_index: ev.run_index ?? 0,
         }])
       } else if (ev.type === 'node_finished' && ev.node_id) {
-        setExecRuns((rs) => {
+        updateRuns((rs) => {
           const i = rs.findLastIndex(sameRun)
           if (i < 0) return rs
           const next = [...rs]
@@ -235,9 +284,9 @@ function EditorInner() {
         })
       } else if (ev.type === 'sub_run' && ev.node_id && ev.sub_run) {
         // A model / tool / memory call inside an AI node: grows the log tree while the node runs.
-        setExecRuns((rs) => upsertSubRun(rs, ev.node_id!, ev.sub_run!))
+        updateRuns((rs) => upsertSubRun(rs, ev.node_id!, ev.sub_run!))
       } else if (ev.type === 'node_waiting' && ev.node_id) {
-        setExecRuns((rs) => rs.map((r) => (r.node_id === ev.node_id && r.status === 'running' ? { ...r, status: 'waiting' } : r)))
+        updateRuns((rs) => rs.map((r) => (r.node_id === ev.node_id && r.status === 'running' ? { ...r, status: 'waiting' } : r)))
       } else if (ev.type === 'log') {
         const n = rf.getNode(ev.node_id ?? '') as RFNode | undefined
         setLogLines((l) => [...l, `[${n?.data.node.name ?? ev.node_id}] ${ev.message}`])
@@ -247,12 +296,12 @@ function EditorInner() {
         if (ev.status === 'error') toast(`Execution failed: ${ev.error}`, 'error')
         if (ev.status === 'waiting') setWaiting(ev.waiting_for ?? null)
         api.execution(ev.execution_id).then((ex) => {
-          setExecRuns(ex.node_runs ?? [])
+          updateRuns(() => ex.node_runs ?? [])
           setExecMeta((m) => ({ ...(m ?? { id: ex.id }), id: ex.id, status: ex.status, mode: ex.mode, started_at: ex.started_at, duration_ms: ex.duration_ms, error: ex.error }))
         }).catch(() => {})
       }
     })
-  }, [id])
+  }, [id, updateRuns])
 
   const subscribe = useCallback((fn: (ev: ExecEvent) => void) => {
     listeners.current.add(fn)
@@ -274,7 +323,35 @@ function EditorInner() {
   }), [edges, runData])
 
   // ---- graph editing -----------------------------------------------------
-  const snapshot = () => JSON.stringify({ nodes: fromRF(rf.getNodes() as RFNode[]), edges: edgesFromRF(rf.getEdges()) })
+  // Pinned data can be large: snapshots refer to it by a token instead of copying it into every step. Pin data is
+  // replaced (never mutated) on edit, so object identity is enough, and pin edits stay undoable (the token changes).
+  const pins = useRef({ ids: new WeakMap<object, string>(), byId: new Map<string, unknown>(), seq: 0 })
+  const pinToken = (data: unknown) => {
+    if (!data || typeof data !== 'object') return data
+    const P = pins.current
+    let k = P.ids.get(data)
+    if (!k) { k = `p${++P.seq}`; P.ids.set(data, k); P.byId.set(k, data) }
+    return { $pin: k }
+  }
+  const pinValue = (data: unknown) => {
+    const k = data && typeof data === 'object' && !Array.isArray(data) ? (data as { $pin?: unknown }).$pin : undefined
+    return typeof k === 'string' && pins.current.byId.has(k) ? pins.current.byId.get(k) : data
+  }
+  const tokenized = (ns: WFNode[]) => ns.map((n) => (n.pin_data == null ? n : { ...n, pin_data: pinToken(n.pin_data) as WFNode['pin_data'] }))
+  const snapshot = () => JSON.stringify({ nodes: tokenized(fromRF(rf.getNodes() as RFNode[])), edges: edgesFromRF(rf.getEdges()) })
+  /** Drop the oldest steps beyond the step / size budget, and pinned data no step refers to any more. */
+  const trimHistory = () => {
+    const h = history.current
+    if (h.past.length > HISTORY_MAX_STEPS) h.past.splice(0, h.past.length - HISTORY_MAX_STEPS)
+    let size = (h.last?.length ?? 0) + h.past.reduce((a, x) => a + x.length, 0) + h.future.reduce((a, x) => a + x.length, 0)
+    while (size > HISTORY_MAX_CHARS && h.past.length) size -= h.past.shift()!.length
+    const P = pins.current
+    if (P.byId.size > 20) {
+      const used = new Set<string>()
+      for (const st of [h.last ?? '', ...h.past, ...h.future]) for (const m of st.matchAll(/"\$pin":"(p\d+)"/g)) used.add(m[1])
+      for (const k of [...P.byId.keys()]) if (!used.has(k)) P.byId.delete(k)
+    }
+  }
   const commit = () => {
     const h = history.current
     window.clearTimeout(h.timer)
@@ -283,9 +360,9 @@ function EditorInner() {
     if (h.last === null) { h.last = now; return }
     if (now === h.last) return
     h.past.push(h.last)
-    if (h.past.length > 100) h.past.shift()
     h.future = []
     h.last = now
+    trimHistory()
   }
   function scheduleCommit() {
     window.clearTimeout(history.current.timer)
@@ -294,7 +371,7 @@ function EditorInner() {
   const markDirty = () => { touched(); scheduleCommit() }
   const restore = (state: string) => {
     const s = JSON.parse(state) as { nodes: WFNode[]; edges: WFEdge[] }
-    setNodes(s.nodes.map((n) => toRF(n)))
+    setNodes(s.nodes.map((n) => toRF(n.pin_data == null ? n : { ...n, pin_data: pinValue(n.pin_data) as WFNode['pin_data'] })))
     setEdges(s.edges.map(edgeToRF))
     history.current.last = state
     touched()  // undo / redo are saved like any edit
@@ -316,6 +393,11 @@ function EditorInner() {
     restore(next)
   }
   const currentNodes = () => fromRF(rf.getNodes() as RFNode[])
+  /** Edges whose both ends still exist (the server refuses a graph with dangling connections). */
+  const liveEdges = () => {
+    const ids = new Set(rf.getNodes().map((n) => n.id))
+    return edgesFromRF(rf.getEdges().filter((e) => ids.has(e.source) && ids.has(e.target)))
+  }
 
   const isValidConnection = useCallback((c: Connection | Edge) => {
     const sh = c.sourceHandle ?? 'main'
@@ -444,31 +526,50 @@ function EditorInner() {
   }
 
   // ---- save / run --------------------------------------------------------
-  const save = useCallback(async (extra: Partial<Workflow> = {}, quiet = false) => {
+  /** Take a workflow the server returned (save, publish, move…): its server-owned fields and revision. */
+  const adopt = useCallback((saved: Workflow) => {
+    if (saved.revision != null) revision.current = saved.revision
+    // Only server-owned fields: what was typed while the request ran (name, settings…) stays.
+    setWf((w) => (w ? { ...w, ...serverFields(saved) } : saved))
+  }, [])
+
+  /** Save the editor's draft. `force` overwrites a newer server version ("Keep mine" after a conflict). */
+  const save = useCallback(async (extra: Partial<Workflow> = {}, quiet = false, force = false) => {
     if (!wf) return
+    if (conflictRef.current && !force) throw new Error('This workflow was changed in another tab or session. Choose which version to keep first.')
     const version = changes.current
     try {
       const saved = await api.updateWorkflow(wf.id, {
         name: wf.name, settings: wf.settings, description: wf.description,
-        nodes: currentNodes(), edges: edgesFromRF(rf.getEdges()), ...extra,
+        nodes: currentNodes(), edges: liveEdges(), ...extra,
+        // Without a revision from the server (older backend) there's nothing to check: save as before.
+        ...(revision.current != null ? { revision: revision.current } : {}),
       })
-      // Only server-owned fields: what was typed while the request ran (name, settings…) stays.
-      setWf((w) => (w ? { ...w, updated_at: saved.updated_at, active: saved.active, folder_id: saved.folder_id } : saved))
+      adopt(saved)
       savedVersion.current = Math.max(savedVersion.current, version)
       if (changes.current === version) setDirty(false)
       return saved
     } catch (e) {
+      const latest = conflictOf(e)
+      if (latest) {
+        // Someone else saved first: stop autosaving and let the user choose (banner below the top bar).
+        window.clearTimeout(autosave.current.timer)
+        conflictRef.current = latest
+        setConflict(latest)
+        throw e
+      }
       if (!quiet) toast(String(e), 'error')
       throw e
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wf, rf])
+  }, [wf, rf, adopt])
 
   /** Write pending changes now. Serialised: a change made during a save is written right after it. */
   const flush = useCallback(async () => {
     const a = autosave.current
     window.clearTimeout(a.timer)
     if (readOnly || changes.current === savedVersion.current) return  // nothing new since the last save
+    if (conflictRef.current) return  // paused until the user picks a version
     if (a.inflight) { a.again = true; return }
     a.inflight = true
     setSaveState('saving')
@@ -476,15 +577,23 @@ function EditorInner() {
     try {
       await save({}, true)
       setSaveState('saved')
-    } catch {
+    } catch (e) {
+      if (conflictOf(e)) { setSaveState('saved'); return }  // the conflict banner takes over; no retry loop
       setSaveState('error')
+      // The server refused the content (empty name, invalid graph…): retrying won't help, say why. The next edit saves again.
+      if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 429) { toast(`Couldn't save: ${e.message}`, 'error'); return }
       a.timer = window.setTimeout(() => { flushRef.current() }, AUTOSAVE_RETRY_MS)  // e.g. network blip
     } finally {
       a.inflight = false
-      if (a.again || changes.current !== version) { a.again = false; if (changes.current !== version) flushRef.current() }
+      if (a.again || changes.current !== version) { a.again = false; if (changes.current !== version && !conflictRef.current) flushRef.current() }
     }
   }, [save, readOnly])
   flushRef.current = flush
+  /** Wait for an autosave that's already running, then write whatever is still pending. */
+  const settle = useCallback(async () => {
+    for (let i = 0; i < 300 && autosave.current.inflight; i++) await new Promise((r) => window.setTimeout(r, 50))
+    await flush()
+  }, [flush])
   const ensureSaved = useCallback(async () => { if (dirty) await flush() }, [dirty, flush])
 
   // Leaving the editor, switching tabs or closing the window: write what's pending right away.
@@ -522,8 +631,82 @@ function EditorInner() {
 
   const toggleActive = async () => {
     if (!wf) return
-    const saved = await save({ active: !wf.active })
-    if (saved) toast(saved.active ? 'Workflow activated' : 'Workflow deactivated')
+    try {
+      await settle()
+      const saved = await save({ active: !wf.active })
+      if (saved) toast(saved.active ? `Workflow activated · running v${saved.published_version}` : 'Workflow deactivated')
+    } catch { /* toast / conflict banner already shown */ }
+  }
+
+  /** Conflict: "Load latest" replaces the editor with the server's version (undo brings yours back). */
+  const loadLatest = () => {
+    const latest = conflictRef.current
+    if (!latest) return
+    commit()  // your unsaved edits become an undo step
+    const h = history.current
+    const state = JSON.stringify({ nodes: tokenized(latest.nodes ?? []), edges: latest.edges ?? [] })
+    if (h.last !== null && h.last !== state) { h.past.push(h.last); h.future = []; trimHistory() }
+    h.last = state
+    window.clearTimeout(h.timer)
+    window.clearTimeout(autosave.current.timer)
+    conflictRef.current = null
+    setConflict(null)
+    revision.current = latest.revision
+    setWf(latest)
+    setNodes((latest.nodes ?? []).map((n) => toRF(n)))
+    setEdges((latest.edges ?? []).map(edgeToRF))
+    savedVersion.current = changes.current
+    setDirty(false)
+    setSaveState('saved')
+    requestAnimationFrame(() => requestAnimationFrame(() => updateInternals((latest.nodes ?? []).map((n) => n.id))))
+    toast('Loaded the latest version. Undo (Ctrl+Z) brings your changes back.')
+  }
+  /** Conflict: "Keep mine" saves the editor over the newer version. */
+  const keepMine = async () => {
+    const latest = conflictRef.current
+    if (!latest) return
+    revision.current = latest.revision
+    conflictRef.current = null
+    setConflict(null)
+    setSaveState('saving')
+    try {
+      await save({}, false, true)
+      setSaveState('saved')
+      toast('Your version was saved')
+    } catch (e) {
+      setSaveState(conflictOf(e) ? 'saved' : 'error')
+    }
+  }
+
+  /** n8n's Publish: the saved draft becomes a new version and what production runs; activates the workflow. */
+  const publish = async () => {
+    if (!wf || publishing) return
+    setPublishing(true)
+    try {
+      if (conflictRef.current) throw new Error('This workflow was changed in another tab or session. Choose which version to keep, then publish.')
+      await settle()
+      if (conflictRef.current) return  // the save just hit a conflict: the banner asks what to keep
+      if (changes.current !== savedVersion.current) throw new Error("Couldn't save your latest changes, so nothing was published. Try again.")
+      const saved = await api.publishWorkflow(wf.id)
+      adopt(saved)
+      toast(`Published v${saved.published_version} · production runs it now`)
+    } catch (e) {
+      if (!conflictOf(e)) toast(String(e), 'error')
+    } finally {
+      setPublishing(false)
+    }
+  }
+
+  /** Version history "Restore": load that version into the editor as a normal (undoable, autosaved) edit. */
+  const restoreVersion = async (v: WorkflowVersion) => {
+    if (!wf) return
+    const full = await api.workflowVersion(wf.id, v.id)
+    commit()
+    const h = history.current
+    if (h.last !== null) { h.past.push(h.last); h.future = [] }
+    restore(JSON.stringify({ nodes: tokenized(full.nodes ?? []), edges: full.edges ?? [] }))
+    requestAnimationFrame(() => { smartFit(); requestAnimationFrame(() => updateInternals((full.nodes ?? []).map((n) => n.id))) })
+    toast(`v${v.number} restored to the editor · publish it to put it live`)
   }
 
   /** Add nodes/edges (pasted or imported) to the canvas with fresh ids, selected. `at` = top-left of the group
@@ -717,6 +900,9 @@ function EditorInner() {
     toast(`Pinned ${items.length} item${items.length === 1 ? '' : 's'} from that run on "${trig?.name ?? 'the trigger'}". Execute to debug.`)
   }
   const menu = [
+    ...(!readOnly && (dirty || wf.has_unpublished_changes) ? [{ label: 'Publish', icon: 'upload', onClick: publish }] : []),
+    { label: 'Version history', icon: 'history', onClick: () => setHistoryOpen(true) },
+    { divider: true, label: '' },
     { label: 'Duplicate', icon: 'copy', onClick: () => setDialog('duplicate') },
     { label: 'Move to folder…', icon: 'folder-input', onClick: () => setDialog('move') },
     { divider: true, label: '' },
@@ -741,19 +927,37 @@ function EditorInner() {
           </Link>
         )}
         {crumbs.length > 0 && <span className="ed-crumb-sep hide-sm">/</span>}
-        <input className="wf-name" value={wf.name} onChange={(e) => { setWf({ ...wf, name: e.target.value }); markDirty() }} />
+        <input className="wf-name" value={wf.name} aria-label="Workflow name" title={wf.name} onChange={(e) => { setWf({ ...wf, name: e.target.value }); markDirty() }} />
         {!readOnly && (() => {
-          const st = saveState === 'error' ? 'error' : dirty || saveState === 'saving' ? 'saving' : 'saved'
-          const text = st === 'error' ? "Couldn't save · retrying" : st === 'saving' ? 'Saving…' : 'All changes saved'
+          const st = conflict || saveState === 'error' ? 'error' : dirty || saveState === 'saving' ? 'saving' : 'saved'
+          const text = conflict ? 'Not saved · changed elsewhere' : st === 'error' ? "Couldn't save" : st === 'saving' ? 'Saving…' : 'All changes saved'
           return <span className={`save-state ${st}`} title={`${text} (changes save automatically)`} aria-live="polite"><span className="btn-text">{text}</span></span>
         })()}
-        <span className="spacer" />
+        <span className="spacer ed-break" />
         <div className="tabs ed-tabs" role="tablist">
           <button role="tab" aria-selected={tab === 'editor'} className={`tab ${tab === 'editor' ? 'active' : ''}`} onClick={() => setTab('editor')}>Editor</button>
           <button role="tab" aria-selected={tab === 'executions'} className={`tab ${tab === 'executions' ? 'active' : ''}`} onClick={() => setTab('executions')}>Executions</button>
         </div>
         <span className="spacer" />
-        <label className={`active-pill ${wf.active ? 'on' : ''}`} title="Active workflows listen for webhooks, schedules and WhatsApp">
+        {(() => {
+          const changed = dirty || !!wf.has_unpublished_changes
+          const label = wf.published_version ? `v${wf.published_version}` : 'Not published'
+          return (
+            <div className="group publish-group">
+              <button className={`btn sm publish-state ${changed ? 'changed' : 'live'}`} onClick={() => setHistoryOpen(true)} aria-label={`Version history (${label})`}
+                title={`${wf.published_version ? `Production runs v${wf.published_version}` : 'Never published'}${changed ? ' · the editor has unpublished changes' : ''}. Open version history`}>
+                <Icon name="history" size={14} /> <span className="btn-text">{label}{changed && wf.published_version ? ' · edited' : ''}</span>
+              </button>
+              {!readOnly && (
+                <button className="btn sm primary" onClick={publish} disabled={publishing || !changed} aria-label={publishing ? 'Publishing' : changed ? 'Publish' : 'Published'}
+                  title={changed ? 'Publish these changes: production runs them from now on' : 'Everything is published'}>
+                  <Icon name="upload" size={14} /> <span className="btn-text">{publishing ? 'Publishing…' : changed ? 'Publish' : 'Published'}</span>
+                </button>
+              )}
+            </div>
+          )
+        })()}
+        <label className={`active-pill ${wf.active ? 'on' : ''}`} title="Active workflows run the published version for webhooks, schedules and other triggers">
           <span className="btn-text">{wf.active ? 'Active' : 'Inactive'}</span>
           <span className="switch"><input type="checkbox" checked={wf.active} onChange={toggleActive} disabled={readOnly} /><span /></span>
         </label>
@@ -768,10 +972,25 @@ function EditorInner() {
           <button className="btn sm icon" title="Download JSON" onClick={download}><Icon name="download" size={16} /></button>
           <button className="btn sm icon" title="Workflow settings" onClick={() => setSettingsOpen(true)}><Icon name="settings" size={16} /></button>
         </div>
-        <Menu items={menu} title="Workflow actions" className="btn icon" />
+        <Menu items={menu} title="Workflow actions" className="btn icon ed-menu" />
         <input ref={importRef} type="file" accept=".json,application/json" hidden onChange={(e) => { if (e.target.files?.[0]) importFile(e.target.files[0]); e.target.value = '' }} />
       </div>
       {readOnly && <div className="readonly-banner"><Icon name="eye" size={14} /> View only: your role can't change or run this workflow.</div>}
+      {conflict && (
+        <div className="conflict-banner" role="alert">
+          <Icon name="triangle-alert" size={16} />
+          <div className="grow">
+            <b>This workflow was changed in another tab or session.</b>
+            <div className="small">Autosave is paused so nothing gets overwritten. Load the latest version, or keep yours and replace theirs.</div>
+          </div>
+          <button className="btn sm" onClick={loadLatest} title="Replace the editor with the saved version (Ctrl+Z brings your changes back)">
+            <Icon name="download" size={14} /> Load latest
+          </button>
+          <button className="btn sm primary" onClick={keepMine} title="Save what's in this editor over the other version">
+            <Icon name="save" size={14} /> Keep mine
+          </button>
+        </div>
+      )}
 
       {tab === 'executions' && (
         <WorkflowExecutionsView workflowId={wf.id} execId={routeExecId} onDebug={debugExecution}
@@ -899,15 +1118,7 @@ function EditorInner() {
           onRun={run} />
       )}
       {opened && opened.type === 'sticky' && (
-        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && setOpenNode(null)}>
-          <div className="modal">
-            <div className="modal-head"><h2>Sticky note</h2><button className="btn ghost icon" onClick={() => setOpenNode(null)}><Icon name="x" /></button></div>
-            <div className="modal-body">
-              <textarea className="textarea" rows={10} value={String(opened.data.node.parameters.content ?? '')}
-                onChange={(e) => updateNode({ ...opened.data.node, parameters: { content: e.target.value } })} />
-            </div>
-          </div>
-        </div>
+        <StickyModal node={opened.data.node} onChange={updateNode} onClose={() => setOpenNode(null)} />
       )}
       {dialog === 'duplicate' && (
         <PromptDialog title="Duplicate workflow" label="Name" initial={`${wf.name} (copy)`} confirm="Duplicate" onClose={() => setDialog(null)}
@@ -921,15 +1132,46 @@ function EditorInner() {
       {dialog === 'move' && (
         <MoveDialog title={`Move "${wf.name}"`} folders={folders.filter((f) => f.owner_id === wf.owner_id)} current={wf.folder_id ?? null} onClose={() => setDialog(null)}
           onPick={async (folderId) => {
-            const saved = await api.updateWorkflow(wf.id, { folder_id: folderId })
-            setWf((w) => (w ? { ...w, folder_id: saved.folder_id } : w))
+            await settle()
+            const saved = await save({ folder_id: folderId })
+            if (!saved) return
             toast(`Moved to ${folderId ? folders.find((f) => f.id === folderId)?.name : 'Home'}`)
           }} />
+      )}
+      {historyOpen && <VersionHistory wf={wf} readOnly={readOnly} onClose={() => setHistoryOpen(false)}
+        onPublished={adopt}
+        onRestore={(v) => { setHistoryOpen(false); restoreVersion(v).catch((e) => toast(String(e), 'error')) }}
+        onCompare={(pair, versions) => {
+          setHistoryOpen(false)
+          setCompare({ pair, versions, draft: { nodes: currentNodes(), edges: edgesFromRF(rf.getEdges()) } })
+        }} />}
+      {compare && (
+        <Suspense fallback={null}>
+          <VersionCompare wf={wf} versions={compare.versions} draft={compare.draft} initial={compare.pair} readOnly={readOnly}
+            onClose={() => { setCompare(null); setHistoryOpen(true) }}
+            onPublished={adopt}
+            onRestore={(v) => { setCompare(null); restoreVersion(v).catch((e) => toast(String(e), 'error')) }} />
+        </Suspense>
       )}
       {settingsOpen && <SettingsModal wf={wf} onClose={() => setSettingsOpen(false)} onChange={(w) => { setWf(w); markDirty() }} onDelete={async () => {
         if (!await confirmDialog({ title: `Delete "${wf.name}"?`, message: 'The workflow and all its executions are deleted. This cannot be undone.', confirmLabel: 'Delete', danger: true })) return
         try { await api.deleteWorkflow(wf.id); navigate(home) } catch (e) { toast(String(e), 'error') }
       }} />}
+    </div>
+  )
+}
+
+function StickyModal({ node, onChange, onClose }: { node: WFNode; onChange: (n: WFNode) => void; onClose: () => void }) {
+  const ref = useDialog(onClose)
+  return (
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div ref={ref} className="modal" role="dialog" aria-modal="true" aria-label="Sticky note">
+        <div className="modal-head"><h2>Sticky note</h2><button className="btn ghost icon" onClick={onClose} aria-label="Close" title="Close (Esc)"><Icon name="x" /></button></div>
+        <div className="modal-body">
+          <textarea className="textarea" rows={10} autoFocus value={String(node.parameters.content ?? '')}
+            onChange={(e) => onChange({ ...node, parameters: { content: e.target.value } })} />
+        </div>
+      </div>
     </div>
   )
 }
@@ -942,11 +1184,112 @@ const STATE_REDUCERS = [
   { label: 'Messages: chat history', value: 'messages' },
 ]
 
-function SettingsModal({ wf, onChange, onClose, onDelete }: { wf: Workflow; onChange: (w: Workflow) => void; onClose: () => void; onDelete: () => void }) {
+/** Fields the server owns: merged into the editor's copy without touching what is being typed. */
+function serverFields(w: Workflow): Partial<Workflow> {
+  return { updated_at: w.updated_at, active: w.active, folder_id: w.folder_id, published_version: w.published_version,
+           published_version_id: w.published_version_id, has_unpublished_changes: w.has_unpublished_changes,
+           ...(w.revision != null ? { revision: w.revision } : {}) }
+}
+
+/** n8n's workflow history: every published version, which one production runs, rollback and restore. */
+function VersionHistory({ wf, readOnly, onClose, onPublished, onRestore, onCompare }: {
+  wf: Workflow; readOnly: boolean; onClose: () => void; onPublished: (w: Workflow) => void; onRestore: (v: WorkflowVersion) => void
+  onCompare: (pair: [string, string], versions: WorkflowVersion[]) => void
+}) {
+  const [versions, setVersions] = useState<WorkflowVersion[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const ref = useDialog(onClose)
+  const load = useCallback(() => { api.workflowVersions(wf.id).then(setVersions).catch((e) => toast(String(e), 'error')) }, [wf.id])
+  useEffect(load, [load])
+  const goLive = async (v: WorkflowVersion) => {
+    if (!await confirmDialog({ title: `Publish v${v.number}?`, confirmLabel: `Publish v${v.number}`,
+      message: `Production (webhooks, schedules, listeners${wf.active ? '' : ', once activated'}) runs v${v.number} instead of v${wf.published_version}. The editor's draft is not changed.` })) return
+    setBusy(v.id)
+    try {
+      const saved = await api.publishVersion(wf.id, v.id)
+      onPublished(saved)
+      toast(`v${v.number} is live`)
+      load()
+    } catch (e) {
+      toast(String(e), 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+  /** Before / after for comparing a row: older on the left. The live row compares with the draft (or the version before it). */
+  const compareWith = (v: WorkflowVersion) => {
+    const all = versions ?? []
+    const live = all.find((x) => x.published)
+    if (!live || v.id === live.id) {
+      const prev = all.find((x) => x.number < v.number)
+      return onCompare(wf.has_unpublished_changes || !prev ? [v.id, 'draft'] : [prev.id, v.id], all)
+    }
+    onCompare(v.number < live.number ? [v.id, live.id] : [live.id, v.id], all)
+  }
   return (
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal">
-        <div className="modal-head"><Icon name="settings" /><h2>Workflow settings</h2><button className="btn ghost icon" onClick={onClose}><Icon name="x" /></button></div>
+      <div ref={ref} className="modal version-modal" role="dialog" aria-modal="true" aria-label="Version history">
+        <div className="modal-head"><Icon name="history" /><h2>Version history</h2><button className="btn ghost icon" onClick={onClose} aria-label="Close" title="Close (Esc)"><Icon name="x" /></button></div>
+        <div className="modal-body">
+          <p className="hint">The editor works on a draft that saves automatically. <b>Publish</b> makes it a new version that production runs. Publish an older version to roll back, or restore it into the editor to keep working from it.</p>
+          {wf.has_unpublished_changes && (
+            <div className="version-draft">
+              <Icon name="pencil" size={14} /> <span>Draft: unpublished changes in the editor</span>
+              {versions?.some((v) => v.published) && (
+                <button className="btn sm" onClick={() => onCompare([versions.find((v) => v.published)!.id, 'draft'], versions)}
+                  title="See what the draft changes compared with what production runs"><Icon name="git-compare" size={14} /> Compare with live</button>
+              )}
+            </div>
+          )}
+          {versions === null ? <div className="hint">Loading…</div> : versions.length === 0 ? (
+            <div className="hint">Nothing published yet. Use <b>Publish</b> to put this workflow live.</div>
+          ) : (
+            <ul className="version-list">
+              {versions.map((v) => (
+                <li key={v.id} className={v.published ? 'live' : ''}>
+                  <div className="version-main">
+                    <div className="version-title">
+                      <b>v{v.number}</b>
+                      {v.published && <span className={`badge ${wf.active ? 'success' : 'plain'}`}>{wf.active ? 'Live' : 'Published · inactive'}</span>}
+                    </div>
+                    <div className="version-meta">
+                      {new Date(v.created_at).toLocaleString()}{v.author ? ` · ${v.author}` : ''} · {v.node_count} node{v.node_count === 1 ? '' : 's'}
+                    </div>
+                    {v.note && <div className="version-note">{v.note}</div>}
+                  </div>
+                  <div className="version-actions">
+                    <button className="btn sm" onClick={() => compareWith(v)} title={v.published ? 'Compare the live version with the draft' : 'Compare with the live version'}>
+                      <Icon name="git-compare" size={14} /> Compare
+                    </button>
+                  {!readOnly && (
+                    <>
+                      <button className="btn sm" onClick={() => onRestore(v)} title="Load this version into the editor (doesn't change production)">
+                        <Icon name="rotate-ccw" size={14} /> Restore
+                      </button>
+                      {!v.published && (
+                        <button className="btn sm primary" disabled={busy !== null} onClick={() => goLive(v)} title="Production runs this version">
+                          <Icon name="upload" size={14} /> {busy === v.id ? 'Publishing…' : 'Publish'}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SettingsModal({ wf, onChange, onClose, onDelete }: { wf: Workflow; onChange: (w: Workflow) => void; onClose: () => void; onDelete: () => void }) {
+  const ref = useDialog(onClose)
+  return (
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div ref={ref} className="modal" role="dialog" aria-modal="true" aria-label="Workflow settings">
+        <div className="modal-head"><Icon name="settings" /><h2>Workflow settings</h2><button className="btn ghost icon" onClick={onClose} aria-label="Close" title="Close (Esc)"><Icon name="x" /></button></div>
         <div className="modal-body">
           <div className="field">
             <label>Description</label>

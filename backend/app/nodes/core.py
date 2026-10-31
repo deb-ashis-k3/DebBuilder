@@ -3,14 +3,13 @@
 import asyncio
 import copy
 import json
-import math
 import re
-import textwrap
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from langgraph.types import interrupt
 
+from ..netguard import BlockedURL, guarded_client
 from .base import NodeContext, NodeError, NodeType, prop, register
 
 CORE = dict(group="core", color="#3b82f6")
@@ -40,15 +39,48 @@ def _num(v):
         return None
 
 
+def _bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return None
+
+
+def _maybe_json(v):
+    if isinstance(v, str) and v.strip()[:1] in ("[", "{"):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v
+    return v
+
+
+def _loose_eq(a, b) -> bool:
+    """n8n-style loose equality: 1 == "1", True == "true", [1] == "[1]"."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        ba, bb = _bool(a), _bool(b)
+        if ba is not None and bb is not None:
+            return ba == bb
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return _maybe_json(a) == _maybe_json(b)
+    if _num(a) is not None and _num(b) is not None and not isinstance(a, bool) and not isinstance(b, bool):
+        return _num(a) == _num(b)
+    return str("" if a is None else a) == str("" if b is None else b)
+
+
 def check(left, op, right) -> bool:
     if op == "equals":
-        if _num(left) is not None and _num(right) is not None:
-            return _num(left) == _num(right)
-        return str(left) == str(right) if not isinstance(left, (dict, list)) else left == right
+        return _loose_eq(left, right)
     if op == "not_equals":
         return not check(left, "equals", right)
     if op == "contains":
-        return str(right) in (left if isinstance(left, (list, dict)) else str(left or ""))
+        left = _maybe_json(left) if isinstance(left, str) and isinstance(right, (str, int, float)) and left.strip()[:1] == "[" else left
+        if isinstance(left, list):
+            return any(_loose_eq(x, right) for x in left)
+        if isinstance(left, dict):
+            return str(right) in left
+        return str("" if right is None else right) in str("" if left is None else left)
     if op == "not_contains":
         return not check(left, "contains", right)
     if op == "starts_with":
@@ -226,43 +258,35 @@ async def _code(ctx: NodeContext):
     if language != "python":
         return await _code_subprocess(ctx, language, mode)
     code = ctx.raw_params.get("code") or "return items"
-    logs: list[str] = []
-
-    def _print(*a):
-        msg = " ".join(str(x) for x in a)
-        logs.append(msg)
-        ctx.log(msg)
-
-    env = {
-        "json": json, "re": re, "math": math, "datetime": datetime, "timedelta": timedelta, "timezone": timezone,
-        "httpx": httpx, "asyncio": asyncio, "print": _print,
-        "node": lambda name: ctx.run.outputs_by_name().get(name, []),
-        "vars": ctx.run.meta.get("vars", {}), "execution_id": ctx.run.execution_id,
-        "state": copy.deepcopy(ctx.state), "set_state": ctx.set_state,
-    }
-    src = "async def __user_fn(items, item, index):\n" + textwrap.indent(code, "    ")
-    try:
-        exec(compile(src, f"<code:{ctx.name}>", "exec"), env)  # noqa: S102 - user code by design
-    except SyntaxError as e:
-        raise NodeError(f"Syntax error line {e.lineno - 1}: {e.msg}") from e
-    fn = env["__user_fn"]
-    items = copy.deepcopy(ctx.items)
-    if mode == "each":
-        out = []
-        for idx, item in enumerate(items):
-            r = await fn(items, item, idx)
-            if r is None:
-                continue
-            out.extend(r if isinstance(r, list) else [r])
-    else:
-        r = await fn(items, items[0] if items else {}, 0)
-        out = [] if r is None else (r if isinstance(r, list) else [r])
+    out = await run_python_sandboxed(ctx, code, {
+        "kind": "code", "params": ["items", "item", "index"], "items": ctx.items, "mode": mode,
+        "state": ctx.state, "nodes": ctx.run.outputs_by_name() if "node" in code else {},
+    })
     return {"main": out}
+
+
+async def run_python_sandboxed(ctx: NodeContext, code: str, req: dict):
+    """Run Python user code in the process sandbox (see sandbox.py); applies set_state calls and logs."""
+    from .sandbox import SandboxError, Timeout, code_timeout, run_python
+
+    req = {**req, "code": code, "vars": ctx.run.meta.get("vars", {}), "execution_id": ctx.run.execution_id}
+    try:
+        resp = await run_python(ctx.run.meta.get("owner_id"), req, code_timeout(ctx.raw_params.get("timeout")))
+    except (SandboxError, Timeout) as e:
+        raise NodeError(str(e), ctx.name) from e
+    for line in resp.get("logs") or []:
+        ctx.log(line)
+    if not resp.get("ok"):
+        raise NodeError(resp.get("error") or "Code failed", ctx.name)
+    for key, value, reducer in resp.get("state") or []:
+        ctx.set_state(key, value, reducer)
+    return resp.get("out")
 
 
 async def _code_subprocess(ctx: NodeContext, language: str, mode: str):
     """JavaScript, TypeScript, Bash, PowerShell, Java, Go, … (see code_runtimes)."""
     from .code_runtimes import CodeError, run_code
+    from .sandbox import code_timeout
 
     p = ctx.raw_params
     code = p.get(f"code_{language}") or ""
@@ -270,7 +294,7 @@ async def _code_subprocess(ctx: NodeContext, language: str, mode: str):
         out, logs = await asyncio.to_thread(
             run_code, language, code, copy.deepcopy(ctx.items), mode=mode, vars=ctx.run.meta.get("vars", {}),
             nodes=ctx.run.outputs_by_name(), execution_id=ctx.run.execution_id,
-            timeout=float(p.get("timeout") or 60), command=p.get("command"), ext=p.get("extension"),
+            timeout=code_timeout(p.get("timeout")), command=p.get("command"), ext=p.get("extension"),
         )
     except CodeError as e:
         raise NodeError(str(e), ctx.name) from e
@@ -301,13 +325,14 @@ def _code_props() -> list[dict]:
         *(prop(f"code_{key}", f"{lang.label} code", "code", TEMPLATES[key], language=key, rows=14,
                show_if={"language": [key]}) for key, lang in LANGUAGES.items()),
         prop("code_custom", "Code", "code", TEMPLATES["custom"], rows=14, show_if={"language": ["custom"]}),
-        prop("timeout", "Timeout (seconds)", "number", 60, show_if={"language": others}),
+        prop("timeout", "Timeout (seconds)", "number", 60, show_if={"language": ["python", *others]},
+             description="Capped by the server's CODE_TIMEOUT_SECONDS"),
     ]
 
 
 register(NodeType(
     type="core.code", label="Code", icon="code",
-    description="Run custom code: Python (in-process, async), JavaScript, TypeScript, Bash, PowerShell, Perl, Java, Ruby, PHP, Go, or any language via a custom command.",
+    description="Run custom code: Python (sandboxed, async), JavaScript, TypeScript, Bash, PowerShell, Perl, Java, Ruby, PHP, Go, or any language via a custom command.",
     properties=_code_props(),
     execute=_code, **CORE,
 ))
@@ -335,22 +360,93 @@ def _kv(pairs) -> dict:
     return {p["key"]: p.get("value") for p in pairs or [] if p.get("key")}
 
 
+def _ascii_headers(headers: dict) -> dict:
+    for k, v in headers.items():
+        for part, what in ((k, "name"), (v, "value")):
+            try:
+                str(part).encode("ascii")
+            except UnicodeEncodeError:
+                raise NodeError(f"Header {what} of '{k}' contains non-ASCII characters ({str(part)[:60]!r}). HTTP headers "
+                                "must be ASCII: URL-encode the value, e.g. {{ encodeURIComponent($json.name) }}") from None
+    return headers
+
+
+def json_body(ctx: NodeContext, name: str, i: int = 0):
+    """A JSON field with {{ }} expressions -> a value, always valid JSON.
+
+    Each expression is filled in according to where it stands: inside a JSON string its result is escaped
+    (quotes, newlines, backslashes stay valid), outside a string it becomes a JSON value, and a string that is
+    nothing but one expression ("{{ $json.obj }}") takes the expression's value as is (object, number, ...)."""
+    raw = ctx.raw_params.get(name)
+    if not isinstance(raw, str):
+        return ctx.eval(raw, i) if raw is not None else None
+    if not raw.strip():
+        return None
+    if "{{" not in raw:
+        try:
+            return json.loads(raw)
+        except ValueError as e:
+            raise NodeError(f"Body is not valid JSON: {e}") from e
+    out, k, n, in_str = [], 0, len(raw), False
+    while k < n:
+        c = raw[k]
+        if raw.startswith("{{", k):
+            end = raw.find("}}", k + 2)
+            if end == -1:
+                out.append(raw[k:])
+                break
+            expr = raw[k:end + 2]
+            val = ctx.eval(expr, i)
+            whole = in_str and out and out[-1].endswith('"') and raw[end + 2:end + 3] == '"' \
+                and (len(out[-1]) < 2 or out[-1][-2] != "\\")
+            if whole:  # "{{ expr }}": the value itself
+                out[-1] = out[-1][:-1]
+                out.append(json.dumps(val, default=str))
+                k = end + 3
+                in_str = False
+                continue
+            if in_str:
+                text = val if isinstance(val, str) else json.dumps(val, default=str) if isinstance(val, (dict, list)) \
+                    else ("" if val is None else str(val).lower() if isinstance(val, bool) else str(val))
+                out.append(json.dumps(text)[1:-1])
+            else:
+                out.append(json.dumps(val, default=str))
+            k = end + 2
+            continue
+        if c == "\\" and in_str:
+            out.append(raw[k:k + 2])
+            k += 2
+            continue
+        if c == '"':
+            in_str = not in_str
+        out.append(c)
+        k += 1
+    text = "".join(out)
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise NodeError(f"Body is not valid JSON after filling in expressions: {e}. Got: {text[:300]}") from e
+
+
 async def http_call(ctx: NodeContext, i: int) -> dict | list:
     p = ctx.params(i)
-    headers = {k: str(v) for k, v in _kv(p.get("headers")).items()}
+    headers = _ascii_headers({k: str(v) for k, v in _kv(p.get("headers")).items()})
     auth, auth_params = await apply_auth(ctx, i, headers)
     kwargs: dict = {"params": {**auth_params, **_kv(p.get("query"))} or None, "headers": headers, "auth": auth}
     body_type = p.get("body_type", "none")
     body = p.get("body")
     if body_type == "json":
-        kwargs["json"] = json.loads(body) if isinstance(body, str) and body.strip() else (body or None)
+        kwargs["json"] = json_body(ctx, "body", i)
     elif body_type == "form":
         kwargs["data"] = _kv(p.get("form"))
     elif body_type == "raw":
         kwargs["content"] = body if isinstance(body, str) else json.dumps(body)
-    async with httpx.AsyncClient(timeout=float(p.get("timeout") or 30), verify=not p.get("ignore_ssl"),
-                                 follow_redirects=True) as client:
-        resp = await client.request(p.get("method", "GET"), p["url"], **kwargs)
+    async with guarded_client(timeout=float(p.get("timeout") or 30), verify=not p.get("ignore_ssl"),
+                              follow_redirects=True) as client:
+        try:
+            resp = await client.request(p.get("method", "GET"), p["url"], **kwargs)
+        except BlockedURL as e:
+            raise NodeError(str(e)) from e
     if resp.status_code >= 400 and not p.get("never_error"):
         raise NodeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
     fmt = p.get("response_format", "auto")
@@ -617,15 +713,29 @@ register(NodeType(
 # ---------------------------------------------------------------------------
 
 
+def _del_path(obj: dict, path: str) -> None:
+    parts = path.split(".")
+    cur = obj
+    for p in parts[:-1]:
+        cur = cur.get(p) if isinstance(cur, dict) else None
+    if isinstance(cur, dict):
+        cur.pop(parts[-1], None)
+
+
 async def _split_out(ctx: NodeContext):
-    field = ctx.raw_params.get("field", "")
     out = []
-    for item in ctx.items:
+    for i, item in enumerate(ctx.items):
+        field = str(ctx.param("field", i) or "")
         val = get_path(item, field)
         for v in val if isinstance(val, list) else ([val] if val is not None else []):
             if ctx.raw_params.get("include", "none") == "all":
-                base = {k: x for k, x in item.items() if k != field.split(".")[0]}
-                out.append({**base, **(v if isinstance(v, dict) else {field: v})})
+                base = copy.deepcopy(item)
+                _del_path(base, field)  # only the split field: its siblings stay
+                if isinstance(v, dict):
+                    base.update(v)
+                else:
+                    set_path(base, field, v)
+                out.append(base)
             else:
                 out.append(v if isinstance(v, dict) else {field.split(".")[-1]: v})
     return {"main": out}
@@ -655,7 +765,15 @@ register(NodeType(
 
 
 async def _limit(ctx: NodeContext):
-    n = int(ctx.param("max") or 1)
+    raw = ctx.param("max")
+    try:
+        n = int(float(raw)) if raw not in (None, "") else 1
+    except (TypeError, ValueError) as e:
+        raise NodeError(f"Max items must be a number (got {raw!r})") from e
+    if n < 0:
+        raise NodeError("Max items can't be negative")
+    if n == 0:
+        return {"main": []}
     return {"main": ctx.items[-n:] if ctx.param("keep") == "last" else ctx.items[:n]}
 
 
@@ -666,10 +784,26 @@ register(NodeType(
 ))
 
 
+def _sort_key(v):
+    """Total order over mixed JSON values: numbers < strings < booleans < lists/objects."""
+    if isinstance(v, bool):
+        return (2, int(v), "")
+    if isinstance(v, (int, float)):
+        return (0, v, "")
+    if isinstance(v, str):
+        return (1, 0, v)
+    return (3, 0, json.dumps(v, sort_keys=True, default=str))
+
+
 async def _sort(ctx: NodeContext):
-    field = ctx.raw_params.get("field", "")
+    field = (ctx.raw_params.get("field") or "").strip()
     desc = ctx.raw_params.get("order") == "desc"
-    return {"main": sorted(ctx.items, key=lambda x: (get_path(x, field) is None, get_path(x, field)), reverse=desc)}
+    if not field:
+        return {"main": list(ctx.items)}
+    present = [x for x in ctx.items if get_path(x, field) not in (None, "")]
+    missing = [x for x in ctx.items if get_path(x, field) in (None, "")]
+    # missing / empty values go last in both directions
+    return {"main": sorted(present, key=lambda x: _sort_key(get_path(x, field)), reverse=desc) + missing}
 
 
 register(NodeType(
@@ -702,7 +836,16 @@ async def _datetime(ctx: NodeContext):
     for i, item in enumerate(ctx.items):
         p = ctx.params(i)
         raw = p.get("value")
-        dt = datetime.now(timezone.utc) if not raw else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if raw in (None, ""):
+            dt = datetime.now(timezone.utc)
+        elif isinstance(raw, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(raw).strip()):
+            ts = float(raw)
+            dt = datetime.fromtimestamp(ts / 1000 if abs(ts) > 1e11 else ts, timezone.utc)  # unix seconds or ms
+        else:
+            try:
+                dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+            except ValueError as e:
+                raise NodeError(f"Can't read the date {raw!r}: use ISO 8601 (2024-05-01T09:00:00Z) or a unix timestamp") from e
         if p.get("add_amount"):
             dt += timedelta(**{p.get("add_unit", "days"): float(p["add_amount"])})
         val = dt.strftime(p["format"]) if p.get("format") else dt.isoformat()
@@ -754,12 +897,18 @@ async def _respond(ctx: NodeContext):
         body = ctx.items[0] if ctx.items else {}
     elif p.get("respond_with") == "all_items":
         body = ctx.items
-    elif isinstance(body, str):
+    elif isinstance(ctx.raw_params.get("body"), str):
         try:
-            body = json.loads(body)
-        except ValueError:
-            pass
-    ctx.run.response = {"status": int(p.get("status") or 200), "body": body, "headers": _kv(p.get("headers"))}
+            body = json_body(ctx, "body", 0)  # expressions with quotes etc. keep the JSON valid
+        except NodeError:
+            pass  # not JSON at all: send the text as is
+    try:
+        status = int(float(p.get("status") or 200))
+    except (TypeError, ValueError):
+        raise NodeError(f"Status code must be a number (got {p.get('status')!r})") from None
+    if not 100 <= status <= 599:
+        raise NodeError(f"Status code must be between 100 and 599 (got {status})")
+    ctx.run.response = {"status": status, "body": body, "headers": _kv(p.get("headers"))}
     return {"main": ctx.items}
 
 
@@ -781,23 +930,34 @@ async def run_subworkflow(ctx: NodeContext, workflow_id: str, items: list[dict])
     from ..engine.runtime import execute_workflow, load_workflow
 
     try:
-        wf = await load_workflow(workflow_id)
+        wf = await load_workflow(workflow_id, live=True)  # sub-workflows run their published version
     except ValueError as e:
         raise NodeError(str(e)) from e
     if wf["owner_id"] != ctx.run.meta.get("owner_id"):  # same answer as a missing id: don't reveal it exists
         raise NodeError(f"Workflow {workflow_id} not found")
-    res = await execute_workflow(wf, trigger_type="trigger.subworkflow", items=items, mode="subworkflow") \
-        if any(n["type"] == "trigger.subworkflow" for n in wf["nodes"]) \
-        else await execute_workflow(wf, items=items, mode="subworkflow")
-    if res["status"] == "error":
-        raise NodeError(f"Sub-workflow failed: {res['error']}")
+    # parent: limits nesting (MAX_SUBWORKFLOW_DEPTH) and cancels the child with this run
+    trigger = "trigger.subworkflow" if any(n["type"] == "trigger.subworkflow" for n in wf["nodes"]) else None
+    try:
+        res = await execute_workflow(wf, trigger_type=trigger, items=items, mode="subworkflow", parent=ctx.run)
+    except ValueError as e:
+        raise NodeError(str(e)) from e
+    if res["status"] == "error":  # nested sub-workflows report the innermost reason once, not once per level
+        raise NodeError(f"Sub-workflow failed: {(res['error'] or '').rsplit('Sub-workflow failed: ', 1)[-1]}")
+    if res["status"] == "canceled":
+        raise NodeError("Sub-workflow was canceled")
     return res["output"]
 
 
 async def _exec_wf(ctx: NodeContext):
+    import uuid as _uuid
+
     wf_id = ctx.param("workflow_id")
     if not wf_id:
         raise NodeError("Select a workflow")
+    try:
+        _uuid.UUID(str(wf_id))
+    except ValueError:
+        raise NodeError(f"'{wf_id}' is not a workflow id: pick the workflow from the list (or map a workflow's id)") from None
     if ctx.raw_params.get("mode", "all") == "each":
         out = []
         for item in ctx.items:
@@ -816,7 +976,12 @@ register(NodeType(
     execute=_exec_wf, **CORE,
 ))
 
+async def _sticky(ctx: NodeContext):
+    return {"main": ctx.items}  # a note wired into the flow by mistake just passes items through
+
+
 register(NodeType(
     type="ui.sticky", label="Sticky Note", icon="sticky-note", description="Canvas annotation (not executed).",
     group="core", color="#facc15", inputs=[], outputs=[], properties=[prop("content", "Content", "text", "## Note")],
+    execute=_sticky,
 ))

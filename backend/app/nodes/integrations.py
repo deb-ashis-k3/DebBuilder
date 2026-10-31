@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import smtplib
 from typing import Any
 from email.message import EmailMessage
@@ -48,6 +49,12 @@ async def _whatsapp(ctx: NodeContext):
         to = str(p.get("to") or "").lstrip("+")
         if op in SEND_OPS and not to:
             raise NodeError("Recipient 'to' is empty")
+        need = {"media": "media_link", "template": "template_name", "reaction": "message_id", "mark_read": "message_id",
+                "media_url": "media_id", "create_template": "template_name"}.get(op)
+        if need and not str(p.get(need) or "").strip():
+            raise NodeError(f"'{need}' is required for the '{op}' operation", ctx.name)
+        if op == "location" and (p.get("latitude") in (None, "") or p.get("longitude") in (None, "")):
+            raise NodeError("Latitude and longitude are required", ctx.name)
         if op == "text":
             res = await wa.text(to, str(p.get("text", "")), bool(p.get("preview_url")), p.get("reply_to") or None)
         elif op == "media":
@@ -135,11 +142,18 @@ async def _slack(ctx: NodeContext):
     for i in range(len(ctx.items) or 1):
         _, cred = await ctx.credential("credential", i)
         p = ctx.params(i)
+        if not cred.get("bot_token"):
+            raise NodeError("The Slack credential has no bot token", ctx.name)
+        if not str(p.get("channel") or "").strip():
+            raise NodeError("Channel is empty (a channel ID or #name)", ctx.name)
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post("https://slack.com/api/chat.postMessage",
                              headers={"Authorization": f"Bearer {cred['bot_token']}"},
                              json={"channel": p["channel"], "text": str(p.get("text", "")), **({"thread_ts": p["thread_ts"]} if p.get("thread_ts") else {})})
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            raise NodeError(f"Slack answered HTTP {r.status_code} without JSON: {r.text[:200]}", ctx.name) from None
         if not data.get("ok"):
             raise NodeError(f"Slack error: {data.get('error')}")
         out.append(data)
@@ -163,14 +177,21 @@ async def _telegram(ctx: NodeContext):
     for i in range(len(ctx.items) or 1):
         _, cred = await ctx.credential("credential", i)
         p = ctx.params(i)
+        if not cred.get("bot_token"):
+            raise NodeError("The Telegram credential has no bot token", ctx.name)
+        if not str(p.get("chat_id") or "").strip():
+            raise NodeError("Chat ID is empty (a numeric chat id or @channelname)", ctx.name)
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(f"https://api.telegram.org/bot{cred['bot_token']}/sendMessage",
                              json={"chat_id": p["chat_id"], "text": str(p.get("text", "")),
                                    **({"parse_mode": p["parse_mode"]} if p.get("parse_mode") not in (None, "none") else {})})
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            raise NodeError(f"Telegram answered HTTP {r.status_code} without JSON: {r.text[:200]}", ctx.name) from None
         if not data.get("ok"):
             raise NodeError(f"Telegram error: {data.get('description')}")
-        out.append(data["result"])
+        out.append(data.get("result") or {})
     return {"main": out}
 
 
@@ -209,6 +230,8 @@ async def _email(ctx: NodeContext):
     for i, item in enumerate(ctx.items or [{}]):
         _, cred = await ctx.credential("credential", i)
         p = ctx.params(i)
+        if not str(p.get("to") or "").strip():
+            raise NodeError("'To' is empty: add at least one recipient address", ctx.name)
         msg = EmailMessage()
         msg["From"] = p.get("from_email") or cred.get("from_email") or cred.get("username")
         msg["To"] = p["to"]
@@ -256,8 +279,8 @@ async def _postgres(ctx: NodeContext):
         for i in rng:
             q = ctx.raw_params.get("query", "")  # SQL is not templated; use $1-style params below.
             params = [ctx.eval(v.get("value"), i) for v in ctx.raw_params.get("params") or []]
-            q = _dollar_to_psycopg(q)
-            cur = await conn.execute(q, params or None)
+            q, bound = _dollar_to_psycopg(q, params)
+            cur = await conn.execute(q, bound)
             if cur.description:
                 rows = await cur.fetchall()
                 out.extend(rows)
@@ -266,10 +289,83 @@ async def _postgres(ctx: NodeContext):
     return {"main": out}
 
 
-def _dollar_to_psycopg(q: str) -> str:
-    import re
+def _dollar_to_psycopg(q: str, params: list | None = None) -> tuple[str, dict | None]:
+    """Turn Postgres-style $1..$n into psycopg named placeholders, by number (reuse / any order is fine).
 
-    return re.sub(r"\$(\d+)", "%s", q.replace("%", "%%"))
+    String literals ('..', E'..', $tag$..$tag$), quoted identifiers and comments are copied untouched.
+    `%` is doubled only when parameters are bound (psycopg then reads it back as a literal %)."""
+    params = list(params or [])
+    out: list[str] = []
+    used: set[int] = set()
+    i, n = 0, len(q)
+    pct = "%%" if params else "%"
+    while i < n:
+        c = q[i]
+        if c == "'" or (c in "eE" and q[i + 1:i + 2] == "'" and (i == 0 or not (q[i - 1].isalnum() or q[i - 1] == "_"))):
+            esc = c in "eE"
+            j = i + (2 if esc else 1)
+            while j < n:
+                if esc and q[j] == "\\":
+                    j += 2
+                    continue
+                if q[j] == "'":
+                    if q[j + 1:j + 2] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(q[i:j + 1].replace("%", pct))
+            i = j + 1
+        elif c == '"':
+            j = q.find('"', i + 1)
+            while j != -1 and q[j + 1:j + 2] == '"':
+                j = q.find('"', j + 2)
+            j = n - 1 if j == -1 else j
+            out.append(q[i:j + 1].replace("%", pct))
+            i = j + 1
+        elif c == "-" and q[i + 1:i + 2] == "-":
+            j = q.find("\n", i)
+            j = n if j == -1 else j
+            out.append(q[i:j].replace("%", pct))
+            i = j
+        elif c == "/" and q[i + 1:i + 2] == "*":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if q.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif q.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(q[i:j].replace("%", pct))
+            i = j
+        elif c == "$":
+            m = re.match(r"\$(\d+)", q[i:])
+            tag = None if m else re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", q[i:])
+            if m and not (i and (q[i - 1].isalnum() or q[i - 1] == "_")):
+                k = int(m.group(1))
+                if k < 1 or k > len(params):
+                    raise NodeError(f"Query uses ${k} but only {len(params)} parameter(s) are set")
+                used.add(k)
+                out.append(f"%(p{k})s")
+                i += len(m.group(0))
+            elif tag and not (i and (q[i - 1].isalnum() or q[i - 1] == "_")):
+                end = q.find(tag.group(0), i + len(tag.group(0)))
+                end = n if end == -1 else end + len(tag.group(0))
+                out.append(q[i:end].replace("%", pct))
+                i = end
+            else:
+                out.append(c)
+                i += 1
+        elif c == "%":
+            out.append(pct)
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    if not params:
+        return "".join(out), None
+    return "".join(out), {f"p{k}": params[k - 1] for k in range(1, len(params) + 1)}
 
 
 register(NodeType(
@@ -410,6 +506,8 @@ async def _redis(ctx: NodeContext):
                 out.append({**item, "value": await r.lpop(key)})
             elif op == "keys":
                 out.append({"keys": await r.keys(key or "*")})
+            else:
+                raise NodeError(f"Unknown Redis operation '{op}'", ctx.name)
     finally:
         pass  # pooled client: connections stay open for the next run
     return {"main": out}

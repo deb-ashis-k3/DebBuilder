@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api'
-import { Icon, toast } from '../lib'
+import { Icon, toast, useDialog } from '../lib'
 import type { Folder, Workflow } from '../types'
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,8 @@ export function Menu({ items, trigger, title = 'Actions', className = 'btn ghost
   useEffect(() => {
     if (!open) return
     const away = (e: MouseEvent) => { if (!menu.current?.contains(e.target as Node) && !btn.current?.contains(e.target as Node)) setOpen(false) }
-    const esc = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false)
+    // Esc closes the menu, not the dialog / panel it sits in.
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); setOpen(false); btn.current?.focus() } }
     const close = () => setOpen(false)
     document.addEventListener('mousedown', away)
     document.addEventListener('keydown', esc)
@@ -92,16 +93,12 @@ export function Menu({ items, trigger, title = 'Actions', className = 'btn ghost
 // Dialog shell
 // ---------------------------------------------------------------------------
 
-function Dialog({ title, children, footer, onClose, wide }: { title: string; children: ReactNode; footer: ReactNode; onClose: () => void; wide?: boolean }) {
-  useEffect(() => {
-    const esc = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    document.addEventListener('keydown', esc)
-    return () => document.removeEventListener('keydown', esc)
-  }, [onClose])
+export function Dialog({ title, children, footer, onClose, wide }: { title: string; children: ReactNode; footer: ReactNode; onClose: () => void; wide?: boolean }) {
+  const ref = useDialog(onClose)
   return createPortal(
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={wide ? { width: 'min(640px, 100%)' } : undefined} role="dialog" aria-label={title}>
-        <div className="modal-head"><h2>{title}</h2><button className="btn ghost sm icon" onClick={onClose} title="Close"><Icon name="x" size={16} /></button></div>
+      <div ref={ref} className="modal" style={wide ? { width: 'min(640px, 100%)' } : undefined} role="dialog" aria-modal="true" aria-label={title}>
+        <div className="modal-head"><h2>{title}</h2><button className="btn ghost sm icon" onClick={onClose} title="Close" aria-label="Close"><Icon name="x" size={16} /></button></div>
         <div className="modal-body">{children}</div>
         <div className="modal-foot">{footer}</div>
       </div>
@@ -236,7 +233,18 @@ export function ImportDialog({ folderId, onImported, onClose }: {
     try {
       let created: Workflow[] = []
       if (tab === 'file') {
-        for (const f of files) created = created.concat(await api.importWorkflows({ data: JSON.parse(await f.text()), folder_id: folderId }))
+        // All or nothing: read and check every file first, then one request (the server validates all before creating any).
+        const all: unknown[] = []
+        for (const f of files) {
+          let data: unknown
+          try { data = JSON.parse(await f.text()) } catch { throw new Error(`${f.name} is not valid JSON. Nothing was imported.`) }
+          const list = (data && typeof data === 'object' && Array.isArray((data as { workflows?: unknown }).workflows))
+            ? (data as { workflows: unknown[] }).workflows : Array.isArray(data) ? data : [data]
+          const bad = list.find((w) => !w || typeof w !== 'object' || !Array.isArray((w as { nodes?: unknown }).nodes))
+          if (!list.length || bad !== undefined) throw new Error(`${f.name} is not a DebBuilder workflow file (expected "nodes" and "edges"). Nothing was imported.`)
+          all.push(...list)
+        }
+        created = await api.importWorkflows({ data: all, folder_id: folderId })
       } else if (tab === 'url') {
         created = await api.importWorkflows({ url, folder_id: folderId })
       } else {

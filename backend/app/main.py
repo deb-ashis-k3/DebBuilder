@@ -6,11 +6,12 @@ Run with:  uv run python -m app
 
 import asyncio
 import gzip
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +24,9 @@ from .api import admin, auth, credentials, executions, folders, hooks, voice, wo
 from .config import get_settings
 from .db import init_db
 from .engine import runtime
+from .engine.errors import Overloaded
 from .engine.store import store
+from .netguard import BlockedURL
 from .security import AuthMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -40,7 +43,13 @@ async def lifespan(app: FastAPI):
     )
     await pool.open()
     checkpointer = AsyncPostgresSaver(pool)
-    await checkpointer.setup()
+    # Replicas starting together on a fresh database would race creating the checkpoint tables.
+    async with pool.connection() as conn:
+        await conn.execute("SELECT pg_advisory_lock(233812)")
+        try:
+            await checkpointer.setup()
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock(233812)")
     runtime.set_checkpointer(checkpointer)
     store.start()  # batched execution history writer (every replica runs executions)
     await cluster.start()  # schedules, listeners, voice workers and retention run on the elected replica
@@ -52,7 +61,70 @@ async def lifespan(app: FastAPI):
         await pool.close()
 
 
+class _TooLarge(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(413, f"Request body is larger than {get_settings().max_request_body_mb} MB (MAX_REQUEST_BODY_MB)")
+
+
+class _BodyLimit:
+    """Every request body (webhooks, imports, forms, saves …) is capped at MAX_REQUEST_BODY_MB: a declared
+    Content-Length above it is refused at once, and a streamed / chunked body is counted as it arrives and stopped
+    as soon as it passes the limit, so nothing big is ever buffered."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        limit = get_settings().max_request_body_mb * 2**20
+        for k, v in scope.get("headers") or []:
+            if k == b"content-length":
+                try:
+                    declared = int(v)
+                except ValueError:
+                    declared = 0
+                if declared > limit:
+                    return await _reply(send, _TooLarge())
+        received = 0
+        started = False
+
+        async def counted():
+            nonlocal received
+            msg = await receive()
+            if msg["type"] == "http.request":
+                received += len(msg.get("body") or b"")
+                if received > limit:
+                    raise _TooLarge()  # an HTTPException: FastAPI's body parsing re-raises it, handlers answer 413
+            return msg
+
+        async def tracked(msg):
+            nonlocal started
+            if msg["type"] == "http.response.start":
+                started = True
+            await send(msg)
+
+        try:
+            await self.app(scope, counted, tracked)
+        except _TooLarge as e:
+            if not started:
+                await _reply(send, e)
+
+
+async def _reply(send, e: HTTPException) -> None:
+    body = json.dumps({"detail": e.detail}).encode()
+    await send({"type": "http.response.start", "status": e.status_code,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                            (b"connection", b"close")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+
+
 app = FastAPI(title="DebBuilder", version="0.1.0", lifespan=lifespan)
+# Added first = innermost: inside AuthMiddleware, whose receive wrapper runs in a task group that would turn the
+# 413 raised while reading the body into an exception group (and a 500).
+app.add_middleware(_BodyLimit)
 # Every request is authenticated + authorized against security.POLICY (default deny).
 # Added before CORS so CORS stays outermost and 401/403 responses still carry CORS headers.
 app.add_middleware(AuthMiddleware)
@@ -74,6 +146,8 @@ class _Compress:
 
 
 app.add_middleware(_Compress)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in get_settings().cors_origins.split(",") if o.strip()],
@@ -81,6 +155,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Overloaded)
+async def _overloaded(request, exc: Overloaded):
+    """Admission control (MAX_QUEUED_EXECUTIONS) refused an execution: 503 + when to retry, for every endpoint
+    that starts one (webhooks, forms and chat also answer this themselves)."""
+    return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Retry-After": str(exc.retry_after)})
+
+
+@app.exception_handler(BlockedURL)
+async def _blocked(request, exc: BlockedURL):
+    return JSONResponse({"detail": str(exc)}, status_code=400)
+
 
 for r in (auth.router, admin.router, workflows.router, folders.router, executions.router, executions.binary_router, credentials.router, credentials.oauth_router, hooks.router, voice.router, ws.router):
     app.include_router(r)

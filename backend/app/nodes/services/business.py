@@ -193,17 +193,28 @@ def _pp_base(cred: dict) -> str:
 
 
 async def _pp_auth(cred: dict):
-    key = f"{cred.get('client_id')}:{cred.get('environment')}"
+    import hashlib
+
+    from ..base import NodeError
+
+    if not cred.get("client_id") or not cred.get("client_secret"):
+        raise NodeError("The PayPal credential needs a client id and a client secret")
+    # keyed by the secret too: a credential with the right client id but a wrong secret never reuses a token
+    key = hashlib.sha256(f"{cred.get('client_id')}\0{cred.get('client_secret')}\0{cred.get('environment')}".encode()).hexdigest()
     tok, exp = _PP.get(key, ("", 0))
     if time.time() > exp - 60:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(f"{_pp_base(cred)}/v1/oauth2/token", data={"grant_type": "client_credentials"},
                              auth=(cred["client_id"], cred["client_secret"]))
         if r.status_code >= 400:
-            from ..base import NodeError
-
             raise NodeError(f"PayPal authentication failed: {r.text[:200]}")
-        tok, exp = r.json()["access_token"], time.time() + r.json().get("expires_in", 3000)
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise NodeError(f"PayPal authentication failed: no access_token in the answer ({r.text[:200]})")
+        tok, exp = data["access_token"], time.time() + float(data.get("expires_in") or 3000)
         _PP[key] = (tok, exp)
     return {"Authorization": f"Bearer {tok}"}, {}
 

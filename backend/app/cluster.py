@@ -30,6 +30,7 @@ log = logging.getLogger("debbuilder.cluster")
 CHANNEL = "debbuilder_changes"
 LOCK_KEY = 0x0DEB_B11D  # advisory locks are per database, so separate databases never collide
 RETRY_SECONDS = 5
+DRAIN_SECONDS = 10  # at shutdown, how long running executions may take to finish before they are canceled
 INSTANCE = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 _leader = False
@@ -61,9 +62,14 @@ async def _start_background() -> None:
     from . import listeners, scheduler, voice_workers
     from .engine.store import prune_loop
 
-    await scheduler.load_all()
-    await listeners.load_all()
-    await voice_workers.load_all()
+    # Each part on its own: one that fails (a broken workflow, a voice provider down) must not keep the
+    # others (and retention) from starting.
+    for name, load in (("schedules", scheduler.load_all), ("listeners", listeners.load_all),
+                       ("voice workers", voice_workers.load_all)):
+        try:
+            await load()
+        except Exception:  # noqa: BLE001
+            log.exception("starting %s failed", name)
     _prune_task = asyncio.get_running_loop().create_task(prune_loop())  # execution retention
 
 
@@ -71,7 +77,7 @@ async def _stop_background() -> None:
     global _prune_task
     from . import listeners, scheduler, voice_workers
 
-    scheduler.scheduler.remove_all_jobs()
+    scheduler.remove_all()
     if _prune_task:
         _prune_task.cancel()
         _prune_task = None
@@ -94,14 +100,14 @@ async def _resync(workflow_id: str) -> None:
             wf = await s.get(Workflow, uuid.UUID(workflow_id))
     except ValueError:
         return
-    if wf is None:
-        scheduler.remove_workflow(workflow_id)
-        listeners.remove_workflow(workflow_id)
-        voice_workers.remove_workflow(workflow_id)
-    else:
-        scheduler.sync_workflow(wf)
-        listeners.sync_workflow(wf)
-        voice_workers.sync_workflow(wf)
+    for part in (scheduler, listeners, voice_workers):  # independently: one failing never stops the others
+        try:
+            if wf is None:
+                part.remove_workflow(workflow_id)
+            else:
+                part.sync_workflow(wf)
+        except Exception:  # noqa: BLE001
+            log.exception("re-syncing workflow %s (%s) failed", workflow_id, part.__name__)
 
 
 def _apply(kind: str, ident: str | None) -> None:
@@ -231,6 +237,7 @@ async def start() -> None:
 async def stop() -> None:
     global _leader, _lock_conn
     from . import scheduler
+    from .engine.runtime import drain
 
     _stopping.set()
     for t in _tasks:
@@ -239,6 +246,9 @@ async def stop() -> None:
     _tasks.clear()
     if _leader:
         await _stop_background()
+    # Process shutdown (no new triggers now): let running executions finish, cancel what is left, so each
+    # records its outcome before the execution writer's last flush (main.py stops the store after this).
+    await drain(DRAIN_SECONDS)
     _leader = False
     if _lock_conn is not None:
         await _lock_conn.close()  # releases the lock at once so another replica can lead

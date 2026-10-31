@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
-import { Icon, fmtDuration, isVisible, outputPorts, toast, useCatalog } from '../lib'
+import { Icon, fmtDuration, isVisible, outputPorts, toast, useCatalog, useDialog } from '../lib'
 import type { CodeRuntime, Item, ListenerStatus, NodeRun, NodeSettings, RunState, VoiceWorkerStatus, WFNode } from '../types'
 import { AiLogs } from './AiLogs'
 import { ExprDataContext, type ExprData } from './ExprField'
@@ -9,6 +9,24 @@ import { PropertyField } from './PropertyField'
 import { Select } from './Select'
 
 export interface ParentRef { id: string; name: string; port: string; type?: string }
+
+/** First 50 items of a node's main output, cached per output object: expression previews compare by identity,
+ *  so a node whose output didn't change keeps the same array (and its fields don't re-request a preview). */
+const sampleCache = new WeakMap<object, Item[]>()
+function outputSample(out: Record<string, Item[]>): Item[] {
+  let v = sampleCache.get(out)
+  if (!v) { v = (out.main ?? Object.values(out)[0] ?? []).slice(0, 50); sampleCache.set(out, v) }
+  return v
+}
+
+const firstCache = new WeakMap<Item[], Item[]>()
+const NO_ITEMS: Item[] = []
+function first50(items: Item[] | undefined): Item[] {
+  if (!items) return NO_ITEMS
+  let v = firstCache.get(items)
+  if (!v) { v = items.slice(0, 50); firstCache.set(items, v) }
+  return v
+}
 
 function pinnedPorts(pin: WFNode['pin_data']): Record<string, Item[]> | null {
   if (pin == null) return null
@@ -67,15 +85,31 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
   const parentNode = parent && byType ? parent : undefined
   const inItems = parentNode ? parentRun?.output?.[parent!.port] ?? parentRun?.output?.main : (r?.input ?? run?.input)
   const inBase = parentNode ? `$('${parentNode.name.replace(/'/g, "\\'")}').json` : '$json'
+  // $state as this node saw it: the state after its input's node ran, else after its own run, else the latest
+  // state any node recorded (state is only on records when the workflow declares state keys).
+  const stateBefore = useMemo(() => {
+    const last = (rs?: RunState) => rs?.runs?.[rs.runs.length - 1]?.state
+    const feeding = r?.sources?.map((s) => last(runsByNode[s.node_id])).find(Boolean)
+    if (feeding) return feeding
+    if (parentRun && last(parentRun)) return last(parentRun)
+    if (r?.state) return r.state
+    let best: { at: string; state: Record<string, unknown> } | undefined
+    for (const rs of Object.values(runsByNode)) for (const x of rs.runs ?? []) {
+      if (x.state && (!best || (x.finished_at ?? x.started_at) > best.at)) best = { at: x.finished_at ?? x.started_at, state: x.state }
+    }
+    return best?.state
+  }, [r, parentRun, runsByNode])
   // Live expression results resolve against this node's input and every node's latest output (capped for size).
+  // Each field sends only what its expression references (see ExprField), so this can list every node.
   const exprData = useMemo<ExprData>(() => ({
     workflowId,
-    items: (inItems ?? []).slice(0, 50),
+    items: first50(inItems),
     nodeNames: Object.values(nodeNames),
     nodeOutputs: Object.fromEntries(Object.entries(runsByNode)
       .filter(([id, rs]) => rs.output && nodeNames[id])
-      .map(([id, rs]) => [nodeNames[id], (rs.output!.main ?? Object.values(rs.output!)[0] ?? []).slice(0, 50)])),
-  }), [workflowId, inItems, runsByNode, nodeNames])
+      .map(([id, rs]) => [nodeNames[id], outputSample(rs.output!)])),
+    state: stateBefore,
+  }), [workflowId, inItems, runsByNode, nodeNames, stateBefore])
   const fed = r?.sources?.map((s) => parents.find((p) => p.id === s.node_id)?.name ?? s.node_id).join(', ')
 
   const pin = () => {
@@ -112,6 +146,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
   )
 
   const layout = usePanelLayout()
+  const dialogRef = useDialog(onClose)
   const uniq = (refs: ParentRef[]) => refs.filter((r, i) => refs.findIndex((x) => x.id === r.id) === i)
 
   return (
@@ -120,10 +155,10 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
       <div className="ndv-shell">
       <NodeNav side="prev" refs={uniq(parents)} onOpen={onOpen} />
       <NodeNav side="next" refs={uniq(children)} onOpen={onOpen} />
-      <div className="modal wide">
+      <div ref={dialogRef} className="modal wide" role="dialog" aria-modal="true" aria-label={`${node.name} (${spec.label})`}>
         <div className="modal-head">
           <div className="mini-icon" style={{ '--nc': spec.color } as React.CSSProperties}><Icon name={spec.icon} size={15} /></div>
-          <input className="wf-name" value={node.name} readOnly={readOnly} onChange={(e) => onChange({ ...node, name: e.target.value })} />
+          <input className="wf-name" value={node.name} readOnly={readOnly} aria-label="Node name" onChange={(e) => onChange({ ...node, name: e.target.value })} />
           {readOnly && <span className="badge plain" title="Opened from an execution: this run's data, read-only"><Icon name="lock" size={11} /> Execution · read-only</span>}
           <span className="muted small">{spec.label}</span>
           <span className="spacer" />
@@ -140,7 +175,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
               </button>
             </>
           )}
-          <button className="btn ghost icon" onClick={onClose} title="Close (Esc)"><Icon name="x" /></button>
+          <button className="btn ghost icon" onClick={onClose} title="Close (Esc)" aria-label="Close"><Icon name="x" /></button>
         </div>
         <div className="ndv-switch tabs">
           {(['input', 'params', 'output'] as const).map((p) => (
@@ -380,9 +415,16 @@ function usePanelLayout() {
   useEffect(() => {
     const el = ref.current
     if (!el) return
-    const ro = new ResizeObserver(([e]) => setWidth(e.contentRect.width))
+    // Next frame: switching between the stacked and the 3-column layout resizes the panel's content, which
+    // would otherwise re-trigger this observer in the same frame ("ResizeObserver loop" error).
+    let raf = 0
+    const ro = new ResizeObserver(([e]) => {
+      cancelAnimationFrame(raf)
+      const w = e.contentRect.width
+      raf = requestAnimationFrame(() => setWidth(w))
+    })
     ro.observe(el)
-    return () => ro.disconnect()
+    return () => { ro.disconnect(); cancelAnimationFrame(raf) }
   }, [])
   // Narrow screens keep the stacked / tabbed layout from the stylesheet.
   const active = width >= 1100

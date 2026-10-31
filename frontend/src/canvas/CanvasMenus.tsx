@@ -40,7 +40,7 @@ export function CanvasContextMenu({ target, actions, readOnly, onClose, nodeCoun
   }, [target])
   useEffect(() => {
     const away = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose() }
-    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); onClose() } }
     document.addEventListener('mousedown', away)
     document.addEventListener('keydown', esc)
     window.addEventListener('wheel', onClose, { passive: true })

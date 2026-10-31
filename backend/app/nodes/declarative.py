@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..netguard import guarded_client
 from ..credentials import fmt, request_auth, with_defaults
 from .base import NodeContext, NodeError, NodeType, prop, register
 from .core import set_path
@@ -321,9 +322,13 @@ def _base(svc: Service, o: Op | None, cred: dict) -> str:
 async def _execute(ctx: NodeContext, svc: Service):
     out: list[dict] = []
     ops = {o.key: o for o in svc.ops}
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+    async with guarded_client(timeout=60, follow_redirects=True) as client:
         for i, item in enumerate(ctx.items or [{}]):
             p = ctx.params(i)
+            key = p.get("operation") or svc.ops[0].key
+            o = ops.get(key)
+            if o is None and key != "custom.call":  # checked before any request (incl. token requests)
+                raise NodeError(f"Unknown operation '{key}'", ctx.name)
             ctype, cred = await ctx.credential("credential", i)
             cred = with_defaults(ctype, cred)
             if svc.auth:
@@ -331,13 +336,9 @@ async def _execute(ctx: NodeContext, svc: Service):
                 auth = None
             else:
                 headers, params, auth = await request_auth(ctype, cred, ctx.param("credential", i))
-            key = p.get("operation") or svc.ops[0].key
             if key == "custom.call":
                 out += await _custom(ctx, svc, client, p, cred, headers, params, auth)
                 continue
-            o = ops.get(key)
-            if o is None:
-                raise NodeError(f"Unknown operation '{key}'", ctx.name)
             out += await _run_op(ctx, svc, o, client, p, item, cred, dict(headers), dict(params), auth)
     return {"main": out}
 
@@ -347,7 +348,10 @@ async def _custom(ctx, svc, client, p, cred, headers, params, auth) -> list[dict
     url = path if path.startswith("http") else f"{_base(svc, None, cred)}/{path.lstrip('/')}"
     q = {**params, **{r["name"]: r.get("value") for r in p.get("custom_query") or [] if r.get("name")}}
     body = p.get("custom_body")
-    body = json.loads(body) if isinstance(body, str) and body.strip() else (body or None)
+    try:
+        body = json.loads(body) if isinstance(body, str) and body.strip() else (body or None)
+    except ValueError as e:
+        raise NodeError(f"Custom body is not valid JSON: {e}", ctx.name) from e
     r = await client.request(p.get("custom_method") or "GET", url, params=q or None, json=body, headers=headers, auth=auth)
     return _items(svc, r, None, None)
 

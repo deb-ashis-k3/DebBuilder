@@ -282,9 +282,11 @@ function SignupScreen({ onBack }: { onBack: () => void }) {
         <Field label="Confirm password"><PasswordInput value={pw2} onChange={setPw2} autoComplete="new-password" /></Field>
         {err && <div className="auth-err" role="alert">{err}</div>}
         <button className="btn primary lg" disabled={busy}>{busy ? 'Creating…' : first ? 'Create owner account' : 'Create account'}</button>
-        <p className="muted small" style={{ textAlign: 'center', margin: 0 }}>
-          Already have an account? <button type="button" className="link-btn" onClick={onBack}>Sign in</button>
-        </p>
+        {!first && (
+          <p className="muted small" style={{ textAlign: 'center', margin: 0 }}>
+            Already have an account? <button type="button" className="link-btn" onClick={onBack}>Sign in</button>
+          </p>
+        )}
       </form>
     </Card>
   )
@@ -308,14 +310,14 @@ export function LoginScreen() {
   }
 
   if (ch) return <CodeStep ch={ch} onBack={() => setCh(null)} />
-  if (signup) return <SignupScreen onBack={() => { setSignup(false); setErr('') }} />
+  // A new installation has no one to sign in: go straight to creating the owner account.
+  if (signup || setupRequired) return <SignupScreen onBack={() => { setSignup(false); setErr('') }} />
   if (forgot) return <ForgotPassword initial={login} onBack={() => setForgot(false)}
     onDone={() => { setForgot(false); setPw(''); setErr(''); setNotice('Your password was reset. Sign in with the new password.') }} />
   return (
     <Card title="Sign in">
       <form onSubmit={submit} className="auth-form">
         {notice && <div className="auth-ok" role="status"><Icon name="circle-check" size={14} /> {notice}</div>}
-        {setupRequired && <div className="auth-ok" role="status"><Icon name="info" size={14} /> No accounts yet. Sign up to create the owner account.</div>}
         <Field label="Email or username"><input className="input" value={login} onChange={(e) => setLogin(e.target.value)} autoComplete="username" autoFocus required /></Field>
         <div className="field">
           <div className="auth-label-row">
@@ -327,7 +329,7 @@ export function LoginScreen() {
         {err && <div className="auth-err" role="alert">{err}</div>}
         <button className="btn primary lg" disabled={busy}>{busy ? 'Checking…' : 'Continue'}</button>
         <p className="muted small" style={{ textAlign: 'center', margin: 0 }}>We’ll email you a code to finish signing in.</p>
-        {signupEnabled && (
+        {signupEnabled && !setupRequired && (
           <p className="small" style={{ textAlign: 'center', margin: 0 }}>
             Don’t have an account? <button type="button" className="link-btn" onClick={() => { setSignup(true); setErr('') }}>Sign up</button>
           </p>

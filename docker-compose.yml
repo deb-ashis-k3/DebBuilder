@@ -52,6 +52,18 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:-}
       EMAIL_CODE_FALLBACK: ${EMAIL_CODE_FALLBACK:-log}
+      # Self-registration from the sign-in page (off: admins add users in Settings -> Users).
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-false}
+      # Workflows may not call private / local-network addresses unless allowed (hosts or CIDRs, or all private):
+      OUTBOUND_ALLOWED_HOSTS: ${OUTBOUND_ALLOWED_HOSTS:-}
+      OUTBOUND_ALLOW_PRIVATE: ${OUTBOUND_ALLOW_PRIVATE:-false}
+      # Limits: request body size (413 above), connections before 503 (0 = automatic), Code node run time.
+      MAX_REQUEST_BODY_MB: ${MAX_REQUEST_BODY_MB:-16}
+      MAX_CONNECTIONS: ${MAX_CONNECTIONS:-0}
+      CODE_TIMEOUT_SECONDS: ${CODE_TIMEOUT_SECONDS:-60}
+      # Database connections per process (the bundled Postgres allows 100).
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
     volumes:
       - appdata:/app/backend/data
     stop_grace_period: 40s

@@ -21,8 +21,8 @@ from ..db import ApiKey, AuthSession, LoginChallenge, SessionLocal, User
 from ..services import mailer
 from ..security import (CSRF_COOKIE, LOCKOUT_AFTER, LOCKOUT_FOR, ROLES, SESSION_IDLE, _allowed_origin, audit,
                         check_password_policy, clean_username, clear_session_cookies, client_ip, create_session, current,
-                        hash_password, new_recovery_codes, new_totp_secret, now, rate_limit, resolve, revoke_sessions,
-                        role_rank, set_session_cookies, sha256, sign, totp_uri, unsign, verify_password, verify_totp)
+                        hash_password_async, new_recovery_codes, new_totp_secret, now, rate_limit, resolve, revoke_sessions,
+                        role_rank, set_session_cookies, sha256, sign, totp_uri, unsign, verify_password_async, verify_totp)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 log = logging.getLogger("debbuilder.auth")
@@ -77,6 +77,13 @@ async def notify_password_changed(u: User, request: Request, how: str) -> None:
         except mailer.MailError as e:
             log.error("Password-changed notice to %s failed: %s", u.email, e)
     _background(go())
+
+
+def _uuid_or_none(v: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(v)
+    except ValueError:
+        return None
 
 
 def _same_origin(request: Request) -> None:
@@ -156,7 +163,7 @@ async def signup(body: SetupIn, request: Request):
         await s.execute(delete(LoginChallenge).where(LoginChallenge.purpose == purpose, LoginChallenge.expires_at < now()))
         ch = LoginChallenge(purpose=purpose, user_id=None, code_hash="", expires_at=now() + CODE_TTL, ip=client_ip(request),
                             payload=encrypt({"email": email, "username": username, "name": body.name.strip()[:200],
-                                             "password_hash": hash_password(body.password)}))
+                                             "password_hash": await hash_password_async(body.password)}))
         s.add(ch)
         await s.flush()
         ch.code_hash = _code_hash(ch.id, code)
@@ -192,7 +199,7 @@ async def login(body: LoginIn, request: Request):
             await audit("auth.login_locked", request, user=u, status=423)
             raise HTTPException(423, "Too many failed attempts. The account is locked for a few minutes.")
         # verify_password runs the hash even for unknown emails, so timing doesn't reveal accounts.
-        ok = verify_password(u.password_hash if u else None, body.password)
+        ok = await verify_password_async(u.password_hash if u else None, body.password)
         if not ok or not u or u.disabled:
             if u:
                 u.failed_logins += 1
@@ -483,7 +490,7 @@ async def reset_password(body: ResetIn, request: Request):
         if not ch:
             raise HTTPException(401, "This password reset expired. Start again.")
         check_password_policy(body.password, u.email, u.name)
-        u.password_hash, u.must_change_password, u.password_changed_at = hash_password(body.password), False, now()
+        u.password_hash, u.must_change_password, u.password_changed_at = await hash_password_async(body.password), False, now()
         u.failed_logins, u.locked_until = 0, None
         # This and every other outstanding code for the account stop working.
         for other in (await s.execute(select(LoginChallenge).where(LoginChallenge.user_id == u.id,
@@ -553,13 +560,13 @@ async def change_password(body: PasswordIn, request: Request):
     rate_limit(f"pw:{p.user.id}", 5, 300)
     async with SessionLocal() as s:
         u = await s.get(User, p.user.id)
-        if not verify_password(u.password_hash, body.current_password):
+        if not await verify_password_async(u.password_hash, body.current_password):
             await audit("auth.password_change_failed", request, p, status=401)
             raise HTTPException(401, "Current password is wrong")
-        if verify_password(u.password_hash, body.new_password):
+        if await verify_password_async(u.password_hash, body.new_password):
             raise HTTPException(400, "Choose a password different from the current one")
         check_password_policy(body.new_password, u.email, u.name)
-        u.password_hash, u.must_change_password, u.password_changed_at = hash_password(body.new_password), False, now()
+        u.password_hash, u.must_change_password, u.password_changed_at = await hash_password_async(body.new_password), False, now()
         await s.commit()
     await revoke_sessions(p.user.id, except_id=p.session_id)  # sign out everywhere else
     await audit("auth.password_changed", request, p, status=200)
@@ -611,7 +618,7 @@ class ConfirmIn(BaseModel):
 async def _confirm_identity(p, body: ConfirmIn, request: Request) -> User:
     async with SessionLocal() as s:
         u = await s.get(User, p.user.id)
-        if not verify_password(u.password_hash, body.password):
+        if not await verify_password_async(u.password_hash, body.password):
             await audit("auth.reauth_failed", request, p, status=401)
             raise HTTPException(401, "Password is wrong")
         if u.mfa_enabled:
@@ -668,7 +675,7 @@ async def my_sessions(request: Request):
 async def revoke_session(sid: str, request: Request):
     p = current(request)
     async with SessionLocal() as s:
-        x = await s.get(AuthSession, uuid.UUID(sid))
+        x = await s.get(AuthSession, _uuid_or_none(sid))
         if not x or x.user_id != p.user.id:
             raise HTTPException(404, "Session not found")
         x.revoked = True
@@ -735,7 +742,7 @@ async def create_key(body: KeyIn, request: Request):
 async def revoke_key(kid: str, request: Request):
     p = current(request)
     async with SessionLocal() as s:
-        k = await s.get(ApiKey, uuid.UUID(kid))
+        k = await s.get(ApiKey, _uuid_or_none(kid))
         if not k or k.user_id != p.user.id:
             raise HTTPException(404, "Key not found")
         k.revoked = True

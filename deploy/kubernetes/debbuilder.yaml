@@ -56,9 +56,19 @@ data:
   EXECUTIONS_SAVE_ERROR: "all"
   EXECUTIONS_SAVE_DATA: "full" # "summary" for very high volume
   EXECUTIONS_MAX_AGE_DAYS: "14"
+  MAX_QUEUED_EXECUTIONS: "5000" # beyond this, webhooks / forms / chat answer 503 + Retry-After
   # replicas x (DB_POOL_SIZE + DB_MAX_OVERFLOW + 13) must stay below Postgres max_connections (or use PgBouncer)
-  DB_POOL_SIZE: "20"
-  DB_MAX_OVERFLOW: "30"
+  DB_POOL_SIZE: "10"
+  DB_MAX_OVERFLOW: "10"
+  MAX_CONNECTIONS: "0" # open connections per pod before new ones get 503 (0 = automatic: 2000 on Linux)
+  MAX_REQUEST_BODY_MB: "16" # larger request bodies get 413
+  CODE_TIMEOUT_SECONDS: "60" # per Code node run
+  CODE_MEMORY_MB: "512"
+  ALLOW_SIGNUP: "false" # "true" offers self-registration (new accounts are editors with an empty workspace)
+  # Outbound requests from workflows / imports / credential tests may not reach private or cluster addresses.
+  # Allow what workflows legitimately call inside your network (hosts or CIDRs), or everything private:
+  OUTBOUND_ALLOWED_HOSTS: "" # e.g. "ollama.ai.svc.cluster.local,10.0.5.0/24"
+  OUTBOUND_ALLOW_PRIVATE: "false"
 ---
 # Execution files (binary data) and the Read/Write Files sandbox. With replicas > 1 every pod needs the same
 # files: use a ReadWriteMany class (EFS, Azure Files, Filestore, NFS). With ReadWriteOnce keep replicas: 1.

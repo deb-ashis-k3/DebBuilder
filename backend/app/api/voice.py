@@ -25,9 +25,9 @@ from ..services import plivo
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
 
-async def _voice_trigger(wf_id: str) -> tuple[dict, dict]:
+async def _voice_trigger(wf_id: str, draft: bool = False) -> tuple[dict, dict]:
     try:
-        wf = await load_workflow(wf_id)
+        wf = await load_workflow(wf_id, live=not draft)
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
     node = next((n for n in wf["nodes"] if n["type"] == "trigger.voice" and not n.get("disabled")), None)
@@ -61,7 +61,7 @@ class SessionIn(BaseModel):
 
 @router.post("/session")
 async def web_session(body: SessionIn, p: Principal = Depends(principal)):
-    wf, node = await _voice_trigger(body.workflow_id)
+    wf, node = await _voice_trigger(body.workflow_id, draft=True)
     if not can_manage(p, uuid.UUID(wf["owner_id"]) if wf["owner_id"] else None):
         raise HTTPException(404, "Workflow not found")
     params = voice_params(node)
@@ -71,7 +71,9 @@ async def web_session(body: SessionIn, p: Principal = Depends(principal)):
         except ValueError as e:
             raise HTTPException(400, f"Voice trigger: {e}") from e
     try:
-        return await lk.start_web_session(cred, body.workflow_id, body.identity, agent_name=params.get("agent_name") or lk.AGENT_NAME)
+        # draft: the worker passes it back so this test call runs the editor's draft, not the published version
+        return await lk.start_web_session(cred, body.workflow_id, body.identity, extra={"draft": True},
+                                          agent_name=params.get("agent_name") or lk.AGENT_NAME)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"LiveKit error: {e}") from e
 
@@ -81,10 +83,10 @@ async def web_session(body: SessionIn, p: Principal = Depends(principal)):
 # ---------------------------------------------------------------------------
 
 @router.get("/config/{wf_id}")
-async def worker_config(wf_id: str, x_internal_token: str | None = Header(None)):
-    """Resolved voice settings, including decrypted provider keys (worker only)."""
+async def worker_config(wf_id: str, draft: bool = False, x_internal_token: str | None = Header(None)):
+    """Resolved voice settings, including decrypted provider keys (worker only). draft: an editor test call."""
     _check_internal(x_internal_token)
-    wf, node = await _voice_trigger(wf_id)
+    wf, node = await _voice_trigger(wf_id, draft)
     p = voice_params(node)
     async with SessionLocal() as s:
         for key in ("stt_credential", "tts_credential", "amd_credential", "recording_credential"):
@@ -109,7 +111,7 @@ async def resolve_workflow(agent_name: str = "", number: str = "", x_internal_to
     async with SessionLocal() as s:
         rows = (await s.execute(select(Workflow).where(Workflow.active.is_(True)))).scalars().all()
     for wf in rows:
-        node = next((n for n in wf.nodes or [] if n["type"] == "trigger.voice" and not n.get("disabled")), None)
+        node = next((n for n in wf.live_nodes if n["type"] == "trigger.voice" and not n.get("disabled")), None)
         if not node:
             continue
         p = voice_params(node)
@@ -139,7 +141,7 @@ async def voice_turn(body: TurnIn, x_internal_token: str | None = Header(None)):
     {"type": "text", "text": "…"} pieces of the reply, and {"type": "action", "action": {…}} call actions
     (hang up, transfer, DTMF, say) queued by Voice Call Action nodes / the Call Control tool."""
     _check_internal(x_internal_token)
-    wf, node = await _voice_trigger(body.workflow_id)
+    wf, node = await _voice_trigger(body.workflow_id, bool(body.metadata.get("draft")))
     stream_tokens = voice_params(node).get("stream_tokens", True)
     item = {"text": body.text, "message": body.text, "session_id": body.session_id, "room": body.room, **body.metadata}
 
@@ -191,7 +193,7 @@ async def voice_event(body: EventIn, x_internal_token: str | None = Header(None)
     """Call lifecycle event from the worker: runs this workflow's Voice Call Events triggers that listen for it."""
     _check_internal(x_internal_token)
     try:
-        wf = await load_workflow(body.workflow_id)
+        wf = await load_workflow(body.workflow_id, live=not (body.data or {}).get("draft"))
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
     started = []

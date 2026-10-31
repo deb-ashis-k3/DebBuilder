@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api } from '../api'
-import { Icon, toast } from '../lib'
+import { ApiError, api } from '../api'
+import { Icon, toast, useDialog } from '../lib'
 import type { Credential, CredentialCatalog, CredentialField, TestResult } from '../types'
 import { Select } from './Select'
 
@@ -28,6 +28,20 @@ export function TypeTile({ label, color, size = 36 }: { label: string; color: st
       {text}
     </div>
   )
+}
+
+/** A short, readable reason from a failed request or test: the server's message, without "Error:" prefixes,
+ *  exception class names or stack traces. */
+export function friendlyError(e: unknown): string {
+  let m = e instanceof Error ? e.message : String(e ?? '')
+  if (e instanceof ApiError && e.status >= 500 && !m.trim()) m = 'The server had a problem. Try again in a moment.'
+  m = m.replace(/^(Error|ApiError):\s*/, '')
+  // Python tracebacks / exception dumps: keep the last line ("SomeError: message" -> "message").
+  if (/Traceback \(most recent call last\)/.test(m)) m = m.trim().split('\n').pop() ?? m
+  m = m.replace(/^(?:[a-z_][\w.]*\.)?[A-Z]\w*(?:Error|Exception|Timeout)(?:\(\))?:\s*/, '')
+  m = m.replace(/\s+/g, ' ').trim()
+  if (m.length > 300) m = m.slice(0, 297) + '…'
+  return m || 'Unknown error'
 }
 
 function TestBanner({ result }: { result: TestResult | 'testing' | null }) {
@@ -123,6 +137,7 @@ export function CredentialModal({ credential, allowedTypes, onClose, onSaved }: 
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<TestResult | 'testing' | null>(null)
   const [connected, setConnected] = useState(!!credential?.oauth_connected)
+  const dialogRef = useDialog(onClose)
 
   useEffect(() => {
     if (credential) api.credential(credential.id).then((c) => { setData(c.data ?? {}); setConnected(!!c.data?.oauth_connected) })
@@ -161,7 +176,7 @@ export function CredentialModal({ credential, allowedTypes, onClose, onSaved }: 
     try {
       setResult(await api.testCredential(type, data, id))
     } catch (e) {
-      setResult({ ok: false, message: String(e) })
+      setResult({ ok: false, message: friendlyError(e) })
     }
   }
 
@@ -186,9 +201,14 @@ export function CredentialModal({ credential, allowedTypes, onClose, onSaved }: 
       if (!c) return
       if (spec?.testable && !(spec.oauth2 && !connected && data.grant_type !== 'client_credentials')) {
         setResult('testing')
-        const r = await api.testSavedCredential(c.id)
-        setResult(r)
-        if (!r.ok) { toast('Saved, but the connection test failed', 'error'); return }
+        let r: TestResult
+        try {
+          r = await api.testSavedCredential(c.id)
+        } catch (e) {
+          r = { ok: false, message: friendlyError(e) }  // e.g. the test request itself failed: still saved
+        }
+        setResult(r.ok ? r : { ...r, message: `Saved, but the connection test failed: ${friendlyError(r.message)}` })
+        if (!r.ok) { toast('Credential saved · connection test failed', 'error'); return }
         toast(r.untested ? 'Credential saved' : 'Saved · connection tested successfully')
       } else {
         toast(spec?.oauth2 && !connected ? 'Saved. Now click “Connect my account”' : 'Credential saved')
@@ -196,7 +216,7 @@ export function CredentialModal({ credential, allowedTypes, onClose, onSaved }: 
       }
       onSaved(c)
     } catch (e) {
-      toast(String(e), 'error')
+      toast(`Couldn't save the credential: ${friendlyError(e)}`, 'error')
     } finally {
       setBusy(false)
     }
@@ -225,11 +245,12 @@ export function CredentialModal({ credential, allowedTypes, onClose, onSaved }: 
 
   return (
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={`modal ${spec ? 'cred-form' : 'cred-pick'}`}>
+      <div ref={dialogRef} className={`modal ${spec ? 'cred-form' : 'cred-pick'}`} role="dialog" aria-modal="true"
+        aria-label={spec ? `${credential ? 'Edit' : 'New'} ${spec.label} credential` : 'Add credential'}>
         <div className="modal-head">
-          {spec && !credential && <button className="btn ghost sm icon" title="Choose another service" onClick={() => { setType(''); setName('') }}><Icon name="arrow-left" size={16} /></button>}
+          {spec && !credential && <button className="btn ghost sm icon" title="Choose another service" aria-label="Choose another service" onClick={() => { setType(''); setName('') }}><Icon name="arrow-left" size={16} /></button>}
           {head}
-          <button className="btn ghost icon" onClick={onClose}><Icon name="x" /></button>
+          <button className="btn ghost icon" onClick={onClose} aria-label="Close" title="Close (Esc)"><Icon name="x" /></button>
         </div>
         <div className="modal-body">
           {!spec ? (

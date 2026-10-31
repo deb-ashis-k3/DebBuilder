@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { edgeTypes } from '../components/CanvasEdge'
+import { FitWhenReady } from '../canvas/FitWhenReady'
 import { Menu, confirmDialog, errText } from '../components/Dialogs'
 import { ExecutionLog } from '../components/ExecutionLog'
 import { NodeDetails } from '../components/NodeDetails'
@@ -313,15 +314,19 @@ function ExecutionPreview({ execId, onChanged, onDebug, onSelect }: {
       </div>
       <div className="exv-canvas canvas">
         <ReactFlowProvider>
-          <ReactFlow key={ex.id} nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+          <ReactFlow key={ex.id} nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
             nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, n) => setSel(n.id)} minZoom={0.1} proOptions={{ hideAttribution: true }}
-            onNodeDoubleClick={(_, n) => { (window as any).__dbg = [...((window as any).__dbg ?? []), 'dbl:' + n.id + ':' + n.type]; if (n.type !== 'sticky') setOpened(n.id) }}>
+            // Nodes here aren't draggable, so React Flow doesn't mark them "nopan" and the canvas's zoom-on-double-click
+            // would swallow the event; double-click opens the node instead (as in n8n).
+            zoomOnDoubleClick={false}
+            onNodeDoubleClick={(_, n) => { if (n.type !== 'sticky') setOpened(n.id) }}>
             <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} color="var(--canvas-dot)" />
             <Controls showInteractive={false} orientation="horizontal" />
+            <FitWhenReady fitKey={ex.id} />
           </ReactFlow>
         </ReactFlowProvider>
       </div>
-      {(() => { (window as any).__dbg = [...((window as any).__dbg ?? []), 'render:' + opened]; return null })()}{opened && (() => {
+      {opened && (() => {
         const wfNodes = ex.workflow?.nodes ?? []
         const wfEdges = ex.workflow?.edges ?? []
         const node = wfNodes.find((n) => n.id === opened)

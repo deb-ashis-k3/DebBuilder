@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Icon } from '../lib'
 import type { Item } from '../types'
 
@@ -19,8 +19,12 @@ function dragExpr(e: React.DragEvent, path: string) {
 // JSON tree
 // ---------------------------------------------------------------------------
 
+/** Children rendered per expanded array / object before a "Show more" button (big outputs stay responsive). */
+const JSON_PAGE = 100
+
 function JsonNode({ value, path, name, depth }: { value: unknown; path: string; name?: string | number; depth: number }) {
   const [open, setOpen] = useState(depth < 2)
+  const [limit, setLimit] = useState(JSON_PAGE)
   const keyEl = name !== undefined && (
     <span className="json-key" draggable onDragStart={(e) => dragExpr(e, path)} title={`Drag into a field: {{ ${path} }}`}>
       {typeof name === 'number' ? name : `"${name}"`}
@@ -34,7 +38,14 @@ function JsonNode({ value, path, name, depth }: { value: unknown; path: string; 
         <span className="json-toggle" onClick={() => setOpen(!open)}>{open ? '▾' : '▸'}</span>
         {keyEl}{keyEl && ': '}{o}
         {!open && <span className="muted"> {entries.length} {Array.isArray(value) ? 'items' : 'keys'} </span>}
-        {open && entries.map(([k, v]) => <JsonNode key={String(k)} value={v} name={k} path={joinPath(path, k)} depth={depth + 1} />)}
+        {open && entries.slice(0, limit).map(([k, v]) => <JsonNode key={String(k)} value={v} name={k} path={joinPath(path, k)} depth={depth + 1} />)}
+        {open && entries.length > limit && (
+          <div style={{ paddingLeft: 16 }}>
+            <button type="button" className="link-btn small" onClick={() => setLimit((l) => l + JSON_PAGE * 5)}>
+              Show {Math.min(JSON_PAGE * 5, entries.length - limit)} more of {entries.length - limit} remaining
+            </button>
+          </div>
+        )}
         {open ? <div style={{ paddingLeft: 14 }}>{c}</div> : c}
       </div>
     )
@@ -145,7 +156,14 @@ export function DataView({ items, base = '$json', empty, actions, defaultMode = 
   meta?: ReactNode
 }) {
   const [mode, setMode] = useState<Mode>(() => (localStorageGet('dv-mode') as Mode) || defaultMode)
+  const [query, setQuery] = useState('')
+  // Searching serialises every item: wait until typing pauses.
   const [q, setQ] = useState('')
+  useEffect(() => {
+    if (!query) { setQ(''); return }
+    const t = window.setTimeout(() => setQ(query), 200)
+    return () => window.clearTimeout(t)
+  }, [query])
   const filtered = useMemo(() => {
     if (!items || !q) return items ?? []
     const needle = q.toLowerCase()
@@ -168,7 +186,7 @@ export function DataView({ items, base = '$json', empty, actions, defaultMode = 
         {!!items?.length && (
           <div className="search dv-search">
             <Icon name="search" size={13} />
-            <input className="input" placeholder="Search" value={q} onChange={(e) => setQ(e.target.value)} />
+            <input className="input" placeholder="Search" aria-label="Search items" value={query} onChange={(e) => setQuery(e.target.value)} />
           </div>
         )}
         <span className="spacer" />

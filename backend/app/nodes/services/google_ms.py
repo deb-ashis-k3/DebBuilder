@@ -88,11 +88,13 @@ async def _drive_download(call, v, item, ctx, p):
         ext = {"application/pdf": "pdf", "text/csv": "csv", "text/plain": "txt",
                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"}.get(fmt, "bin")
-        name, mime = f"{meta['name']}.{ext}", fmt
+        name, mime = f"{meta.get('name') or v['file_id']}.{ext}", fmt
     else:
         r = await call("GET", f"/files/{v['file_id']}", params={"alt": "media"})
-        name, mime = meta["name"], meta.get("mimeType")
-    ref = ctx.put_file(r.content, name, mime)
+        name, mime = meta.get("name") or str(v["file_id"]), meta.get("mimeType")
+    # a JSON file comes back parsed by call(): store its bytes, not the dict
+    content = r.content if hasattr(r, "content") else json.dumps(r, ensure_ascii=False).encode()
+    ref = ctx.put_file(content, name, mime)
     return [{**{k: x for k, x in item.items() if k != "binary"}, **meta, "binary": {**(item.get("binary") or {}), p.get("binary_property") or "data": ref}}]
 
 

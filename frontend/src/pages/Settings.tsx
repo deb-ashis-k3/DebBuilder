@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { NavLink, Navigate, useParams } from 'react-router-dom'
 import { auth } from '../api'
 import { ROLE_HELP, ROLE_LABEL, useAuth } from '../auth'
-import { Menu, confirmDialog, errText } from '../components/Dialogs'
+import { Dialog, Menu, confirmDialog, errText } from '../components/Dialogs'
 import { Select } from '../components/Select'
 import { Icon, fmtDate, toast } from '../lib'
 import type { ApiKey, AuditEntry, AuthSessionInfo, Role, User } from '../types'
@@ -223,6 +223,7 @@ function Users() {
   const [username, setUsername] = useState('')
   const [role, setRole] = useState('editor')
   const [secret, setSecret] = useState<{ label: string; value: string } | null>(null)
+  const [deleting, setDeleting] = useState<User | null>(null)
   const load = () => auth.users().then(setList)
   useEffect(() => { load() }, [])
   const isOwner = can('owner')
@@ -281,9 +282,7 @@ function Users() {
                       } }] : []),
                       { label: 'Sign out everywhere', icon: 'log-out', onClick: () => act(() => auth.revokeUserSessions(u.id), 'Signed out') },
                       { divider: true, label: '' },
-                      { label: 'Delete user', icon: 'trash-2', danger: true, onClick: async () => {
-                        if (await confirmDialog({ title: `Delete ${u.email}?`, message: 'Their sessions and API keys are removed. Their workflows, folders and credentials are transferred to you, and active workflows keep running.', confirmLabel: 'Delete', danger: true })) await act(() => auth.deleteUser(u.id), 'User deleted. Their workflows are now yours')
-                      } },
+                      { label: 'Delete user…', icon: 'trash-2', danger: true, onClick: () => setDeleting(u) },
                     ]} />
                   )}
                 </td>
@@ -292,7 +291,56 @@ function Users() {
           })}
         </tbody>
       </table></div>
+      {deleting && <DeleteUserDialog user={deleting} users={list} onClose={() => setDeleting(null)} onDone={load} />}
     </Section>
+  )
+}
+
+/** Deleting a user deletes what they own, unless an admin hands it to someone else (each user's data is private). */
+function DeleteUserDialog({ user, users, onClose, onDone }: { user: User; users: User[]; onClose: () => void; onDone: () => void }) {
+  const [mode, setMode] = useState<'delete' | 'transfer'>('delete')
+  const [to, setTo] = useState('')
+  const [busy, setBusy] = useState(false)
+  const others = users.filter((x) => x.id !== user.id && !x.disabled)
+  const target = others.find((x) => x.id === to)
+  const who = user.name || user.email
+  const n = user.workflow_count ?? 0
+  const go = async () => {
+    setBusy(true)
+    try {
+      await auth.deleteUser(user.id, mode === 'transfer' ? to : undefined)
+      toast(mode === 'transfer' && target ? `User deleted. Their data now belongs to ${target.name || target.email}` : 'User and their data deleted')
+      onDone()
+      onClose()
+    } catch (x) {
+      toast(errText(x), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Dialog title={`Delete ${user.email}?`} onClose={onClose} footer={<>
+      <button className="btn" onClick={onClose}>Cancel</button>
+      <button className="btn danger solid" disabled={busy || (mode === 'transfer' && !target)} onClick={go}>
+        <Icon name="trash-2" size={14} /> {busy ? 'Deleting…' : mode === 'transfer' ? 'Transfer data and delete' : 'Delete user and data'}
+      </button>
+    </>}>
+      <p style={{ marginTop: 0 }}>
+        {who}'s sessions and API keys are removed. By default their <b>workflows{n ? ` (${n})` : ''}, folders, credentials and executions are deleted too</b>. This cannot be undone.
+      </p>
+      <label className="radio-row"><input type="radio" name="del-mode" checked={mode === 'delete'} onChange={() => setMode('delete')} />
+        Delete their workflows, credentials and executions</label>
+      <label className="radio-row"><input type="radio" name="del-mode" checked={mode === 'transfer'} onChange={() => setMode('transfer')} disabled={!others.length} />
+        Transfer their data to another user instead</label>
+      {mode === 'transfer' && (
+        <div className="field" style={{ marginTop: 10 }}>
+          <label>Transfer their data to…</label>
+          <Select value={to} onChange={setTo} placeholder="Choose a user" searchable={others.length > 6}
+            options={others.map((x) => ({ value: x.id, label: x.name || x.email, hint: x.email }))} />
+          <div className="hint">Their workflows, folders and credentials move to this user; active workflows keep running.</div>
+        </div>
+      )}
+    </Dialog>
   )
 }
 

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .credentials import request_auth, with_defaults
+from .netguard import guarded_client
 
 _OFFICIAL_OPENAI_HOSTS = {"api.openai.com"}
 
@@ -144,7 +145,7 @@ async def list_models(cred_type: str, data: dict, cred_id: str, version: str, re
     if hit and not refresh and time.monotonic() - hit[0] < _TTL:
         return hit[1]
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        async with guarded_client(timeout=20, follow_redirects=True) as c:
             models = await _PROVIDERS[cred_type](c, with_defaults(cred_type, data), cred_id)
     except httpx.HTTPError as e:
         raise ValueError(f"Couldn't reach the provider: {e.__class__.__name__}: {e}") from e

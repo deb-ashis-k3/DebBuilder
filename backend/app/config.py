@@ -34,8 +34,30 @@ class Settings(BaseSettings):
     # Executions running at once per process; more wait their turn (backpressure for webhook bursts).
     # They mostly wait on network calls and hold no database connection while running, so this can be high.
     max_concurrent_executions: int = 200
-    db_pool_size: int = 20
-    db_max_overflow: int = 30
+    # Admission control: executions waiting for a slot beyond this are refused (webhooks answer 503 + Retry-After)
+    # instead of queueing in memory without limit.
+    max_queued_executions: int = 5000
+    # Open connections per process before new ones get 503 (0 = automatic: 400 on Windows, whose event loop
+    # cannot watch more than ~500 sockets, 2000 elsewhere).
+    max_connections: int = 0
+    # Largest request body accepted (webhooks, imports, forms), in MB.
+    max_request_body_mb: int = 16
+    # Workflow-level limits (a workflow's settings can lower them): run time in seconds (0 = none) and how deep
+    # Execute Workflow may nest.
+    execution_timeout_seconds: int = 0
+    max_subworkflow_depth: int = 10
+    # Code node sandbox (every language, Python included): wall-clock seconds and memory per run.
+    code_timeout_seconds: int = 60
+    code_memory_mb: int = 512
+    # Outbound requests (HTTP Request, import from URL, credential tests, RSS…): private, loopback and
+    # link-local addresses are refused unless allowed here. Cloud metadata (169.254.169.254) is always refused.
+    outbound_allow_private: bool = False
+    # Comma-separated hosts or CIDRs that may be reached even though private, e.g. "localhost,10.0.5.0/24".
+    outbound_allowed_hosts: str = ""
+    # Per process: SQLAlchemy pool + overflow (the LangGraph checkpointer adds up to 10). Keep
+    # replicas × (pool + overflow + 12) under Postgres max_connections (default 100).
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
     # ---- execution history at volume (engine/store.py) ----
     # What to keep: "all" | "none" (per workflow overridable in its settings). Paused runs are always kept.
     executions_save_success: str = "all"
@@ -57,9 +79,9 @@ class Settings(BaseSettings):
     # First-run owner setup is only accepted from this machine unless explicitly allowed,
     # so nobody on the network can claim a fresh install before you do.
     allow_remote_setup: bool = False
-    # Once the owner exists, the sign-in page offers "Sign up": new accounts are editors with their
-    # own empty workspace, created only after the emailed code is entered. False = admins add users.
-    allow_signup: bool = True
+    # Self-registration: when true, the sign-in page offers "Sign up" and new accounts are editors with their
+    # own empty workspace (created after the emailed code is entered). Off by default: admins add users.
+    allow_signup: bool = False
     # Email for sign-in codes. Without SMTP_HOST, codes are written to the server console
     # (EMAIL_CODE_FALLBACK=log, for local development) or sign-in is refused (=off).
     smtp_host: str = ""

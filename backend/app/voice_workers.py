@@ -130,7 +130,7 @@ def _api_url() -> str:
 def _voice_triggers(wf: Workflow) -> dict[str, dict]:
     if not wf.active:
         return {}
-    return {n["id"]: n for n in (wf.nodes or []) if n.get("type") == "trigger.voice" and not n.get("disabled")}
+    return {n["id"]: n for n in wf.live_nodes if n.get("type") == "trigger.voice" and not n.get("disabled")}
 
 
 def _set_workflow(wf: Workflow) -> None:

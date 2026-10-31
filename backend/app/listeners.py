@@ -154,6 +154,7 @@ _wf_cache: dict[str, dict] = {}
 
 
 def _emitter(workflow_id: str, node: dict, status: Status, limit: int):
+    from .engine.errors import Overloaded
     from .engine.runtime import execute_workflow, load_workflow
 
     sem = asyncio.Semaphore(max(1, limit))
@@ -162,8 +163,12 @@ def _emitter(workflow_id: str, node: dict, status: Status, limit: int):
         try:
             wf = _wf_cache.get(workflow_id)
             if wf is None:  # once per change, not once per event (thousands per second on busy streams)
-                wf = _wf_cache[workflow_id] = await load_workflow(workflow_id)
-            return await execute_workflow(wf, trigger_node_id=node["id"], mode="trigger", items=items, wait=True)
+                wf = _wf_cache[workflow_id] = await load_workflow(workflow_id, live=True)
+            while True:
+                try:
+                    return await execute_workflow(wf, trigger_node_id=node["id"], mode="trigger", items=items, wait=True)
+                except Overloaded as e:  # the server is saturated: hold the event (and the broker) and retry
+                    await asyncio.sleep(e.retry_after)
         except Exception as e:  # noqa: BLE001
             log.exception("listener execution failed (%s / %s)", workflow_id, node.get("name"))
             return {"status": "error", "error": str(e)}
@@ -249,16 +254,19 @@ def sync_workflow(wf: Workflow, reason: str | None = None) -> None:
     wf_id = str(wf.id)
     _wf_cache.pop(wf_id, None)  # the workflow changed: the next event loads the new version
     had_any = any(k[0] == wf_id for k in _running)
-    wanted = {n["id"]: n for n in (wf.nodes or []) if wf.active and n.get("type") in LISTENERS and not n.get("disabled")}
+    wanted = {n["id"]: n for n in wf.live_nodes if wf.active and n.get("type") in LISTENERS and not n.get("disabled")}
     for key in [k for k in _running if k[0] == wf_id and k[1] not in wanted]:
         _stop(key)
     for nid, node in wanted.items():
-        entry = _running.get((wf_id, nid))
-        if entry and entry.signature == _signature(node):
-            continue
-        if entry:
-            _stop((wf_id, nid))
-        _start(wf_id, node, reason or ("updated" if had_any else "activated"))
+        try:  # one node that can't start never keeps the others from listening
+            entry = _running.get((wf_id, nid))
+            if entry and entry.signature == _signature(node):
+                continue
+            if entry:
+                _stop((wf_id, nid))
+            _start(wf_id, node, reason or ("updated" if had_any else "activated"))
+        except Exception:  # noqa: BLE001
+            log.exception("listener %s/%s couldn't start", wf_id, node.get("name"))
 
 
 def remove_workflow(workflow_id: str) -> None:
@@ -274,7 +282,10 @@ def status(workflow_id: str) -> dict[str, dict]:
 async def load_all() -> None:
     async with SessionLocal() as s:
         for wf in (await s.execute(select(Workflow).where(Workflow.active.is_(True)))).scalars():
-            sync_workflow(wf, reason="started")
+            try:
+                sync_workflow(wf, reason="started")
+            except Exception:  # noqa: BLE001 - one broken workflow never stops the others' listeners
+                log.exception("couldn't start the listeners of workflow %s", wf.id)
 
 
 async def stop_all() -> None:

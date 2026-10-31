@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from ..netguard import guarded_client
 from ..listeners import ListenCtx, csv, listen_once, listener, parse_payload
 from ..services.brokers import (aws_json_request, kafka_kwargs, mqtt_kwargs, nats_kwargs, pg_kwargs, rabbitmq_url,
                                 redis_client)
@@ -704,7 +705,7 @@ def _feed_entries(xml: bytes) -> list[dict]:
 async def _rss(lc: ListenCtx):
     seen: set[str] = set()
     first = True
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "DebBuilder/1.0"}) as client:
+    async with guarded_client(timeout=30, follow_redirects=True, headers={"User-Agent": "DebBuilder/1.0"}) as client:
         while True:
             r = await client.get(lc.params["url"])
             r.raise_for_status()
@@ -745,7 +746,7 @@ async def _sse(lc: ListenCtx):
     if isinstance(headers, str):
         headers = json.loads(headers or "{}")
     only = set(csv(lc.params.get("events")))
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None)) as client:
+    async with guarded_client(timeout=httpx.Timeout(30, read=None)) as client:
         async with aconnect_sse(client, "GET", lc.params["url"], headers=headers) as src:
             src.response.raise_for_status()
             lc.ready()
@@ -762,7 +763,8 @@ async def _sse(lc: ListenCtx):
 
 node("trigger.file", "Local File Trigger", "folder-search", "#a16207",
      "Watches a folder on the server for added / changed / deleted files. Emits {event, path, name, size}.", [
-         prop("path", "Folder or file", "string", "", required=True, placeholder="C:\\data\\incoming"),
+         prop("path", "Folder or file (in your files folder)", "string", "", required=True, placeholder="incoming",
+              description="Relative to your private folder under FILES_ROOT (the Read/Write Files node's folder)"),
          prop("recursive", "Include subfolders", "boolean", True),
          prop("pattern", "File name pattern", "string", "*", description="Glob, e.g. *.csv"),
          prop("events", "Events", "options", "added", options=[
@@ -772,14 +774,33 @@ node("trigger.file", "Local File Trigger", "folder-search", "#a16207",
      ])
 
 
+async def _workflow_owner(workflow_id: str) -> str | None:
+    import uuid
+
+    from sqlalchemy import select
+
+    from ..db import SessionLocal, Workflow
+
+    async with SessionLocal() as s:
+        try:
+            owner = (await s.execute(select(Workflow.owner_id).where(Workflow.id == uuid.UUID(str(workflow_id))))).scalar()
+        except ValueError:
+            return None
+    return str(owner) if owner else None
+
+
 @listener("trigger.file")
 async def _file(lc: ListenCtx):
     from watchfiles import Change, awatch
 
+    from .files import safe_path
+
     p = lc.params
-    path = os.path.expandvars(os.path.expanduser(p["path"]))
+    # Confined to the workflow owner's folder under FILES_ROOT, like Read/Write Files (no arbitrary server paths).
+    owner = await _workflow_owner(lc.workflow_id)
+    path = str(safe_path(str(p.get("path") or ""), owner))
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Path not found: {path}")
+        raise FileNotFoundError(f"Folder not found in your files folder: {p.get('path')}")
     wanted = {"added": {Change.added}, "modified": {Change.modified}, "deleted": {Change.deleted}}.get(
         p.get("events") or "added", {Change.added, Change.modified, Change.deleted})
     pattern = p.get("pattern") or "*"

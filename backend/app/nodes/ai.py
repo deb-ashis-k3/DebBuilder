@@ -6,10 +6,10 @@ nodes.
 """
 
 import ast
+import asyncio
 import json
 import operator as op
 import re
-import textwrap
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field, create_model
 
+from ..netguard import guarded_client
 from .base import NodeContext, NodeError, NodeType, ai_input, prop, register
 
 AI = dict(group="ai", color="#ec4899")
@@ -68,7 +69,10 @@ async def _openai(ctx: NodeContext):
     p = ctx.params()
     return ChatOpenAI(**_opt(
         # Local OpenAI-compatible servers often need no key, but the client requires one.
-        {"model": model_name(ctx, p), "api_key": cred.get("api_key") or "not-needed", "streaming": True},
+        # stream_usage: token counts also for streamed runs and OpenAI-compatible base URLs (servers that don't
+        # support it simply omit the usage chunk).
+        {"model": model_name(ctx, p), "api_key": cred.get("api_key") or "not-needed", "streaming": True,
+         "stream_usage": True},
         base_url=cred.get("base_url"), organization=cred.get("organization"),
         temperature=p.get("temperature"), max_tokens=p.get("max_tokens"),
     ))
@@ -136,7 +140,9 @@ class PgMemory:
     The table is created on first use; connections come from a small pool per database."""
 
     _pools: dict[tuple, Any] = {}
+    _used: dict[tuple, float] = {}
     _ready: set[tuple] = set()
+    POOL_IDLE_SECONDS = 600  # pools unused this long are closed
 
     def __init__(self, cred: dict, table: str, session_key: str, window: int):
         from psycopg import sql
@@ -154,27 +160,52 @@ class PgMemory:
 
         from ..services.brokers import pg_kwargs
 
+        import time
+
+        now = time.time()
+        for k in [k for k, t in self._used.items() if now - t > self.POOL_IDLE_SECONDS and k != self.key]:
+            idle = self._pools.pop(k, None)
+            self._used.pop(k, None)
+            self._ready.difference_update({r for r in self._ready if r[0] == k})
+            if idle is not None:
+                try:
+                    await idle.close()
+                except Exception:  # noqa: BLE001
+                    pass
         pool = self._pools.get(self.key)
         if pool is None:
             pool = AsyncConnectionPool("", kwargs={**pg_kwargs(self.cred), "autocommit": True},
                                        min_size=0, max_size=5, open=False, timeout=15)
             await pool.open()
             self._pools[self.key] = pool
+        self._used[self.key] = now
         return pool
 
     async def _run(self, query, params=(), fetch: bool = False):
         from psycopg import sql
 
+        from psycopg import errors
+
+        async def ensure(conn, ready_key):
+            await conn.execute(sql.SQL(
+                "CREATE TABLE IF NOT EXISTS {t} (id SERIAL PRIMARY KEY, session_id VARCHAR(255) NOT NULL, "
+                "message JSONB NOT NULL)").format(t=self.table))
+            await conn.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {i} ON {t} (session_id)").format(
+                i=self.index, t=self.table))
+            self._ready.add(ready_key)
+
         try:
             async with (await self._pool()).connection() as conn:
-                if (self.key, str(self.table.as_string(conn))) not in self._ready:
-                    await conn.execute(sql.SQL(
-                        "CREATE TABLE IF NOT EXISTS {t} (id SERIAL PRIMARY KEY, session_id VARCHAR(255) NOT NULL, "
-                        "message JSONB NOT NULL)").format(t=self.table))
-                    await conn.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {i} ON {t} (session_id)").format(
-                        i=self.index, t=self.table))
-                    self._ready.add((self.key, str(self.table.as_string(conn))))
-                cur = await conn.execute(query, params)
+                ready_key = (self.key, str(self.table.as_string(conn)))
+                if ready_key not in self._ready:
+                    await ensure(conn, ready_key)
+                try:
+                    cur = await conn.execute(query, params)
+                except errors.UndefinedTable:
+                    # the table was dropped since we created it: recreate it once and retry
+                    self._ready.discard(ready_key)
+                    await ensure(conn, ready_key)
+                    cur = await conn.execute(query, params)
                 return await cur.fetchall() if fetch else None
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"Postgres Chat Memory ({self.cred.get('host')}/{self.cred.get('database')}): {e}") from e
@@ -184,7 +215,7 @@ class PgMemory:
         from psycopg import sql
 
         rows = await self._run(sql.SQL("SELECT message FROM {t} WHERE session_id = %s ORDER BY id DESC LIMIT %s").format(
-            t=self.table), (self.session_key, self.window), fetch=True)
+            t=self.table), (self.session_key, self.window if self.window > 0 else None), fetch=True)  # 0 = no limit
         return messages_from_dict([r[0] for r in reversed(rows or [])])
 
     async def save(self, human: str, ai: str) -> None:
@@ -208,7 +239,7 @@ async def _memory(ctx: NodeContext):
     _, cred = await ctx.credential()
     try:
         return PgMemory(cred, str(ctx.param("table") or "chat_histories"), str(ctx.param("session_key") or "default"),
-                        int(ctx.param("window") or 20))
+                        int(ctx.param("window") if ctx.param("window") not in (None, "") else 20))
     except ValueError as e:
         raise NodeError(str(e), ctx.name) from e
 
@@ -285,7 +316,7 @@ async def _tool_http(ctx: NodeContext) -> BaseTool:
                 query[f["name"]] = v
         headers: dict = {}
         auth, auth_params = await apply_auth(ctx, 0, headers)
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+        async with guarded_client(timeout=30, follow_redirects=True) as c:
             r = await c.request(p.get("method", "GET"), url, params={**auth_params, **query} or None,
                                 json=body or None, headers=headers, auth=auth)
         return r.text[:8000]
@@ -310,15 +341,31 @@ register(NodeType(
 
 
 async def _tool_code(ctx: NodeContext) -> BaseTool:
+    from .sandbox import SandboxError, Timeout, code_timeout, run_python
+
     code = ctx.raw_params.get("code") or "return query"
     fields = ctx.raw_params.get("parameters") or []
     arg_names = [f["name"] for f in fields if f.get("name")] or ["query"]
-    env: dict = {"json": json, "httpx": httpx, "datetime": datetime}
-    src = f"async def __tool({', '.join(arg_names)}):\n" + textwrap.indent(code, "    ")
-    exec(compile(src, f"<tool:{ctx.name}>", "exec"), env)  # noqa: S102 - user code by design
+    bad = [a for a in arg_names if not a.isidentifier()]
+    if bad:
+        raise NodeError(f"Argument names must be valid Python identifiers: {', '.join(bad)}", ctx.name)
+    try:  # syntax check only (compile, never exec): the code itself runs in the sandbox
+        compile(f"async def __tool({', '.join(arg_names)}):\n" + "".join(f"    {line}\n" for line in code.splitlines()),
+                "<code>", "exec")
+    except SyntaxError as e:
+        raise NodeError(f"Code Tool syntax error line {(e.lineno or 1) - 1}: {e.msg}", ctx.name) from e
 
     async def call(**kwargs):
-        r = await env["__tool"](**kwargs)
+        # Runs in the process sandbox like the Code node (no server secrets, timeout, memory cap).
+        req = {"kind": "tool", "params": arg_names, "args": {a: kwargs.get(a) for a in arg_names}, "code": code,
+               "vars": ctx.run.meta.get("vars", {}), "execution_id": ctx.run.execution_id}
+        try:
+            resp = await run_python(ctx.run.meta.get("owner_id"), req, code_timeout(ctx.raw_params.get("timeout")))
+        except (SandboxError, Timeout) as e:
+            return f"Error: {e}"
+        if not resp.get("ok"):
+            return f"Error: {resp.get('error')}"
+        r = resp.get("out")
         return r if isinstance(r, str) else json.dumps(r, default=str)
 
     return StructuredTool.from_function(coroutine=call, name=_tool_name(ctx), description=ctx.param("tool_description"),
@@ -363,28 +410,60 @@ _BIN = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv,
         ast.Mod: op.mod, ast.FloorDiv: op.floordiv}
 
 
+_CALC_MAX_DIGITS = 1000  # results beyond ~1e1000 are refused instead of hanging the server
+
+
+def _calc_check(v):
+    if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > _CALC_MAX_DIGITS * 3.33:
+        raise ValueError(f"Result too large (more than {_CALC_MAX_DIGITS} digits)")
+    return v
+
+
+def _calc_pow(a, b):
+    import math
+
+    if isinstance(b, (int, float)) and abs(b) > 1 and isinstance(a, (int, float)) and abs(a) > 1:
+        if abs(b) * math.log10(abs(a)) > _CALC_MAX_DIGITS:
+            raise ValueError(f"Result too large: {a} ** {b} has more than {_CALC_MAX_DIGITS} digits")
+    return a ** b
+
+
 def _calc(node):
     import math
 
     if isinstance(node, ast.Expression):
         return _calc(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return _calc_check(node.value)
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN:
-        return _BIN[type(node.op)](_calc(node.left), _calc(node.right))
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        return -_calc(node.operand)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and hasattr(math, node.func.id):
-        return getattr(math, node.func.id)(*[_calc(a) for a in node.args])
-    if isinstance(node, ast.Name) and node.id in ("pi", "e"):
+        left, right = _calc(node.left), _calc(node.right)
+        if isinstance(node.op, ast.Pow):
+            return _calc_check(_calc_pow(left, right))
+        return _calc_check(_BIN[type(node.op)](left, right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _calc(node.operand)
+        return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and hasattr(math, node.func.id) \
+            and not node.func.id.startswith("_") and not node.keywords:
+        args = [_calc(a) for a in node.args]
+        if node.func.id in ("factorial", "comb", "perm") and any(abs(a) > 1000 for a in args):
+            raise ValueError(f"{node.func.id}() arguments above 1000 are not supported")
+        if node.func.id == "pow" and len(args) == 2:
+            return _calc_check(_calc_pow(*args))
+        if node.func.id in ("ldexp",) and len(args) == 2 and abs(args[1]) > 4000:
+            raise ValueError("Result too large")
+        return _calc_check(getattr(math, node.func.id)(*args))
+    if isinstance(node, ast.Name) and node.id in ("pi", "e", "tau", "inf"):
         return getattr(math, node.id)
-    raise ValueError("Unsupported expression")
+    raise ValueError("Unsupported expression (numbers, + - * / // % **, parentheses and math functions only)")
 
 
 async def _tool_calc(ctx: NodeContext) -> BaseTool:
     def calculator(expression: str) -> str:
         """Evaluate a math expression, e.g. '2 * (3 + 4) / sqrt(16)'."""
         try:
+            if len(expression or "") > 2000:
+                return "Error: expression too long"
             return str(_calc(ast.parse(expression, mode="eval")))
         except Exception as e:  # noqa: BLE001
             return f"Error: {e}"
@@ -462,12 +541,36 @@ register(NodeType(
 async def _tool_mcp(ctx: NodeContext) -> list[BaseTool]:
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
+    from ..netguard import BlockedURL, check_url
+
     p = ctx.params()
+    url = str(p.get("url") or "").strip()
+    if not url:
+        raise NodeError("MCP Client Tool: set the Server URL (e.g. https://example.com/mcp)", ctx.name)
+    try:
+        await check_url(url)
+    except BlockedURL as e:
+        raise NodeError(f"MCP Client Tool: {e}", ctx.name) from e
     headers = {h["key"]: h.get("value", "") for h in p.get("headers") or [] if h.get("key")}
-    conn: dict = {"url": p["url"], "transport": p.get("transport", "streamable_http")}
+    transport = p.get("transport") or "streamable_http"
+
+    def factory(headers=None, timeout=None, auth=None):
+        return guarded_client(headers=headers, timeout=timeout or httpx.Timeout(30, read=300), auth=auth,
+                              follow_redirects=True)
+
+    conn: dict = {"url": url, "transport": transport, "timeout": 30, "sse_read_timeout": 300,
+                  "httpx_client_factory": factory}
     if headers:
         conn["headers"] = headers
-    tools = await MultiServerMCPClient({"server": conn}).get_tools()
+    try:
+        tools = await asyncio.wait_for(MultiServerMCPClient({"server": conn}).get_tools(), 45)
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        raise NodeError(f"MCP Client Tool: no answer from {url} within 45s", ctx.name) from e
+    except Exception as e:  # noqa: BLE001 - ExceptionGroups from the MCP SDK hide the real cause
+        inner = e
+        while isinstance(inner, BaseExceptionGroup) and inner.exceptions:
+            inner = inner.exceptions[0]
+        raise NodeError(f"MCP Client Tool: could not list tools from {url}: {type(inner).__name__}: {inner}", ctx.name) from e
     include = {t.strip() for t in (p.get("include") or "").split(",") if t.strip()}
     return [t for t in tools if not include or t.name in include]
 
@@ -509,6 +612,15 @@ def _json_schema(fields: list[dict]) -> dict | None:
     return {"title": "Output", "type": "object", "properties": props, "required": required}
 
 
+def _check_structured(value: Any, schema: dict, node: str) -> Any:
+    """Models don't always honour the schema: refuse an answer that lacks a required field."""
+    if isinstance(value, dict):
+        missing = [k for k in schema.get("required", []) if value.get(k) is None]
+        if missing:
+            raise NodeError(f"The model's structured output is missing required field(s): {', '.join(missing)}", node)
+    return value
+
+
 def state_history(msgs: Any) -> list[BaseMessage]:
     """Chat messages kept in graph state ({role, content}) as LangChain messages."""
     kinds = {"human": HumanMessage, "user": HumanMessage, "ai": AIMessage, "assistant": AIMessage, "system": SystemMessage}
@@ -519,6 +631,41 @@ def state_history(msgs: Any) -> list[BaseMessage]:
     return out
 
 
+def _blank(v) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip()) or v == [] or v == {}
+
+
+def _tool_errors_to_model():
+    """Agent middleware: a tool that raises returns its error to the model (which can retry or explain)
+    instead of failing the whole node. Interrupts (approvals) and cancellation still propagate."""
+    from langchain.agents.middleware import AgentMiddleware
+    from langgraph.errors import GraphBubbleUp
+
+    def _msg(request, e: Exception) -> ToolMessage:
+        tc = request.tool_call
+        return ToolMessage(content=f"Error: {type(e).__name__}: {e}"[:4000], tool_call_id=tc.get("id") or "",
+                           name=tc.get("name"), status="error")
+
+    class ToolErrors(AgentMiddleware):
+        def wrap_tool_call(self, request, handler):
+            try:
+                return handler(request)
+            except GraphBubbleUp:
+                raise
+            except Exception as e:  # noqa: BLE001
+                return _msg(request, e)
+
+        async def awrap_tool_call(self, request, handler):
+            try:
+                return await handler(request)
+            except GraphBubbleUp:
+                raise
+            except Exception as e:  # noqa: BLE001
+                return _msg(request, e)
+
+    return ToolErrors()
+
+
 async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_iterations: int = 10,
                     output_fields: list | None = None, memory=None, state_messages: str | None = None) -> dict:
     """`state_messages`: a graph-state key holding the conversation (LangGraph's MessagesState):
@@ -526,7 +673,8 @@ async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_i
     model = await ctx.require_model(i)
     tools = await collect_tools(ctx, i)
     schema = _json_schema(output_fields or [])
-    agent = create_agent(model, tools, system_prompt=system or None, response_format=schema)
+    agent = create_agent(model, tools, system_prompt=system or None, response_format=schema,
+                         middleware=[_tool_errors_to_model()] if tools else ())
     history = []
     if memory:  # logged like n8n: the memory node shows what it loaded and saved
         step = ctx.start_sub_run(memory, "memory", "load", {"action": "loadMemoryVariables", "session_key": memory.session_key,
@@ -538,9 +686,20 @@ async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_i
     config: dict = {"recursion_limit": max_iterations * 2 + 1}
     if cbs := ctx.callbacks():  # empty for sub-agents: they inherit the parent's handlers
         config["callbacks"] = cbs
-    result = await agent.ainvoke({"messages": [*history, HumanMessage(prompt)]}, config=config)
+    from langgraph.errors import GraphRecursionError
+
+    try:
+        result = await agent.ainvoke({"messages": [*history, HumanMessage(prompt)]}, config=config)
+    except GraphRecursionError as e:
+        raise NodeError(f"The agent used all {max_iterations} tool iterations without reaching a final answer. "
+                        "Raise 'Max tool iterations', or make the prompt / tool descriptions more specific.", ctx.name) from e
     messages = result["messages"]
     answer = message_text(messages[-1]) if messages else ""
+    last = messages[-1] if messages else None
+    if result.get("structured_response") is None and (
+            last is None or (isinstance(last, AIMessage) and not str(answer).strip() and not last.tool_calls)):
+        raise NodeError("The model returned an empty response. Check the model name, the credential and its base URL "
+                        "(a server that doesn't speak this provider's API answers with nothing usable).", ctx.name)
     steps = []
     by_id = {m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)}
     for m in messages:
@@ -561,7 +720,8 @@ async def run_agent(ctx: NodeContext, i: int, prompt: str, system: str, *, max_i
     out: dict = {"output": answer}
     if schema and result.get("structured_response") is not None:
         sr = result["structured_response"]
-        out["output"] = sr if isinstance(sr, dict) else getattr(sr, "model_dump", lambda: sr)()
+        out["output"] = _check_structured(sr if isinstance(sr, dict) else getattr(sr, "model_dump", lambda: sr)(),
+                                          schema, ctx.name)
     if steps:
         out["steps"] = steps
     return out
@@ -572,7 +732,7 @@ async def _agent(ctx: NodeContext):
     for i, item in enumerate(ctx.items or [{}]):
         p = ctx.params(i)
         prompt = p.get("prompt")
-        if not prompt:
+        if _blank(prompt):  # 0 / False are valid prompts
             raise NodeError("Prompt is empty. Map it from the input, e.g. {{ $json.message }}")
         memories = await ctx.supply("ai_memory", i)
         res = await run_agent(ctx, i, str(prompt), p.get("system_message") or "",
@@ -645,6 +805,8 @@ async def _chain(ctx: NodeContext):
     out = []
     for i, item in enumerate(ctx.items or [{}]):
         p = ctx.params(i)
+        if _blank(p.get("prompt")):
+            raise NodeError("Prompt is empty. Map it from the input, e.g. {{ $json.message }}", ctx.name)
         model = await ctx.require_model(i)
         memories = await ctx.supply("ai_memory", i)
         memory = memories[0] if memories else None
@@ -653,14 +815,17 @@ async def _chain(ctx: NodeContext):
             msgs.append(SystemMessage(p["system_message"]))
         if memory:
             msgs.extend(await memory.load())
-        msgs.append(HumanMessage(str(p.get("prompt") or "")))
+        msgs.append(HumanMessage(str(p.get("prompt"))))
         schema = _json_schema(ctx.raw_params.get("output_fields")) if p.get("structured") else None
         if schema:
             res = await model.with_structured_output(schema).ainvoke(msgs, config={"callbacks": ctx.callbacks()})
-            answer: Any = res
+            answer: Any = _check_structured(res, schema, ctx.name)
         else:
             res = await model.ainvoke(msgs, config={"callbacks": ctx.callbacks()})
             answer = message_text(res)
+            if not str(answer).strip() and not getattr(res, "tool_calls", None):
+                raise NodeError("The model returned an empty response. Check the model name, the credential and its "
+                                "base URL.", ctx.name)
         if memory:
             await memory.save(str(p.get("prompt")), answer if isinstance(answer, str) else json.dumps(answer))
         out.append({"output": answer})

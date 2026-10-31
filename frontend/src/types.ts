@@ -109,6 +109,25 @@ export interface Workflow {
   owner_name?: string | null;
   node_count?: number;
   trigger_types?: string[];
+  /** Draft / publish (n8n): production runs the published version; editor changes stay in the draft. */
+  published_version_id?: string | null;
+  published_version?: number | null;
+  has_unpublished_changes?: boolean;
+  /** Bumped by the server on every save: sent back with a save to detect edits from another tab / session. */
+  revision?: number;
+}
+
+export interface WorkflowVersion {
+  id: string;
+  number: number;
+  note: string | null;
+  created_at: string;
+  author: string | null;
+  node_count: number;
+  /** What production runs now. */
+  published: boolean;
+  nodes?: WFNode[];
+  edges?: WFEdge[];
 }
 
 export interface LlmMessage {

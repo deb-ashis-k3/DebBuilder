@@ -67,6 +67,27 @@ user (uid 10001). Voice models are baked in; the root filesystem can be read-onl
 credentials can't be decrypted without it. Set `PUBLIC_BASE_URL` to the public https URL and `FORWARDED_ALLOW_IPS`
 to your proxy (`*` inside Kubernetes).
 
+**Limits and protections** (environment variables, defaults in brackets):
+- `MAX_CONNECTIONS` [0 = automatic: 400 on Windows, 2000 elsewhere]: open connections per process. Beyond it a new
+  connection is answered `503` and closed instead of being queued (on Windows the event loop can't watch more than
+  ~500 sockets; the server used to crash past that).
+- `MAX_REQUEST_BODY_MB` [16]: largest request body (webhooks, imports, forms, saves). Larger ones get `413`, also
+  when streamed without a `Content-Length`.
+- `MAX_CONCURRENT_EXECUTIONS` [200] and `MAX_QUEUED_EXECUTIONS` [5000]: executions running at once, and waiting for a
+  slot. Past the queue limit, webhooks, forms and chat answer `503` with `Retry-After` instead of queueing in memory.
+- `CODE_TIMEOUT_SECONDS` [60] and `CODE_MEMORY_MB` [512]: wall-clock time and memory of each Code node run (every language).
+- `DB_POOL_SIZE` [10] and `DB_MAX_OVERFLOW` [10]: database connections per process (the LangGraph checkpointer adds up to 10
+  more, plus 2–3 for leader election and change notifications). Keep replicas × (pool + overflow + 13) below Postgres
+  `max_connections` (100 by default), or put PgBouncer (transaction mode) in front.
+- **Outbound requests** (HTTP Request node, import from URL, credential tests, model lists, OAuth2 token endpoints):
+  only `http(s)`, and private, loopback and link-local addresses (`10.x`, `192.168.x`, `127.0.0.1`, `localhost`, …)
+  are refused, redirects included, so a workflow can't be used to reach internal services. Cloud metadata addresses
+  (`169.254.169.254`, …) are always refused. **Workflows that call services on your own network now need**
+  `OUTBOUND_ALLOW_PRIVATE=true` (allow every private address) or `OUTBOUND_ALLOWED_HOSTS` (a comma-separated list of
+  host names or CIDRs, e.g. `localhost,ollama.internal,10.0.5.0/24`). That includes a local Ollama (`localhost:11434`).
+- `ALLOW_SIGNUP` [false]: self-registration from the sign-in page (see Security).
+- A warning is printed at startup when the server listens on a network address while `PUBLIC_BASE_URL` isn't https.
+
 **Probes:** `GET /api/health` (liveness: the process answers) and `GET /api/ready` (readiness: database reachable; also
 reports this replica's id and whether it is the leader).
 
@@ -89,7 +110,7 @@ reports this replica's id and whether it is the leader).
   the webhook route table is rebuilt single-flight after a change (a burst can't stampede the database).
 - **Sizing:** throughput scales with replicas (each is one process; the engine is CPU-bound). On Linux the image uses
   uvloop + httptools. Budget connections: replicas × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW` + 13) < Postgres
-  `max_connections`, or put PgBouncer (transaction mode) in front. Webhooks that don't need the workflow's result
+  `max_connections` (with the defaults 10 + 10: up to 3 replicas on a stock Postgres), or put PgBouncer (transaction mode) in front. Webhooks that don't need the workflow's result
   should respond immediately, so callers don't hold connections open while it runs.
 
 **Several replicas** share one PostgreSQL:
@@ -128,7 +149,7 @@ Each workflow is stored as JSON (`nodes`, `edges`) and compiled into a `langgrap
   - Tools: HTTP Request tool, Python Code tool, Call Workflow tool, **AI Agent tool (multi-agent / supervisor patterns)**, MCP client (remote MCP servers), Web search (Tavily), Wikipedia, Calculator, Date & Time.
 - **Voice (LiveKit)**: Voice Agent trigger (STT: OpenAI/Deepgram; TTS: OpenAI/Cartesia/ElevenLabs/Deepgram; Silero VAD; barge-in; token streaming to TTS), Make Phone Call (outbound SIP, like Vapi outbound), Create Voice Session (room + token for any LiveKit client).
 - **WhatsApp**: send text, media, reply buttons, list menus, templates, location, reactions; mark read + typing indicator; get media URL; list/create templates; phone numbers; business profile. Webhook verification and `X-Hub-Signature-256` checking.
-- **Core / Flow / Data**: HTTP Request, Code (Python in-process; JavaScript, TypeScript, Bash, PowerShell, Perl, Java, Ruby, PHP, Go or any language via a custom command as a subprocess; see `backend/app/nodes/code_runtimes.py`), Edit Fields (Set), If, Filter, Switch, Merge, Loop Over Items, Wait, Human Approval, Execute Workflow, Respond to Webhook, Stop and Error, No-op, Split Out, Aggregate, Limit, Sort, Remove Duplicates, Date & Time, Postgres (parameterised SQL), Slack, Telegram, Email (SMTP), Sticky Note.
+- **Core / Flow / Data**: HTTP Request, Code (Python in a sandboxed worker process; JavaScript, TypeScript, Bash, PowerShell, Perl, Java, Ruby, PHP, Go or any language via a custom command as a subprocess; see `backend/app/nodes/code_runtimes.py`), Edit Fields (Set), If, Filter, Switch, Merge, Loop Over Items, Wait, Human Approval, Execute Workflow, Respond to Webhook, Stop and Error, No-op, Split Out, Aggregate, Limit, Sort, Remove Duplicates, Date & Time, Postgres (parameterised SQL), Slack, Telegram, Email (SMTP), Sticky Note.
 
 ### RAG (embeddings, vector stores, retrievers)
 
@@ -289,9 +310,11 @@ To point the editor at an API on another port: `BACKEND_URL=http://localhost:800
 
 Every request is checked by `backend/app/security.py` against one route policy table; routes not listed are **denied**.
 
-- **Accounts:** the sign-in page always comes first, with a **Sign up** link.
+- **Accounts:** the sign-in page always comes first.
   - On a new installation, the first sign-up (from the server itself) creates the **owner**.
-  - After that, sign-up creates an **editor** with their own empty workspace. Set `ALLOW_SIGNUP=false` in `backend/.env` to make accounts admin-invite only.
+  - After that, accounts are **admin-invite only** by default (*Settings → Users*): `GET /api/auth/status` reports
+    `signup_enabled: false` and `POST /api/auth/signup` answers 403. Set `ALLOW_SIGNUP=true` to offer **Sign up** on
+    the sign-in page; each sign-up then creates an **editor** with their own empty workspace.
   - Either way the account is created only after the emailed code is entered. Signing up with an address that already has an account looks the same as a new one; only the mailbox owner (who gets the code) is told.
   - Admins can also add users from *Settings → Users*. Those users get a temporary password and must set their own at first sign-in.
 - **Sign in with email or username:** a username is optional (3–32 characters: letters, digits, `.` `_` `-`, starting with a letter; case-insensitive and unique). Users set it in *Settings → Account*; admins can set it for anyone.
@@ -313,7 +336,9 @@ Every request is checked by `backend/app/security.py` against one route policy t
   - 12 h idle and 7 day maximum lifetime;
   - you can see and revoke your sessions;
   - changing your password, or an admin changing your role or disabling you, signs out your other sessions.
-- **CSRF:** state-changing browser requests need the double-submit `X-CSRF-Token` and an allowed `Origin`.
+- **CSRF:** state-changing browser requests need the double-submit `X-CSRF-Token` and an allowed `Origin` (or, when a
+  browser leaves `Origin` out, an allowed `Referer`; a cookie-authenticated request with neither is refused). API-key
+  requests don't use cookies and aren't affected.
 - **API keys** (*Settings → Account*): `X-API-Key: dbk_…` or `Authorization: Bearer dbk_…`. Each key is shown once, stored hashed, expires, and is capped at its creator's role.
 - **Roles:**
 
@@ -327,18 +352,23 @@ Every request is checked by `backend/app/security.py` against one route policy t
 - **Per-user workspaces:** workflows, folders, credentials and executions belong to the user who created them (`owner_id`, see `backend/app/access.py`).
   - **Every role**, including admin and owner, sees and changes only their own; anyone else's answers 404. Roles control what you may do, never whose data you see.
   - At run time a workflow can only use **its owner's** credentials and call its owner's workflows (Execute Workflow, Call Workflow tool, error workflow), so pasting someone else's credential id doesn't work.
-  - Deleting a user transfers their workspace to the admin who deletes them; active workflows keep running.
+  - Deleting a user deletes their workspace with the account (workflows with their executions and versions, folders,
+    credentials). To keep it, the admin names a recipient explicitly: `DELETE /api/users/{id}?transfer_to=<user id>`
+    hands everything to that user (their active workflows keep running under the new owner).
   - Upgrading an existing database assigns all existing workflows, folders and credentials to the first owner.
 
 - **Public routes:**
-  - `/webhook/*` (active workflows only);
-  - `/form/*`;
-  - `/api/chat/*` only when the Chat Trigger is marked public;
+  - `/webhook/*` (the published version of active workflows only). One method + path belongs to one active workflow:
+    publishing or activating a workflow whose webhook path another active workflow already uses is refused (409);
+  - `/form/*` (active, published workflows only);
+  - `/api/chat/*` only for an active, published workflow whose Chat Trigger is marked public (the owner can always
+    chat with their own workflow; the editor's chat panel tests the draft);
   - WhatsApp (verified by Meta signature/token), OAuth callback (signed state), voice worker (`INTERNAL_TOKEN`).
 
-  `/webhook-test/*`, WebSockets and the API docs require sign-in.
+  `/webhook-test/*` runs a draft and answers only the signed-in **owner** of that workflow (404 for everyone else);
+  WebSockets and the API docs require sign-in.
 - **Audit log** (*Settings → Audit log*): sign-ins, failures, lockouts, 2FA, keys, user changes, denied requests and every data change. Request bodies are never stored.
-- **Headers:** `nosniff`, `X-Frame-Options: DENY`, CSP on the UI, HSTS on https, `Cache-Control: no-store` on the API.
+- **Headers:** `nosniff`, `X-Frame-Options: DENY`, CSP on the UI and the hosted forms, HSTS on https, `Cache-Control: no-store` on the API.
 
 **Locked out?** From a shell on the server (in `backend/`): `uv run python -m app.cli list-users`, `uv run python -m app.cli reset-password you@example.com` (prints a temporary password) or `uv run python -m app.cli disable-mfa you@example.com`. These need access to the machine, are audited, and sign the user out everywhere.
 
@@ -347,7 +377,7 @@ Every request is checked by `backend/app/security.py` against one route policy t
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/node-types` | Node catalogue (drives the editor) |
-| `CRUD /api/workflows`, `POST /api/workflows/{id}/run` | Workflows; run (optionally with an unsaved graph) |
+| `CRUD /api/workflows`, `POST /api/workflows/{id}/run` | Workflows; run (optionally with an unsaved graph). `PUT` accepts the `revision` it loaded and answers 409 `{"detail": {"code": "conflict", "workflow": …}}` if another tab saved since |
 | `GET /api/executions`, `/{id}`, `POST /{id}/resume`, `/{id}/cancel`, `/{id}/retry` | Execution history and control |
 | `POST /api/chat/{workflow_id}` `{message, session_id, wait}` | Chat with a workflow (enable *public* on the Chat Trigger for external use) |
 | `ANY /webhook/{path}` | Production webhooks (active workflows) |
@@ -361,5 +391,5 @@ Every request is checked by `backend/app/security.py` against one route policy t
 - Per-workflow sharing and projects: access is by role across the whole instance (see Security).
 - The several hundred SaaS integration nodes. Use HTTP Request, the MCP tool or a custom node.
 - Vector-store / RAG nodes. The local Postgres has no `pgvector`; install it to add PGVector nodes.
-- Binary data (files). The Code node runs in-process Python, as n8n's does, so treat workflow editors as trusted.
+- Binary data (files). The Code node (and Code Tool) runs Python out of process, in a pool of warm sandbox workers (`backend/app/nodes/sandbox.py`): wall-clock limit `CODE_TIMEOUT_SECONDS`, memory cap `CODE_MEMORY_MB`, a minimal environment without the server's secrets (`ENCRYPTION_KEY`, `DATABASE_URL`, ...), no access to the app's modules or database, no file writes, subprocesses or ctypes, and no private / metadata network addresses. Workers are never shared between users. The other languages run as subprocesses with the same environment, timeout and memory limits. This is defence in depth rather than a hard jail: for untrusted editors, also run the backend in a container or as a low-privilege OS user.
 - Queue mode / horizontal workers. Executions run in the API process, and the live event bus is in-memory.

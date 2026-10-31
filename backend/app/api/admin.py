@@ -3,12 +3,12 @@
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import delete, desc, func, select, update
 
 from ..db import AuditLog, Credential, Folder, SessionLocal, User, Workflow
-from ..security import (ROLES, audit, check_password_policy, clean_username, current, hash_password, revoke_sessions, role_rank,
+from ..security import (ROLES, audit, check_password_policy, clean_username, current, hash_password_async, revoke_sessions, role_rank,
                         temp_password)
 from .auth import ensure_username_free, user_json
 from .. import cluster
@@ -67,7 +67,7 @@ async def create_user(body: NewUser, request: Request):
         if (await s.execute(select(User).where(User.email == email))).scalar_one_or_none():
             raise HTTPException(409, "A user with that email already exists")
         await ensure_username_free(s, username)
-        u = User(email=email, username=username, name=body.name.strip()[:200], role=body.role, password_hash=hash_password(pw),
+        u = User(email=email, username=username, name=body.name.strip()[:200], role=body.role, password_hash=await hash_password_async(pw),
                  must_change_password=True)
         s.add(u)
         await s.commit()
@@ -130,7 +130,7 @@ async def reset_password(user_id: str, request: Request):
             raise HTTPException(404, "User not found")
         if not _can_manage(p.role, u.role):
             raise HTTPException(403, "Only the owner can reset an owner's password")
-        u.password_hash, u.must_change_password, u.failed_logins, u.locked_until = hash_password(pw), True, 0, None
+        u.password_hash, u.must_change_password, u.failed_logins, u.locked_until = await hash_password_async(pw), True, 0, None
         await s.commit()
     await revoke_sessions(u.id)
     await audit("user.password_reset", request, p, status=200, target=u.email)
@@ -166,7 +166,10 @@ async def revoke_user_sessions(user_id: str, request: Request):
 
 
 @router.delete("/users/{user_id}")
-async def delete_user(user_id: str, request: Request):
+async def delete_user(user_id: str, request: Request, transfer_to: str | None = None):
+    """Delete an account. Every user's workspace is private (nobody else, admins included, can see it), so by
+    default their workflows (with executions and versions), folders and credentials are deleted with them.
+    `?transfer_to=<user id>` hands the whole workspace to that user instead, explicitly."""
     p = current(request)
     async with SessionLocal() as s:
         u = await s.get(User, _uid(user_id))
@@ -178,23 +181,39 @@ async def delete_user(user_id: str, request: Request):
             raise HTTPException(403, "Only the owner can delete an owner")
         if u.role == "owner" and await _owner_count(s) <= 1:
             raise HTTPException(400, "The last owner can't be deleted")
+        heir = None
+        if transfer_to:
+            try:
+                heir = await s.get(User, uuid.UUID(transfer_to))
+            except ValueError:
+                heir = None
+            if not heir or heir.id == u.id:
+                raise HTTPException(400, "transfer_to must be another existing user")
+            if heir.disabled:
+                raise HTTPException(400, "Can't transfer a workspace to a disabled user")
         email = u.email
-        # Their workspace (workflows, folders, credentials) moves to the admin deleting them, so
-        # active workflows keep running with the same credentials.
-        moved = {}
+        counts = {}
         for model in (Workflow, Folder, Credential):
-            res = await s.execute(update(model).where(model.owner_id == u.id).values(owner_id=p.user.id))
-            moved[model.__tablename__] = res.rowcount
+            if heir:
+                res = await s.execute(update(model).where(model.owner_id == u.id).values(owner_id=heir.id))
+            else:  # executions, versions, stats and static data go with their workflow (ON DELETE CASCADE)
+                res = await s.execute(delete(model).where(model.owner_id == u.id))
+            counts[model.__tablename__] = res.rowcount
         await s.delete(u)
         await s.commit()
-    cluster.users_changed()  # cached webhook routes and running triggers carry the owner
-    await audit("user.deleted", request, p, status=200, target=email, transferred_to=p.user.email, **moved)
-    return {"ok": True, "transferred": moved}
+    # Every replica drops cached webhook routes and credentials; the leader reloads triggers, schedules and
+    # listeners from the database, so deleted workflows stop and transferred ones run under their new owner.
+    cluster.users_changed()
+    if heir:
+        await audit("user.deleted", request, p, status=200, target=email, transferred_to=heir.email, **counts)
+        return {"ok": True, "transferred_to": str(heir.id), "transferred": counts}
+    await audit("user.deleted", request, p, status=200, target=email, data="deleted", **counts)
+    return {"ok": True, "deleted": counts}
 
 
 @router.get("/audit")
 async def audit_log(user: str | None = None, action: str | None = None, since: datetime | None = None,
-                    limit: int = 100, offset: int = 0):
+                    limit: int = Query(100, ge=1), offset: int = Query(0, ge=0)):
     q = select(AuditLog)
     cq = select(func.count(AuditLog.id))
     conds = []

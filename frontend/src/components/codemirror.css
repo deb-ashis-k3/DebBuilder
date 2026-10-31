@@ -1,0 +1,88 @@
+/* CodeMirror: VS Code look. Dark+ token colours on every dark theme (Slate dark, Rose, Aqua), on that theme's own
+   background; Light+ only in the light theme. */
+.cm-host { --cm-bg: color-mix(in srgb, var(--bg) 82%, #000 18%); --cm-gutter: var(--cm-bg); --cm-line: #ffffff0d;
+  --cm-num: #6e7681; --cm-num-active: #cccccc; --cm-sel: #264f78; --cm-match: #ffffff20; --cm-cursor: #aeafad;
+  --tk-kw: #569cd6; --tk-ctl: #c586c0; --tk-str: #ce9178; --tk-num: #b5cea8; --tk-com: #6a9955; --tk-fn: #dcdcaa;
+  --tk-type: #4ec9b0; --tk-var: #9cdcfe; --tk-prop: #9cdcfe; --tk-op: #d4d4d4; --tk-bool: #569cd6; --tk-meta: #d7ba7d; --tk-tag: #569cd6; --tk-attr: #9cdcfe;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--cm-bg); position: relative; }
+:root[data-theme="light"] .cm-host { --cm-bg: #ffffff; --cm-gutter: #ffffff; --cm-line: #0000000a; --cm-num: #9a9a9a; --cm-num-active: #3b3b3b;
+  --cm-sel: #add6ff; --cm-match: #a8ac9480; --cm-cursor: #000;
+  --tk-kw: #0000ff; --tk-ctl: #af00db; --tk-str: #a31515; --tk-num: #098658; --tk-com: #008000; --tk-fn: #795e26;
+  --tk-type: #267f99; --tk-var: #001080; --tk-prop: #001080; --tk-op: #000000; --tk-bool: #0000ff; --tk-meta: #800000; --tk-tag: #800000; --tk-attr: #e50000; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) .cm-host, :root[data-theme="system"] .cm-host { --cm-bg: #ffffff; --cm-gutter: #ffffff; --cm-line: #0000000a; --cm-num: #9a9a9a; --cm-num-active: #3b3b3b;
+    --cm-sel: #add6ff; --cm-match: #a8ac9480; --cm-cursor: #000;
+    --tk-kw: #0000ff; --tk-ctl: #af00db; --tk-str: #a31515; --tk-num: #098658; --tk-com: #008000; --tk-fn: #795e26;
+    --tk-type: #267f99; --tk-var: #001080; --tk-prop: #001080; --tk-op: #000000; --tk-bool: #0000ff; --tk-meta: #800000; --tk-tag: #800000; --tk-attr: #e50000; }
+}
+
+.cm-host:focus-within { border-color: rgb(var(--accent-rgb)); box-shadow: 0 0 0 3px rgb(var(--accent-rgb) / .18); }
+.cm-host .cm-editor { height: 100%; background: var(--cm-bg); color: var(--tk-op); font-size: 13px; }
+.cm-host .cm-editor.cm-focused { outline: none; }
+.cm-host .cm-scroller { font-family: var(--mono); line-height: 1.6; }
+.cm-host .cm-content { caret-color: var(--cm-cursor); padding: 6px 0; }
+.cm-host .cm-cursor { border-left: 2px solid var(--cm-cursor); }
+.cm-host .cm-gutters { background: var(--cm-gutter); color: var(--cm-num); border-right: 0; }
+.cm-host .cm-lineNumbers .cm-gutterElement { padding: 0 10px 0 14px; min-width: 32px; }
+.cm-host .cm-activeLineGutter { background: transparent; color: var(--cm-num-active); }
+.cm-host .cm-activeLine { background: var(--cm-line); }
+.cm-host .cm-selectionBackground, .cm-host .cm-focused .cm-selectionBackground, .cm-host .cm-content ::selection { background: var(--cm-sel) !important; }
+.cm-host .cm-selectionMatch { background: var(--cm-match); }
+.cm-host .cm-matchingBracket { background: transparent; outline: 1px solid var(--cm-num); }
+.cm-host .cm-foldGutter .cm-gutterElement { color: var(--cm-num); cursor: pointer; padding: 0 4px; }
+.cm-host .cm-foldPlaceholder { background: var(--cm-line); border: 1px solid var(--border); color: var(--cm-num); }
+.cm-host .cm-tooltip { background: var(--surface, var(--bg)); border: 1px solid var(--border); border-radius: 6px; color: var(--text); }
+.cm-host .cm-tooltip-autocomplete ul li[aria-selected] { background: rgb(var(--accent-rgb) / .25); color: var(--text); }
+.cm-host .cm-panels { background: var(--surface-2, var(--bg)); color: var(--text); border-color: var(--border); }
+.cm-host .cm-panel.cm-search input, .cm-host .cm-panel.cm-search button { font: inherit; font-size: 12px; }
+.cm-host .cm-lintRange-error { background-image: none; text-decoration: underline wavy #f14c4c; text-underline-offset: 3px; }
+.cm-host .cm-lint-marker-error { content: none; }
+.cm-host .cm-diagnostic-error { border-left-color: #f14c4c; }
+
+/* tokens */
+.cm-host .tok-keyword { color: var(--tk-ctl); }
+.cm-host .tok-definitionKeyword, .cm-host .tok-modifier, .cm-host .tok-self, .cm-host .tok-null { color: var(--tk-kw); }
+.cm-host .tok-bool, .cm-host .tok-atom { color: var(--tk-bool); }
+.cm-host .tok-string, .cm-host .tok-string2 { color: var(--tk-str); }
+.cm-host .tok-number, .cm-host .tok-literal { color: var(--tk-num); }
+.cm-host .tok-comment { color: var(--tk-com); font-style: italic; }
+.cm-host .tok-variableName { color: var(--tk-var); }
+.cm-host .tok-variableName.tok-definition, .cm-host .tok-function { color: var(--tk-fn); }
+.cm-host .tok-propertyName { color: var(--tk-prop); }
+.cm-host .tok-typeName, .cm-host .tok-className, .cm-host .tok-namespace { color: var(--tk-type); }
+.cm-host .tok-operator, .cm-host .tok-punctuation { color: var(--tk-op); }
+.cm-host .tok-meta, .cm-host .tok-macroName { color: var(--tk-meta); }
+.cm-host .tok-tagName { color: var(--tk-tag); }
+.cm-host .tok-attributeName { color: var(--tk-attr); }
+.cm-host .tok-heading { font-weight: bold; color: var(--tk-kw); }
+.cm-host .tok-invalid { color: #f14c4c; }
+
+/* code field in the node panel */
+.code-editor { height: var(--cm-h, 280px); min-height: 90px; max-height: 80vh; resize: vertical; }
+/* maximised: moved to <body> (see CodeEditor), above the node panel and its sticky toolbars */
+.code-editor-max { position: fixed; inset: 24px; z-index: 1000; display: flex; flex-direction: column; box-shadow: 0 20px 60px #0009; }
+.code-editor-max-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 14px; background: var(--cm-gutter); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--cm-num-active); }
+.code-editor-max-head .spacer { flex: 1; }
+.code-editor-max-head kbd { font-family: var(--mono); font-size: 11px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; color: var(--cm-num); }
+.code-editor-max-body { flex: 1; min-height: 0; }
+.code-editor-tools { position: absolute; top: 4px; right: 6px; z-index: 6; display: flex; gap: 2px; opacity: 0; transition: opacity .15s; }
+.code-editor:hover .code-editor-tools, .code-editor:focus-within .code-editor-tools { opacity: 1; }
+.code-editor-tools .btn { background: var(--surface-2, var(--bg)); }
+.code-editor-backdrop { position: fixed; inset: 0; z-index: 999; background: #0008; }
+.code-editor.readonly { opacity: .9; }
+
+/* side-by-side diff (version compare): VS Code colours */
+.cm-host.diff { --cm-del: #ff000026; --cm-del-strong: #ff00004d; --cm-add: #9bb95533; --cm-add-strong: #9bb95566; }
+.cm-host.diff .cm-mergeView { height: 100%; }
+.cm-host.diff .cm-mergeViewEditors { min-height: 100%; }
+.cm-host.diff .cm-mergeViewEditor + .cm-mergeViewEditor { border-left: 1px solid var(--border); }
+.cm-host.diff .cm-changedLine { background: transparent; }
+.cm-host.diff .cm-merge-a .cm-changedLine, .cm-host.diff .cm-deletedChunk { background: var(--cm-del) !important; }
+.cm-host.diff .cm-merge-b .cm-changedLine, .cm-host.diff .cm-inlineChangedLine { background: var(--cm-add) !important; }
+.cm-host.diff .cm-merge-a .cm-changedText, .cm-host.diff .cm-deletedChunk .cm-deletedText { background: var(--cm-del-strong) !important; text-decoration: none; }
+.cm-host.diff .cm-merge-b .cm-changedText { background: var(--cm-add-strong) !important; text-decoration: none; }
+.cm-host.diff .cm-merge-a .cm-changedLineGutter { background: #f14c4c; }
+.cm-host.diff .cm-merge-b .cm-changedLineGutter { background: #2ea043; }
+.cm-host.diff .cm-collapsedLines { background: var(--cm-gutter); color: var(--cm-num); font-size: 12px; padding: 3px 12px; cursor: pointer; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.cm-host.diff .cm-collapsedLines::before, .cm-host.diff .cm-collapsedLines::after { content: none; }
+.code-editor-placeholder { height: 100%; display: grid; place-items: center; color: var(--cm-num); font-size: 12px; }

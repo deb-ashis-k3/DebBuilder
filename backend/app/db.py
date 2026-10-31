@@ -1,7 +1,9 @@
+import json
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, func, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, event, func, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -151,6 +153,27 @@ class Workflow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=utcnow
     )
+    # Draft / publish: production (triggers, webhooks, schedules) runs the published version; the editor edits
+    # `nodes` / `edges` (the draft). The published graph is copied here so production lookups need no join.
+    published_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    published_version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    published_hash: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    published_nodes: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    published_edges: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # graph_hash of the draft, kept current on every save (see _draft_hash_on_update), so lists can tell "unpublished
+    # changes" without loading and hashing every graph.
+    draft_hash: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Bumped on every save: the editor sends the revision it loaded and gets 409 if another tab saved since.
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+    @property
+    def live_nodes(self) -> list:
+        """What production runs: the published graph, or the draft if it was never published."""
+        return (self.published_nodes or []) if self.published_version_id else (self.nodes or [])
+
+    @property
+    def live_edges(self) -> list:
+        return (self.published_edges or []) if self.published_version_id else (self.edges or [])
 
 
 class Credential(Base):
@@ -193,6 +216,37 @@ class Execution(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+@event.listens_for(Workflow, "before_insert")
+def _draft_hash_on_insert(mapper, connection, target: Workflow) -> None:
+    target.draft_hash = graph_hash(target.nodes or [], target.edges or [])
+
+
+@event.listens_for(Workflow, "before_update")
+def _draft_hash_on_update(mapper, connection, target: Workflow) -> None:
+    state = sa_inspect(target)
+    if "nodes" in state.unloaded or "edges" in state.unloaded:
+        return  # loaded without its graph (load_only), so the graph didn't change here
+    if state.attrs.nodes.history.has_changes() or state.attrs.edges.history.has_changes():
+        target.draft_hash = graph_hash(target.nodes or [], target.edges or [])
+
+
+class WorkflowVersion(Base):
+    """A published (or restorable) snapshot of a workflow's graph: n8n's workflow history. The workflow keeps
+    editing a draft; production runs the version in workflows.published_version_id."""
+
+    __tablename__ = "workflow_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
+    number: Mapped[int] = mapped_column(Integer)
+    nodes: Mapped[list] = mapped_column(JSONB, default=list)
+    edges: Mapped[list] = mapped_column(JSONB, default=list)
+    content_hash: Mapped[str] = mapped_column(String(40))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class WorkflowSnapshot(Base):
@@ -241,6 +295,15 @@ class StaticData(Base):
     value: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
+def graph_hash(nodes: list, edges: list) -> str:
+    """Content of a graph for "unpublished changes": editor-only pinned test data doesn't count."""
+    import hashlib
+
+    clean = [{k: v for k, v in n.items() if k != "pin_data"} for n in nodes or []]
+    raw = json.dumps([clean, edges or []], sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         # Replicas starting together would race to create the same tables: one at a time.
@@ -257,6 +320,48 @@ async def init_db() -> None:
         await conn.execute(text("ALTER TABLE login_challenges ALTER COLUMN user_id DROP NOT NULL"))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_executions_workflow_started ON executions (workflow_id, started_at DESC)"))
+        # Draft / publish (workflow_versions).
+        for col, typ in (("published_version_id", "UUID"), ("published_version_number", "INTEGER"),
+                         ("published_hash", "VARCHAR(40)"), ("published_nodes", "JSONB"), ("published_edges", "JSONB")):
+            await conn.execute(text(f"ALTER TABLE workflows ADD COLUMN IF NOT EXISTS {col} {typ}"))
+        # Workflows active before versions existed keep running exactly what they run now: their draft becomes v1.
+        rows = (await conn.execute(text(
+            "SELECT id, nodes, edges FROM workflows WHERE active AND published_version_id IS NULL"))).all()
+        for wid, nodes, edges in rows:
+            vid = uuid.uuid4()
+            h = graph_hash(nodes or [], edges or [])
+            await conn.execute(text(
+                "INSERT INTO workflow_versions (id, workflow_id, number, nodes, edges, content_hash, note) "
+                "VALUES (:id, :wid, 1, CAST(:n AS JSONB), CAST(:e AS JSONB), :h, 'Published automatically (before version history)')"),
+                {"id": vid, "wid": wid, "n": json.dumps(nodes or []), "e": json.dumps(edges or []), "h": h})
+            await conn.execute(text(
+                "UPDATE workflows SET published_version_id = :vid, published_version_number = 1, published_hash = :h, "
+                "published_nodes = CAST(:n AS JSONB), published_edges = CAST(:e AS JSONB) WHERE id = :wid"),
+                {"vid": vid, "h": h, "n": json.dumps(nodes or []), "e": json.dumps(edges or []), "wid": wid})
+        # Draft hash (fast workflow lists) and revision (conflict detection between tabs).
+        await conn.execute(text("ALTER TABLE workflows ADD COLUMN IF NOT EXISTS draft_hash VARCHAR(40)"))
+        await conn.execute(text("ALTER TABLE workflows ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 0"))
+        while True:  # backfill in batches (rows written before the column existed)
+            rows = (await conn.execute(text(
+                "SELECT id, nodes, edges FROM workflows WHERE draft_hash IS NULL LIMIT 500"))).all()
+            if not rows:
+                break
+            await conn.execute(text("UPDATE workflows SET draft_hash = :h WHERE id = :id"),
+                               [{"id": wid, "h": graph_hash(nodes or [], edges or [])} for wid, nodes, edges in rows])
+        # One number per version of a workflow. Concurrent publishes could once create duplicates: renumber them
+        # (in creation order) before the unique index goes on.
+        dupes = (await conn.execute(text(
+            "SELECT workflow_id FROM workflow_versions GROUP BY workflow_id, number HAVING count(*) > 1"))).scalars().all()
+        if dupes:
+            await conn.execute(text(
+                "UPDATE workflow_versions v SET number = r.rn FROM (SELECT id, row_number() OVER "
+                "(PARTITION BY workflow_id ORDER BY number, created_at, id) AS rn FROM workflow_versions "
+                "WHERE workflow_id = ANY(:ids)) r WHERE v.id = r.id"), {"ids": list(set(dupes))})
+            await conn.execute(text(
+                "UPDATE workflows w SET published_version_number = v.number FROM workflow_versions v "
+                "WHERE w.published_version_id = v.id AND w.published_version_number IS DISTINCT FROM v.number"))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_workflow_versions_number ON workflow_versions (workflow_id, number)"))
         # High-volume execution history (see engine/store.py).
         await conn.execute(text("ALTER TABLE executions ADD COLUMN IF NOT EXISTS snapshot_hash VARCHAR(40)"))
         await conn.execute(text("ALTER TABLE executions ALTER COLUMN workflow_snapshot DROP NOT NULL"))

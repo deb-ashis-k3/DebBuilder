@@ -256,6 +256,9 @@ async def _call_control_tool(ctx: NodeContext) -> BaseTool:
             voice_action(ctx, {"type": "hangup", "message": ""})
             return "The call will end after your reply. Say goodbye now."
         if action == "dtmf":
+            digits = "".join(str(digits or "").split()).upper()
+            if not digits or len(digits) > 64 or any(c not in "0123456789*#ABCD" for c in digits):
+                return "Invalid keypad digits: use 0-9, *, # or A-D (at most 64)."
             voice_action(ctx, {"type": "dtmf", "digits": digits})
             return f"Sending keypad tones {digits} after your reply."
         return "Unknown action: use hangup, transfer or dtmf."

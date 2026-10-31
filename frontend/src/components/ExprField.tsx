@@ -1,10 +1,14 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
-import { Icon } from '../lib'
+import { Icon, useDialog } from '../lib'
 import type { Item } from '../types'
 
 /** What an expression in the open node resolves against: its input items and earlier nodes' outputs (by name). */
-export interface ExprData { workflowId: string; items: Item[]; nodeOutputs: Record<string, Item[]>; nodeNames: string[] }
+export interface ExprData {
+  workflowId: string; items: Item[]; nodeOutputs: Record<string, Item[]>; nodeNames: string[]
+  /** Graph state of the latest run ($state); undefined before the workflow has run. */
+  state?: Record<string, unknown>
+}
 export const ExprDataContext = createContext<ExprData | null>(null)
 
 /** One {{ … }} block, checked on its own like n8n's inline expression editor. */
@@ -13,19 +17,51 @@ export type ExprResult =
   | { ok: true; type: string; text: string; truncated?: boolean; segments?: ExprSegment[] }
   | { ok: false; error: string; pending?: boolean; segments?: ExprSegment[] }
 
-/** n8n's inline result: resolve the value on the server (same engine as runs), debounced while typing. */
+const NODE_REF = /\$\(\s*(['"])((?:(?!\1).)+)\1\s*\)|\$node\[\s*(['"])((?:(?!\3).)+)\3\s*\]|\$node\.([A-Za-z_]\w*)/g
+// Anything that reads the current item / input list (Jinja names work with or without the $).
+const STATE_REF = /\$?state\b/
+const USES_INPUT = /(?:^|[^\w.$])\$?(?:json|input|binary|items?|itemIndex)\b|\.item\b/
+
+/** What a preview of `value` needs: the input items only if it reads them, and only the nodes it names. */
+export function previewPayload(value: string, data: ExprData) {
+  const names = new Set<string>()
+  for (const m of value.matchAll(NODE_REF)) names.add(m[2] ?? m[4] ?? m[5])
+  const node_outputs: Record<string, Item[]> = {}
+  for (const n of names) if (data.nodeOutputs[n]) node_outputs[n] = data.nodeOutputs[n]
+  // Paired items ($('X').item) resolve against the input item too.
+  const items = USES_INPUT.test(value) ? data.items : []
+  // $state.key: the latest run's graph state (only when the expression reads it)
+  const state = STATE_REF.test(value) ? data.state : undefined
+  return { value, items, node_outputs, node_names: data.nodeNames, ...(state ? { state } : {}) }
+}
+
+const sameList = (a: unknown[], b: unknown[]) => a.length === b.length && a.every((x, i) => x === b[i])
+
+/** n8n's inline result: resolve the value on the server (same engine as runs), debounced while typing.
+ *  Sends only the data the expression references, and asks again only when that data or the text changes
+ *  (not on every unrelated run event). */
 function usePreview(value: string): { res: ExprResult | null; data: ExprData | null } {
   const data = useContext(ExprDataContext)
   const [res, setRes] = useState<ExprResult | null>(null)
+  const sent = useRef<{ key: unknown[]; seq: number }>({ key: [], seq: 0 })
   useEffect(() => {
-    if (!data) { setRes(null); return }
-    let alive = true
+    if (!data) { sent.current.key = []; setRes(null); return }
+    const body = previewPayload(value, data)
+    const key: unknown[] = [data.workflowId, value, body.items, body.node_names.length, body.state, ...Object.entries(body.node_outputs).flat()]
+    if (sameList(key, sent.current.key)) return  // same text and same data: the last answer still holds
+    sent.current.key = key
+    const seq = ++sent.current.seq
+    let fired = false
     const t = window.setTimeout(() => {
-      api.expressionPreview(data.workflowId, { value, items: data.items, node_outputs: data.nodeOutputs, node_names: data.nodeNames })
-        .then((r) => { if (alive) setRes(r) })
-        .catch((e) => { if (alive) setRes({ ok: false, error: String(e instanceof Error ? e.message : e) }) })
-    }, 250)
-    return () => { alive = false; window.clearTimeout(t) }
+      fired = true
+      api.expressionPreview(data.workflowId, body)
+        .then((r) => { if (seq === sent.current.seq) setRes(r) })
+        .catch((e) => { if (seq === sent.current.seq) setRes({ ok: false, error: String(e instanceof Error ? e.message : e) }) })
+    }, 300)
+    return () => {
+      window.clearTimeout(t)
+      if (!fired) sent.current.key = []  // cancelled before it was sent: the next run must send
+    }
   }, [value, data])
   return { res, data }
 }
@@ -222,6 +258,15 @@ function ResultLine({ res, data, value }: { res: ExprResult | null; data: ExprDa
 }
 
 /** n8n-style expression input: fx badge, each {{ }} checked and coloured, autocomplete, live result, expand to a full editor. */
+function ExprModal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  const ref = useDialog(onClose)
+  return (
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div ref={ref} className="modal expr-modal" role="dialog" aria-modal="true" aria-label="Edit expression">{children}</div>
+    </div>
+  )
+}
+
 export function ExprField({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
   const { res, data } = usePreview(value)
   const [open, setOpen] = useState(false)
@@ -242,12 +287,11 @@ export function ExprField({ value, onChange, placeholder }: { value: string; onC
       </div>
       <ResultLine res={res} data={data} value={value} />
       {open && (
-        <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && setOpen(false)}>
-          <div className="modal expr-modal">
+        <ExprModal onClose={() => setOpen(false)}>
             <div className="modal-head">
               <span className="expr-fx">fx</span>
               <h2 className="grow" style={{ margin: 0 }}>Edit expression</h2>
-              <button className="btn ghost icon" onClick={() => setOpen(false)}><Icon name="x" /></button>
+              <button className="btn ghost icon" onClick={() => setOpen(false)} aria-label="Close" title="Close (Esc)"><Icon name="x" /></button>
             </div>
             <div className="expr-modal-body">
               <div className="expr-modal-col">
@@ -272,17 +316,21 @@ export function ExprField({ value, onChange, placeholder }: { value: string; onC
                 <ResultLine res={res} data={data} value={value} />
               </div>
             </div>
-          </div>
-        </div>
+        </ExprModal>
       )}
     </>
   )
 }
 
 /** Code node: syntax errors while typing (compiled on the server, never run), like n8n's code editor lint. */
-export function CodeCheck({ code, language }: { code: string; language: string }) {
+type CheckResult = { ok: boolean; checked?: boolean; line?: number; column?: number; message?: string }
+
+export function CodeCheck({ code, language, onResult }: { code: string; language: string; onResult?: (r: CheckResult | null) => void }) {
   const data = useContext(ExprDataContext)
-  const [res, setRes] = useState<{ ok: boolean; checked?: boolean; message?: string } | null>(null)
+  const [res, setRes] = useState<CheckResult | null>(null)
+  const report = useRef(onResult)
+  report.current = onResult
+  useEffect(() => { report.current?.(res?.checked ? res : null) }, [res])
   useEffect(() => {
     if (!data || language !== 'python') { setRes(null); return }
     let alive = true

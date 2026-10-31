@@ -2,9 +2,10 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select
+from sqlalchemy.orm import load_only
 
 from ..access import check, principal, visible_workflow_ids
 from ..engine.store import stats_for, store, workflow_snapshot
@@ -84,15 +85,22 @@ def _conditions(f: ExecFilter, p: Principal, write: bool = False) -> list:
     return conds
 
 
+_LIST_COLUMNS = (Execution.id, Execution.workflow_id, Execution.status, Execution.mode, Execution.started_at,
+                 Execution.finished_at, Execution.duration_ms, Execution.error, Execution.waiting_for)
+
+
 @router.get("")
 async def list_executions(workflow_id: str | None = None, status: str | None = None, mode: str | None = None,
                           started_after: datetime | None = None, started_before: datetime | None = None,
-                          limit: int = 50, offset: int = 0, session: AsyncSession = Depends(get_session),
+                          limit: int = Query(50, ge=1), offset: int = Query(0, ge=0),
+                          session: AsyncSession = Depends(get_session),
                           p: Principal = Depends(principal)):
     """Filters accept comma separated values (e.g. status=error,canceled; several workflow ids)."""
     conds = _conditions(ExecFilter(workflow_id=workflow_id, status=status, mode=mode,
                                    started_after=started_after, started_before=started_before), p)
-    q = select(Execution, Workflow.name).join(Workflow, Workflow.id == Execution.workflow_id).where(*conds)
+    # List rows never load the run data (input / output / node_runs / snapshot JSON): only what the list shows.
+    q = (select(Execution, Workflow.name).options(load_only(*_LIST_COLUMNS))
+         .join(Workflow, Workflow.id == Execution.workflow_id).where(*conds))
     rows = (await session.execute(q.order_by(desc(Execution.started_at)).limit(min(limit, 200)).offset(offset))).all()
     # Exact counts over millions of rows are slow; past COUNT_CAP the page says "10,000+".
     total = (await session.execute(select(func.count()).select_from(
@@ -168,9 +176,8 @@ async def delete_execution(ex_id: str, session: AsyncSession = Depends(get_sessi
 
 @router.delete("")
 async def prune(workflow_id: str | None = None, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
-    q = delete(Execution).where(Execution.status.in_(["success", "error", "canceled"]), *_conditions(ExecFilter(), p, write=True))
-    if workflow_id:
-        q = q.where(Execution.workflow_id == uuid.UUID(workflow_id))
+    q = delete(Execution).where(Execution.status.in_(["success", "error", "canceled"]),
+                                *_conditions(ExecFilter(workflow_id=workflow_id), p, write=True))
     await session.execute(q.execution_options(synchronize_session=False))
     await session.commit()
     return {"ok": True}
@@ -203,5 +210,5 @@ async def retry(ex_id: str, session: AsyncSession = Depends(get_session), p: Pri
         raise HTTPException(404, "Workflow deleted")
     from ..engine.runtime import workflow_to_dict
 
-    return await execute_workflow(workflow_to_dict(wf), trigger_node_id=ex.trigger_node, items=ex.input,
+    return await execute_workflow(workflow_to_dict(wf, live=wf.active), trigger_node_id=ex.trigger_node, items=ex.input,
                                   mode=ex.mode, wait=False)

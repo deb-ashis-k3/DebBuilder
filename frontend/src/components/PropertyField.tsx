@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { Icon, isExpr, isVisible, toast } from '../lib'
 import type { Credential, PropSpec, Workflow } from '../types'
 import { CredentialModal } from './CredentialModal'
 import { CodeCheck, ExprField } from './ExprField'
 import { Select } from './Select'
+import type { CodeProblem } from './CodeEditor'
+
+// CodeMirror loads with the first code field opened; the plain textarea shows meanwhile.
+const CodeEditor = lazy(() => import('./CodeEditor'))
 
 // Small shared caches so every field doesn't refetch.
 let credCache: Credential[] | null = null
@@ -110,6 +114,22 @@ function CodeArea({ value, onChange, rows, className }: { value: string; onChang
           requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = s + 4 })
         }
       }} />
+  )
+}
+
+/** A code parameter: VS Code-style editor, live syntax check underlined in the editor. */
+function CodeField({ value, onChange, rows, language, check }: {
+  value: string; onChange: (v: unknown) => void; rows?: number; language?: string; check: boolean
+}) {
+  const [problem, setProblem] = useState<CodeProblem | null>(null)
+  return (
+    <>
+      <Suspense fallback={<CodeArea value={value} rows={rows} onChange={onChange} />}>
+        <CodeEditor value={value} onChange={onChange} rows={rows} language={language} problem={problem} />
+      </Suspense>
+      {check && <CodeCheck code={value} language={language ?? 'python'}
+        onResult={(r) => setProblem(r && !r.ok && r.line ? { line: r.line, column: r.column, message: r.message ?? 'Syntax error' } : null)} />}
+    </>
   )
 }
 
@@ -252,12 +272,8 @@ export function PropertyField({ spec, value, onChange, params }: {
         control = <textarea className={`textarea ${exprCls}`} rows={spec.rows ?? 3} value={str} placeholder={spec.placeholder} onChange={(e) => onChange(e.target.value)} />
         break
       case 'code':
-        control = (
-          <>
-            <CodeArea value={str} rows={spec.rows} onChange={onChange} />
-            {spec.name === 'code' && <CodeCheck code={str} language={String(params?.language ?? 'python')} />}
-          </>
-        )
+        control = <CodeField value={str} rows={spec.rows} onChange={onChange} check={spec.name === 'code'}
+          language={spec.language ?? (spec.name === 'code' ? String(params?.language ?? 'python') : undefined)} />
         break
       case 'json':
         control = <CodeArea value={str} rows={spec.rows ?? 5} className={exprCls} onChange={onChange} />

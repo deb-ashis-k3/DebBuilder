@@ -1,4 +1,5 @@
 """Starter workflows. Credentials are left empty; pick them in the editor."""
+from .templates_iot import IOT_INCIDENT_TEMPLATE
 
 
 def n(id, type, name, x, y, **params):
@@ -9,7 +10,8 @@ def e(src, tgt, sh="main", th="main"):
     return {"id": f"e_{src}_{sh}_{tgt}_{th}", "source": src, "sourceHandle": sh, "target": tgt, "targetHandle": th}
 
 
-MODEL = dict(model="gpt-5-mini")
+# No preset model name: pick one from your provider's list in the editor.
+MODEL = dict(model="")
 
 LOOP_NOTE = """## Agentic loop on LangGraph state
 **State** (Settings → State) is a LangGraph channel per key, each with a reducer: `question` replace,
@@ -65,6 +67,7 @@ AVA_SYSTEM = """You are Ava, the phone assistant of Acme Dental. You are speakin
 - Use the think tool to plan multi-step requests."""
 
 TEMPLATES = {
+    "iot-incident-response": IOT_INCIDENT_TEMPLATE,
     "voice-ai-agent-complete": {
         "name": "Voice AI Agent – Complete (phone, IVR, RAG, events, outbound)",
         "description": "Every voice feature in one workflow: fully configured LiveKit voice agent, keypad IVR, AI agent with memory, "
@@ -121,7 +124,7 @@ TEMPLATES = {
             n("kb_tool", "tool.vector_store", "Knowledge base", 940, 420, tool_name="knowledge_base", top_k=4,
               tool_description="Search Acme Dental's FAQ: services, prices, opening hours, insurance and policies."),
             n("kb_store", "vs.memory", "FAQ store", 940, 600, memory_key="acme-faq"),
-            n("kb_embed", "embeddings.openai", "FAQ embeddings ⚠", 940, 760, model="text-embedding-3-small"),
+            n("kb_embed", "embeddings.openai", "FAQ embeddings ⚠", 940, 760, model=""),
             n("orders", "tool.http", "Order lookup", 1080, 420, tool_name="order_lookup", method="GET",
               url="https://api.example.com/orders/{order_id}",
               tool_description="Look up an order or invoice by its number: status, amount, due date.",
@@ -130,7 +133,7 @@ TEMPLATES = {
             n("think", "tool.think", "Think", 1220, 420),
 
             # ② Call events ------------------------------------------------------------------------------------
-            sticky("Call events", -80, 920, 760, 150, VOICE_EVENTS_NOTE),
+            sticky("Note: Call events", -80, 920, 760, 150, VOICE_EVENTS_NOTE),
             n("events", "trigger.voice_event", "Call events", 0, 1120, events="call_started,call_ended,amd,dtmf,transfer,error"),
             n("ev_route", "flow.switch", "Which event?", 300, 1120, fallback=True, all_matches=False, rules=[
                 {"name": "call_started", "left": "{{ $json.event }}", "operator": "equals", "right": "call_started"},
@@ -179,7 +182,7 @@ TEMPLATES = {
               ringing_timeout=30, max_call_duration=600, krisp=True, play_dialtone=False, wait_until_answered=False),
 
             # ④ Knowledge base --------------------------------------------------------------------------------
-            sticky("Knowledge base", -80, 2300, 760, 130, VOICE_KB_NOTE),
+            sticky("Note: Knowledge base", -80, 2300, 760, 130, VOICE_KB_NOTE),
             n("kb_run", "trigger.manual", "Load FAQ (run once)", 0, 2480),
             n("faq", "core.code", "FAQ documents", 300, 2480, language="python", mode="all",
               code="return [\n"
@@ -193,7 +196,7 @@ TEMPLATES = {
             n("kb_loader", "loader.default", "FAQ loader", 520, 2680, mode="expression", text="{{ $json.text }}",
               metadata=[{"name": "topic", "value": "{{ $json.topic }}"}]),
             n("kb_store2", "vs.memory", "FAQ store (write)", 700, 2680, memory_key="acme-faq"),
-            n("kb_embed2", "embeddings.openai", "FAQ embeddings (write) ⚠", 700, 2840, model="text-embedding-3-small"),
+            n("kb_embed2", "embeddings.openai", "FAQ embeddings (write) ⚠", 700, 2840, model=""),
         ],
         "edges": [
             e("voice", "route"),

@@ -8,17 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import fnmatch
 import gzip
 import io
 import json
 import os
+import re
 import subprocess
 import zipfile
 from pathlib import Path
 
-import httpx
 
+from ..netguard import guarded_client
 from ..config import get_settings
 from .base import NodeContext, NodeError, NodeType, prop, register
 from .core import CORE, apply_auth
@@ -248,55 +248,90 @@ register(NodeType(
 # ---------------------------------------------------------------------------
 
 
-def files_root() -> Path:
-    root = Path(get_settings().files_root).resolve()
+def files_root(owner_id: str | None = None) -> Path:
+    """FILES_ROOT/<owner id>: every user gets a private folder; nobody reads or overwrites another user's files."""
+    base = Path(get_settings().files_root).resolve()
+    owner = re.sub(r"[^A-Za-z0-9_-]", "", str(owner_id or "")) or "_system"
+    root = (base / owner).resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def safe_path(rel: str) -> Path:
-    """Resolve a user path inside FILES_ROOT; anything escaping it is refused."""
-    root = files_root()
-    p = (root / str(rel or "").lstrip("/\\")).resolve()
+def safe_path(rel: str, owner_id: str | None = None) -> Path:
+    """Resolve a user path inside the user's folder under FILES_ROOT; anything escaping it is refused."""
+    root = files_root(owner_id)
+    p = (root / str(rel or "").replace("\\", "/").lstrip("/")).resolve()
     if p != root and root not in p.parents:
-        raise NodeError(f"Path '{rel}' is outside the allowed folder ({root}). Set FILES_ROOT to change it.")
+        raise NodeError(f"Path '{rel}' is outside the allowed folder (your files folder). Use a path relative to it, "
+                        "e.g. 'reports/a.csv'.")
     return p
+
+
+_WILD = re.compile(r"[*?\[]")
+
+
+def _glob(root: Path, pattern: str) -> list[Path]:
+    """Glob relative to `root`: `*.txt` = this folder only, `**/*.txt` = any depth (this folder included),
+    `sub/**/*.txt` = anywhere under sub/."""
+    pattern = pattern.replace("\\", "/").lstrip("/") or "*"
+    if ".." in pattern.split("/"):
+        raise NodeError("'..' is not allowed in file patterns (paths outside your files folder are refused)")
+    if not _WILD.search(pattern):
+        f = (root / pattern).resolve()
+        return [f] if f.is_file() and root in f.parents else []
+    out = []
+    for f in root.glob(pattern):
+        try:
+            r = f.resolve()
+        except OSError:
+            continue
+        if r.is_file() and root in r.parents:  # symlinks pointing outside the folder are skipped
+            out.append(f)
+    return sorted(set(out))
 
 
 async def _read_write(ctx: NodeContext):
     out = []
-    root = files_root()
+    owner = ctx.run.meta.get("owner_id")
+    root = files_root(owner)
     for i, it in enumerate(ctx.items or [{}]):
         p = ctx.params(i)
         if p.get("operation") == "write":
             data, ref = ctx.file(it, p.get("binary_property") or "data")
-            path = safe_path(p.get("path") or ref.get("fileName") or "file")
+            fname = ref.get("fileName") or "file"
+            target = str(p.get("path") or "").strip()
+            if not target or _WILD.search(target):
+                target = fname  # no path, or a read pattern such as the default *.csv: keep the file's own name
+            elif target.endswith(("/", "\\")):
+                target += fname
+            path = safe_path(target, owner)
             path.parent.mkdir(parents=True, exist_ok=True)
             if p.get("append") and path.exists():
                 with path.open("ab") as f:
                     f.write(data)
             else:
                 path.write_bytes(data)
-            out.append({**it, "fileName": str(path.relative_to(root)), "fileSize": len(data)})
+            out.append({**it, "fileName": path.relative_to(root).as_posix(), "fileSize": len(data)})
             continue
         pattern = str(p.get("path") or "*")
-        base = safe_path(os.path.dirname(pattern) or ".")
-        matches = sorted(f for f in base.rglob("*") if f.is_file() and fnmatch.fnmatch(str(f.relative_to(root)).replace("\\", "/"), pattern.lstrip("/")))
+        matches = await asyncio.to_thread(_glob, root, pattern)
         if not matches and not p.get("allow_empty"):
-            raise NodeError(f"No file matches '{pattern}' in {root}", ctx.name)
+            raise NodeError(f"No file matches '{pattern}' in your files folder", ctx.name)
         for f in matches[: int(p.get("limit") or 1000)]:
             ref = ctx.put_file(f.read_bytes(), f.name)
-            out.append({"fileName": str(f.relative_to(root)).replace("\\", "/"), "binary": {p.get("binary_property") or "data": ref}})
+            out.append({"fileName": f.relative_to(root).as_posix(), "binary": {p.get("binary_property") or "data": ref}})
     return {"main": out}
 
 
 register(NodeType(
     type="file.read_write", label="Read/Write Files from Disk", icon="hard-drive",
-    description="Read files matching a pattern, or write a file, inside the server's files folder (FILES_ROOT).",
+    description="Read files matching a pattern, or write a file, inside your private folder under FILES_ROOT.",
     properties=[
         prop("operation", "Operation", "options", "read", options=[{"label": "Read file(s)", "value": "read"},
                                                                     {"label": "Write file", "value": "write"}]),
-        prop("path", "Path (relative to FILES_ROOT; read accepts * and ** patterns)", "string", "*.csv"),
+        prop("path", "Path (relative to your files folder)", "string", "*.csv",
+             description="Read: *.csv = this folder, **/*.csv = any depth, sub/**/*.csv. Write: empty or a pattern keeps "
+                         "the file's own name; a folder ending in / puts it there."),
         prop("binary_property", "Binary property", "string", "data"),
         prop("append", "Append if the file exists", "boolean", False, show_if={"operation": ["write"]}),
         prop("allow_empty", "Don't fail when nothing matches", "boolean", False, show_if={"operation": ["read"]}),
@@ -310,6 +345,19 @@ register(NodeType(
 # ---------------------------------------------------------------------------
 
 
+def _read_capped(src, limit: int, name: str, ctx: NodeContext) -> bytes:
+    """Decompress in 1 MB chunks and stop as soon as the output passes `limit` (zip / gzip bombs)."""
+    buf = bytearray()
+    while True:
+        chunk = src.read(1024 * 1024)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            raise NodeError(f"'{name}' unpacks to more than MAX_BINARY_MB ({limit // (1024 * 1024)} MB): larger than allowed",
+                            ctx.name)
+
+
 async def _compression(ctx: NodeContext):
     out = []
     for i, it in enumerate(ctx.items or [{}]):
@@ -319,14 +367,22 @@ async def _compression(ctx: NodeContext):
             data, ref = ctx.file(it, props[0])
             files: dict = {}
             name = ref.get("fileName") or "file"
+            limit = get_settings().max_binary_mb * 1024 * 1024
             if zipfile.is_zipfile(io.BytesIO(data)):
                 with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    total = 0
                     for k, info in enumerate(x for x in z.infolist() if not x.is_dir()):
-                        if info.file_size > get_settings().max_binary_mb * 1024 * 1024:
-                            raise NodeError(f"'{info.filename}' is larger than MAX_BINARY_MB", ctx.name)
-                        files[f"{p.get('output_prefix') or 'file_'}{k}"] = ctx.put_file(z.read(info), Path(info.filename).name)
+                        # the declared size can lie: inflate in chunks and stop at the limit
+                        with z.open(info) as src:
+                            content = _read_capped(src, limit, info.filename, ctx)
+                        total += len(content)
+                        if total > limit * 4:
+                            raise NodeError("The archive unpacks to more than 4 x MAX_BINARY_MB", ctx.name)
+                        files[f"{p.get('output_prefix') or 'file_'}{k}"] = ctx.put_file(content, Path(info.filename).name)
             elif data[:2] == b"\x1f\x8b":
-                files[f"{p.get('output_prefix') or 'file_'}0"] = ctx.put_file(gzip.decompress(data), name.removesuffix(".gz"))
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as src:
+                    content = _read_capped(src, limit, name, ctx)
+                files[f"{p.get('output_prefix') or 'file_'}0"] = ctx.put_file(content, name.removesuffix(".gz"))
             else:
                 raise NodeError(f"'{name}' is not a zip or gzip file", ctx.name)
             out.append({**{k: v for k, v in it.items() if k != "binary"}, "binary": files})
@@ -447,7 +503,7 @@ async def _command(ctx: NodeContext):
         timeout = float(ctx.param("timeout", i) or 60)
         # A thread, like the Code node: the Windows selector loop (needed by psycopg) has no subprocess support.
         try:
-            proc = await asyncio.to_thread(subprocess.run, cmd, shell=True, capture_output=True, timeout=timeout, cwd=str(files_root()))
+            proc = await asyncio.to_thread(subprocess.run, cmd, shell=True, capture_output=True, timeout=timeout, cwd=str(files_root(ctx.run.meta.get("owner_id"))))
         except subprocess.TimeoutExpired as e:
             raise NodeError(f"Command timed out after {timeout:g}s", ctx.name) from e
         res = {"exitCode": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace").rstrip(),
@@ -476,6 +532,8 @@ def _ssh_opts(c: dict) -> dict:
 
     opts: dict = {"host": c["host"], "port": int(c.get("port") or 22), "username": c.get("username") or None,
                   "known_hosts": None, "connect_timeout": 20}
+    if c.get("host_key"):  # pin the server's public key ("ssh-ed25519 AAAA..."): refuse anyone else
+        opts["known_hosts"] = asyncssh.import_known_hosts(f"{c['host']} {str(c['host_key']).strip()}\n")
     if c.get("private_key"):
         opts["client_keys"] = [asyncssh.import_private_key(c["private_key"], c.get("passphrase") or None)]
     if c.get("password"):
@@ -623,12 +681,15 @@ async def _graphql(ctx: NodeContext):
         variables = p.get("variables")
         variables = json.loads(variables) if isinstance(variables, str) and variables.strip() else (variables or {})
         body = {"query": p.get("query") or "", "variables": variables, **({"operationName": p["operation_name"]} if p.get("operation_name") else {})}
-        async with httpx.AsyncClient(timeout=float(p.get("timeout") or 30)) as c:
+        async with guarded_client(timeout=float(p.get("timeout") or 30)) as c:
             r = await c.post(p["endpoint"], json=body, headers=headers, params=params or None, auth=auth)
         try:
             data = r.json()
         except ValueError as e:
             raise NodeError(f"GraphQL endpoint returned non-JSON ({r.status_code}): {r.text[:300]}", ctx.name) from e
+        if not isinstance(data, dict):
+            raise NodeError(f"GraphQL endpoint returned {type(data).__name__} JSON, expected an object with 'data' "
+                            f"(HTTP {r.status_code}): {r.text[:300]}", ctx.name)
         if (r.status_code >= 400 or data.get("errors")) and not p.get("continue_on_errors"):
             raise NodeError(f"GraphQL error: {json.dumps(data.get('errors') or data)[:500]}", ctx.name)
         out.append(data)

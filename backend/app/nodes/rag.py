@@ -30,7 +30,8 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langchain_core.vectorstores import InMemoryVectorStore, VectorStore
 from pydantic import ConfigDict, Field, create_model
 
-from ..engine.expressions import build_context, evaluate
+from ..netguard import guarded_client
+from ..engine.expressions import evaluate
 from .ai import AI, MODEL_COMMON, SUB_TOOL, TOOL_COMMON, _opt, _tool_name, message_text, model_name
 from .base import NodeContext, NodeError, NodeType, ai_input, prop, register
 
@@ -74,13 +75,38 @@ async def _emb_openai(ctx: NodeContext):
                                    chunk_size=p.get("batch_size")))
 
 
+_TOKENIZER_HELP = ("Set TIKTOKEN_CACHE_DIR to a folder holding the downloaded tokenizer file, allow outbound access to "
+                   "openaipublic.blob.core.windows.net, or use the Character / Recursive splitter instead.")
+
+
+async def _tiktoken(name: str = "cl100k_base"):
+    """The tiktoken encoding (downloaded once, then cached); None when it can't be loaded (e.g. no internet)."""
+    def load():
+        import tiktoken
+
+        return tiktoken.get_encoding(name)
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(load), 30)
+    except Exception:  # noqa: BLE001 - network / proxy / timeout
+        return None
+
+
 async def _emb_azure(ctx: NodeContext):
     from langchain_openai import AzureOpenAIEmbeddings
 
     _, cred = await ctx.credential()
     p = ctx.params()
+    if not p.get("model") or not cred.get("endpoint") or not cred.get("api_key"):
+        raise NodeError("Azure embeddings need a deployment name and a credential with endpoint and API key", ctx.name)
+    # Long-input splitting needs the tiktoken file; without it (offline servers) send texts as they are.
+    can_count = await _tiktoken() is not None
+    if not can_count:
+        ctx.log("Tokenizer (tiktoken cl100k_base) unavailable: embedding texts without token-length splitting. "
+                + _TOKENIZER_HELP)
     return AzureOpenAIEmbeddings(**_opt({"azure_deployment": p["model"], "azure_endpoint": cred["endpoint"],
-                                         "api_key": cred["api_key"], "api_version": cred.get("api_version")},
+                                         "api_key": cred["api_key"], "api_version": cred.get("api_version"),
+                                         "check_embedding_ctx_length": can_count},
                                         dimensions=p.get("dimensions")))
 
 
@@ -150,26 +176,23 @@ async def _emb_cohere(ctx: NodeContext):
     return CohereEmbeddings(cred["api_key"], ctx.param("model"))
 
 
-for _type, _label, _cred, _default, _options, _fn, _extra in [
-    ("embeddings.openai", "Embeddings OpenAI", "openai", "text-embedding-3-small",
-     ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"], _emb_openai,
+for _type, _label, _cred, _fn, _extra in [
+    ("embeddings.openai", "Embeddings OpenAI", "openai", _emb_openai,
      [prop("dimensions", "Dimensions (empty = model default)", "number", None), prop("batch_size", "Batch size", "number", 512)]),
-    ("embeddings.azure_openai", "Embeddings Azure OpenAI", "azure_openai", "text-embedding-3-small", [], _emb_azure,
+    ("embeddings.azure_openai", "Embeddings Azure OpenAI", "azure_openai", _emb_azure,
      [prop("dimensions", "Dimensions (empty = model default)", "number", None)]),
-    ("embeddings.gemini", "Embeddings Google Gemini", "google_genai", "gemini-embedding-001",
-     ["gemini-embedding-001", "text-embedding-004"], _emb_gemini, []),
-    ("embeddings.ollama", "Embeddings Ollama", "ollama", "nomic-embed-text",
-     ["nomic-embed-text", "mxbai-embed-large", "all-minilm"], _emb_ollama, []),
-    ("embeddings.mistral", "Embeddings Mistral Cloud", "mistral", "mistral-embed", ["mistral-embed"], _emb_mistral, []),
-    ("embeddings.cohere", "Embeddings Cohere", "cohere", "embed-v4.0",
-     ["embed-v4.0", "embed-english-v3.0", "embed-multilingual-v3.0"], _emb_cohere, []),
+    ("embeddings.gemini", "Embeddings Google Gemini", "google_genai", _emb_gemini, []),
+    ("embeddings.ollama", "Embeddings Ollama", "ollama", _emb_ollama, []),
+    ("embeddings.mistral", "Embeddings Mistral Cloud", "mistral", _emb_mistral, []),
+    ("embeddings.cohere", "Embeddings Cohere", "cohere", _emb_cohere, []),
 ]:
+    # No preset model names: the list comes from the credential's own server (Azure takes a deployment name).
     register(NodeType(
         type=_type, label=_label, icon="binary", description=f"{_label}: turns text into vectors for vector stores.",
         properties=[
             prop("credential", "Credential", "credential", None, credential_types=[_cred], required=True),
-            prop("model", "Model" if _cred != "azure_openai" else "Deployment name", "combo", _default,
-                 options=_options or None, required=True),
+            prop("model", "Deployment name", "string", "", required=True) if _cred == "azure_openai"
+            else prop("model", "Model", "combo", "", required=True, load_options="models"),
             *_extra,
         ],
         provides="ai_embedding", supply=_fn, **SUB_EMBEDDING,
@@ -190,7 +213,9 @@ async def _split_recursive(ctx: NodeContext):
 async def _split_character(ctx: NodeContext):
     from langchain_text_splitters import CharacterTextSplitter
 
-    sep = (ctx.param("separator") or "\n\n").encode().decode("unicode_escape")  # "\n" typed in the form
+    from .transform import unescape_sep
+
+    sep = unescape_sep(ctx.param("separator") or "\n\n")  # "\n" typed in the form; other characters kept as is
     return CharacterTextSplitter(separator=sep, chunk_size=int(ctx.param("chunk_size") or 1000),
                                  chunk_overlap=int(ctx.param("chunk_overlap") or 0))
 
@@ -198,6 +223,9 @@ async def _split_character(ctx: NodeContext):
 async def _split_token(ctx: NodeContext):
     from langchain_text_splitters import TokenTextSplitter
 
+    if await _tiktoken() is None:
+        raise NodeError("The Token Splitter needs the tiktoken tokenizer (cl100k_base), which couldn't be downloaded. "
+                        + _TOKENIZER_HELP, ctx.name)
     return TokenTextSplitter(chunk_size=int(ctx.param("chunk_size") or 500),
                              chunk_overlap=int(ctx.param("chunk_overlap") or 0), encoding_name="cl100k_base")
 
@@ -227,7 +255,8 @@ class ItemLoader:
 
     def _eval(self, raw: Any, items: list, i: int) -> Any:
         ctx = self.ctx
-        return evaluate(raw, build_context(items[i], items, i, ctx.run.outputs_by_name(), ctx.run.meta, state=ctx.state))
+        # the node's per-execution expression scope (cached by items list): no per-item rebuild, O(n) over items
+        return evaluate(raw, ctx._expr_scope(items).context(items[i], i))
 
     def load(self, items: list[dict]) -> list[Document]:
         p = self.ctx.raw_params
@@ -249,7 +278,9 @@ class ItemLoader:
                 continue
             if p.get("mode") == "expression":
                 text = self._eval(p.get("text") or "", items, i)
-                text = text if isinstance(text, str) else json.dumps(text, default=str)
+                if text is None:
+                    continue  # missing field: no document (instead of one saying "null")
+                text = text if isinstance(text, str) else json.dumps(text, default=str, ensure_ascii=False)
             else:
                 text = json.dumps(item, default=str, ensure_ascii=False)
             if not str(text).strip():
@@ -395,7 +426,7 @@ class QdrantStore(RestVectorStore):
         return r.json()
 
     async def _upsert(self, ids, texts, vectors, metas):
-        async with httpx.AsyncClient(timeout=60) as c:
+        async with guarded_client(timeout=60) as c:
             exists = await c.get(f"{self.url}/collections/{self.collection}", headers=self.headers)
             if exists.status_code == 404:
                 await self._req(c, "PUT", "", json={"vectors": {"size": len(vectors[0]), "distance": "Cosine"}})
@@ -407,7 +438,7 @@ class QdrantStore(RestVectorStore):
         body: dict = {"vector": vector, "limit": k, "with_payload": True}
         if filter:
             body["filter"] = {"must": [{"key": f"metadata.{key}", "match": {"value": v}} for key, v in filter.items()]}
-        async with httpx.AsyncClient(timeout=60) as c:
+        async with guarded_client(timeout=60) as c:
             res = (await self._req(c, "POST", "/points/search", json=body)).get("result") or []
         return [(Document(page_content=(p.get("payload") or {}).get("page_content", ""),
                           metadata=(p.get("payload") or {}).get("metadata") or {}), float(p.get("score", 0))) for p in res]
@@ -479,14 +510,14 @@ class SupabaseStore(RestVectorStore):
 
     async def _upsert(self, ids, texts, vectors, metas):
         rows = [{"id": i, "content": t, "metadata": m, "embedding": v} for i, t, m, v in zip(ids, texts, metas, vectors)]
-        async with httpx.AsyncClient(timeout=60) as c:
+        async with guarded_client(timeout=60) as c:
             r = await c.post(f"{self.url}/rest/v1/{self.table}", json=rows,
                              headers={**self.headers, "Prefer": "resolution=merge-duplicates"})
         if r.status_code >= 400:
             raise RuntimeError(f"Supabase insert failed ({r.status_code}): {r.text[:300]}")
 
     async def _query(self, vector, k, filter):
-        async with httpx.AsyncClient(timeout=60) as c:
+        async with guarded_client(timeout=60) as c:
             r = await c.post(f"{self.url}/rest/v1/rpc/{self.query_name}", headers=self.headers,
                              json={"query_embedding": vector, "match_count": k, "filter": filter or {}})
         if r.status_code >= 400:
@@ -506,15 +537,33 @@ class MemoryStore(InMemoryVectorStore):
 
 
 _MEMORY_STORES: dict[str, MemoryStore] = {}
+_MEMORY_STORES_USED: dict[str, float] = {}
+MEMORY_STORE_IDLE_SECONDS = 24 * 3600  # an in-memory store nobody touched for a day is dropped
+MEMORY_STORE_MAX = 500
+
+
+def _evict_memory_stores(now: float) -> None:
+    for k in [k for k, t in _MEMORY_STORES_USED.items() if now - t > MEMORY_STORE_IDLE_SECONDS]:
+        _MEMORY_STORES.pop(k, None)
+        _MEMORY_STORES_USED.pop(k, None)
+    while len(_MEMORY_STORES) > MEMORY_STORE_MAX:
+        k = min(_MEMORY_STORES_USED, key=_MEMORY_STORES_USED.get)
+        _MEMORY_STORES.pop(k, None)
+        _MEMORY_STORES_USED.pop(k, None)
 
 
 async def _vs_memory(ctx: NodeContext):
+    import time
+
     emb = await _one(ctx, "ai_embedding", "Embedding")
     # Per workspace: two users' "default" stores never mix.
     key = f"{ctx.run.meta.get('owner_id')}:{ctx.param('memory_key') or 'default'}"
+    now = time.time()
     store = _MEMORY_STORES.get(key)
     if store is None:
         store = _MEMORY_STORES[key] = MemoryStore(emb)
+    _MEMORY_STORES_USED[key] = now
+    _evict_memory_stores(now)
     store.embedding = emb  # follow the attached embeddings node
     return store
 
@@ -934,13 +983,13 @@ register(NodeType(
 # More chat models (OpenAI-compatible providers + Azure) and memories
 # ---------------------------------------------------------------------------
 
-COMPATIBLE = {  # credential type -> (label, base URL, default model, suggestions)
-    "groq": ("Groq Chat Model", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
-    "mistral": ("Mistral Cloud Chat Model", "https://api.mistral.ai/v1", "mistral-large-latest", ["mistral-large-latest", "mistral-small-latest"]),
-    "deepseek": ("DeepSeek Chat Model", "https://api.deepseek.com/v1", "deepseek-chat", ["deepseek-chat", "deepseek-reasoner"]),
-    "openrouter": ("OpenRouter Chat Model", "https://openrouter.ai/api/v1", "openai/gpt-5-mini", []),
-    "xai": ("xAI Grok Chat Model", "https://api.x.ai/v1", "grok-4", ["grok-4", "grok-3-mini"]),
-    "together": ("Together AI Chat Model", "https://api.together.xyz/v1", "meta-llama/Llama-3.3-70B-Instruct-Turbo", []),
+COMPATIBLE = {  # credential type -> (label, base URL); models come from the provider's own list
+    "groq": ("Groq Chat Model", "https://api.groq.com/openai/v1"),
+    "mistral": ("Mistral Cloud Chat Model", "https://api.mistral.ai/v1"),
+    "deepseek": ("DeepSeek Chat Model", "https://api.deepseek.com/v1"),
+    "openrouter": ("OpenRouter Chat Model", "https://openrouter.ai/api/v1"),
+    "xai": ("xAI Grok Chat Model", "https://api.x.ai/v1"),
+    "together": ("Together AI Chat Model", "https://api.together.xyz/v1"),
 }
 
 
@@ -984,26 +1033,62 @@ register(NodeType(
 
 
 class BufferMemory:
-    """n8n's Simple Memory: the last N exchanges per session key, kept in the server process."""
+    """n8n's Simple Memory: the last N exchanges per session key, kept in the server process.
 
-    _store: dict[str, list] = {}
+    window = 0 means "no limit" (still capped at MAX_MESSAGES per session). The store is bounded: least recently
+    used sessions are evicted past MAX_SESSIONS, and sessions idle for IDLE_SECONDS are dropped."""
+
+    from collections import OrderedDict as _OD
+
+    _store: "_OD[str, list]" = _OD()
+    _seen: dict[str, float] = {}
+    MAX_SESSIONS = 5000
+    MAX_MESSAGES = 1000
+    IDLE_SECONDS = 24 * 3600
 
     def __init__(self, session_key: str, window: int):
-        self.session_key, self.window = session_key, window
+        self.session_key, self.window = session_key, max(0, int(window or 0))
+
+    def _rows(self, create: bool = False) -> list:
+        import time
+
+        now = time.time()
+        cls = type(self)
+        rows = cls._store.get(self.session_key)
+        if rows is None and create:
+            rows = cls._store[self.session_key] = []
+        if rows is not None:
+            cls._store.move_to_end(self.session_key)
+            cls._seen[self.session_key] = now
+        while len(cls._store) > cls.MAX_SESSIONS:
+            k, _ = cls._store.popitem(last=False)
+            cls._seen.pop(k, None)
+        if len(cls._seen) and next(iter(cls._store), None) is not None:
+            for k in list(cls._store)[:50]:  # oldest first: drop the idle ones
+                if now - cls._seen.get(k, now) <= cls.IDLE_SECONDS:
+                    break
+                cls._store.pop(k, None)
+                cls._seen.pop(k, None)
+        return rows if rows is not None else []
 
     async def load(self):
         from langchain_core.messages import AIMessage
 
-        rows = self._store.get(self.session_key, [])[-self.window * 2:]
+        rows = self._rows()
+        if self.window:
+            rows = rows[-self.window * 2:]
         return [HumanMessage(c) if r == "human" else AIMessage(c) for r, c in rows]
 
     async def save(self, human: str, ai: str) -> None:
-        rows = self._store.setdefault(self.session_key, [])
+        rows = self._rows(create=True)
         rows += [("human", human), ("ai", ai)]
-        del rows[:-self.window * 2 * 4]  # keep it bounded
+        keep = min(self.window * 2 * 4, self.MAX_MESSAGES) if self.window else self.MAX_MESSAGES
+        if len(rows) > keep:
+            del rows[:len(rows) - keep]  # bounded (no rows[:-0] slicing bug when window is 0)
 
     async def clear(self) -> None:
         self._store.pop(self.session_key, None)
+        self._seen.pop(self.session_key, None)
 
 
 class RedisMemory(BufferMemory):
@@ -1021,7 +1106,7 @@ class RedisMemory(BufferMemory):
 
         r = self._client()
         try:
-            raw = await r.lrange(f"chat:{self.session_key}", -self.window * 2, -1)
+            raw = await r.lrange(f"chat:{self.session_key}", -self.window * 2 if self.window else 0, -1)
         finally:
             await r.aclose()
         out = []
@@ -1052,18 +1137,28 @@ def _session(ctx: NodeContext) -> str:
     return f"{ctx.run.meta['workflow_id']}:{ctx.param('session_key') or 'default'}"
 
 
+def _window(ctx: NodeContext, default: int = 10) -> int:
+    raw = ctx.param("window")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(float(raw)))  # 0 = no limit
+    except (TypeError, ValueError) as e:
+        raise NodeError(f"Context window must be a number (got {raw!r})", ctx.name) from e
+
+
 async def _mem_buffer(ctx: NodeContext):
-    return BufferMemory(_session(ctx), int(ctx.param("window") or 10))
+    return BufferMemory(_session(ctx), _window(ctx))
 
 
 async def _mem_redis(ctx: NodeContext):
     _, c = await ctx.credential()
     ttl = ctx.param("ttl")
-    return RedisMemory(c, _session(ctx), int(ctx.param("window") or 10), int(ttl) if ttl else None)
+    return RedisMemory(c, _session(ctx), _window(ctx), int(ttl) if ttl else None)
 
 
 _MEM_PROPS = [prop("session_key", "Session key", "string", "{{ $json.session_id or $json.sessionId or 'default' }}"),
-              prop("window", "Context window (exchanges)", "number", 10)]
+              prop("window", "Context window (exchanges)", "number", 10, description="0 = no limit")]
 register(NodeType(
     type="memory.buffer", label="Simple Memory", icon="brain-circuit",
     description="Keeps recent chat turns in the server's memory (no setup; lost on restart).",

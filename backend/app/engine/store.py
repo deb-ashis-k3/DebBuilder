@@ -9,6 +9,9 @@ churn, index churn and lock contention. Instead:
   one multi-row upsert. An execution that finishes before its first flush (most of them) is written once,
   already finished. Rows are written in primary-key order, so concurrent flushes from several replicas
   can't deadlock. Manual (editor) runs and runs that pause for input are flushed immediately.
+- **A row the database refuses never blocks the others.** If a batch fails for a reason other than the
+  connection (a constraint, a bad value), its rows are retried one by one and the ones that still fail are
+  dropped and logged; on connection errors the whole batch is kept and retried with backoff.
 - **Backpressure.** If the database falls behind, producers wait once the buffer holds EXECUTIONS_MAX_PENDING
   rows instead of growing memory without bound.
 - **Workflow snapshots are stored once per version** (workflow_snapshots, keyed by a content hash); an
@@ -31,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 
 from ..config import get_settings
 from ..db import Execution, ExecutionStat, SessionLocal, WorkflowSnapshot
@@ -77,6 +81,38 @@ def summarize(node_runs: list[dict]) -> list[dict]:
     return [{k: v for k, v in r.items() if k not in _DATA_KEYS} for r in node_runs]
 
 
+def _strip_nul(v):
+    """Copy of a row without NUL characters, which Postgres can't store in text or JSONB."""
+    if isinstance(v, str):
+        return v.replace("\x00", "")
+    if isinstance(v, dict):
+        return {_strip_nul(k): _strip_nul(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_strip_nul(x) for x in v]
+    return v
+
+
+def _transient(e: BaseException) -> bool:
+    """The database is unreachable / restarting (retry everything later), as opposed to refusing a row."""
+    if isinstance(e, (OperationalError, InterfaceError, OSError, asyncio.TimeoutError)):
+        return True
+    return isinstance(e, DBAPIError) and bool(e.connection_invalidated)
+
+
+# One upsert statement per column set, built once: executemany lets SQLAlchemy reuse the compiled statement
+# (a multi-row VALUES literal was compiled anew for every flush, on the event loop).
+_UPSERTS: dict[frozenset, object] = {}
+
+
+def _upsert(cols: frozenset):
+    stmt = _UPSERTS.get(cols)
+    if stmt is None:
+        ins = pg_insert(Execution)
+        stmt = _UPSERTS[cols] = ins.on_conflict_do_update(
+            index_elements=["id"], set_={c: getattr(ins.excluded, c) for c in _MUTABLE if c in cols})
+    return stmt
+
+
 class ExecutionStore:
     def __init__(self) -> None:
         self._rows: dict[uuid.UUID, dict] = {}          # waiting to be written (full rows)
@@ -94,7 +130,7 @@ class ExecutionStore:
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._stopping = False
-        self.stats = {"flushes": 0, "rows": 0, "failures": 0, "last_flush_ms": 0.0}
+        self.stats = {"flushes": 0, "rows": 0, "failures": 0, "dropped": 0, "last_flush_ms": 0.0}
 
     # ---- producers -------------------------------------------------------------------------------------
     async def _wait_for_room(self) -> None:
@@ -103,12 +139,14 @@ class ExecutionStore:
             self._wake.set()
             await self._room.wait()
 
-    async def started(self, row: dict, workflow: dict, immediate: bool) -> None:
-        """A new execution. `row` holds the Execution columns; the snapshot is stored by hash."""
+    async def started(self, row: dict, workflow: dict, immediate: bool, digest: str | None = None,
+                      raw: str | None = None) -> None:
+        """A new execution. `row` holds the Execution columns; the snapshot is stored by hash.
+        `digest` / `raw`: the workflow's snapshot_hash and JSON when the caller has them already."""
         await self._wait_for_room()
-        h = snapshot_hash(workflow)
-        if h not in self._known:
-            self._snapshots.setdefault(h, workflow)
+        h = digest or snapshot_hash(workflow)
+        if h not in self._known and h not in self._snapshots:
+            self._snapshots[h] = json.loads(raw) if raw else json.loads(json.dumps(workflow, default=str))
         self._rows[row["id"]] = {**row, "snapshot_hash": h}
         if immediate:
             await self._flush_now()
@@ -143,7 +181,10 @@ class ExecutionStore:
                 self._rows[exec_id] = {**self._flushed.pop(exec_id), **fields}
             elif exec_id in self._inflight:  # its "running" row is being written: upsert the final state after it
                 base = self._inflight[exec_id]
-                self._rows[exec_id] = {**{c: base[c] for c in _BASE if c in base}, "input": [], **fields}
+                if base.get("_update_only"):  # an update in flight carries no start columns: update again
+                    self._rows[exec_id] = {"id": exec_id, "_update_only": True, **fields}
+                else:
+                    self._rows[exec_id] = {**{c: base[c] for c in _BASE if c in base}, "input": [], **fields}
             else:  # e.g. resumed from the database by another process: plain update
                 self._rows[exec_id] = {"id": exec_id, "_update_only": True, **fields}
         if immediate or status == "waiting":  # a paused run must be resumable right away
@@ -180,22 +221,16 @@ class ExecutionStore:
             self._inflight = rows
             try:
                 await self._write(rows, drop, snaps, stats)
-            except Exception as e:  # noqa: BLE001 - keep the data and retry with the next flush
-                self.stats["failures"] += 1
-                log.error("writing %d executions failed (will retry): %s", len(rows), e)
-                for k, v in rows.items():
-                    newer = self._rows.get(k)
-                    if newer is None:
-                        self._rows[k] = v
-                    else:  # finished while we were failing: its newer state wins, start columns fill in
-                        merged = {**v, **newer}
-                        if not v.get("_update_only"):
-                            merged.pop("_update_only", None)
-                        self._rows[k] = merged
-                self._drop |= drop
-                self._snapshots.update(snaps)
-                self._stats.update(stats)
-                raise
+            except Exception as e:  # noqa: BLE001
+                if _transient(e):  # the database is away: keep everything and retry with the next flush
+                    self.stats["failures"] += 1
+                    log.error("writing %d executions failed (will retry): %s", len(rows), e)
+                    self._requeue(rows, drop, snaps, stats)
+                    raise
+                # Something in the batch is refused: write row by row so one bad row can't block the rest
+                # (requeues what is left and raises if the database goes away meanwhile).
+                log.warning("writing %d executions failed (%s): retrying them one by one", len(rows), e)
+                rows = await self._write_each(rows, drop, snaps, stats)
             finally:
                 self._inflight = {}
                 if len(self._rows) < get_settings().executions_max_pending:
@@ -213,18 +248,80 @@ class ExecutionStore:
             self.stats["rows"] += len(rows)
             self.stats["last_flush_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
+    def _requeue(self, rows: dict, drop: set, snaps: dict, stats: Counter) -> None:
+        for k, v in rows.items():
+            newer = self._rows.get(k)
+            if newer is None:
+                self._rows[k] = v
+            else:  # finished while we were failing: its newer state wins, start columns fill in
+                merged = {**v, **newer}
+                if not v.get("_update_only"):
+                    merged.pop("_update_only", None)
+                self._rows[k] = merged
+        self._drop |= drop
+        self._snapshots.update(snaps)
+        self._stats.update(stats)
+
+    async def _write_each(self, rows: dict, drop: set, snaps: dict, stats: Counter) -> dict:
+        """After a refused batch: snapshots / deletes / stats, then every row in its own transaction. Rows the
+        database still refuses are dropped and logged. A connection error requeues whatever isn't written
+        yet (and raises). Returns the rows written."""
+        try:
+            await self._write({}, drop, snaps, Counter())
+        except Exception as e:  # noqa: BLE001
+            self.stats["failures"] += 1
+            log.error("writing %d executions failed (will retry): %s", len(rows), e)
+            self._requeue(rows, drop, snaps, stats)  # (a refused snapshot would retry with backoff)
+            raise
+        for key in sorted(stats):  # per counter: a workflow deleted meanwhile (foreign key) loses only its own
+            try:
+                await self._write({}, set(), {}, Counter({key: stats[key]}))
+            except Exception as e:  # noqa: BLE001
+                if _transient(e):
+                    self._requeue(rows, set(), {}, Counter({k: n for k, n in stats.items() if k >= key}))
+                    raise
+                log.warning("execution counter %s dropped: %s", key, e)
+        written: dict = {}
+        for k in sorted(rows):
+            try:
+                await self._write({k: rows[k]}, set(), {}, Counter())
+                written[k] = rows[k]
+            except Exception as e:  # noqa: BLE001
+                if _transient(e):
+                    self.stats["failures"] += 1
+                    log.error("writing executions failed (will retry): %s", e)
+                    self._requeue({j: r for j, r in rows.items() if j not in written}, set(), {}, Counter())
+                    raise
+                try:  # Postgres refuses NUL characters in text / JSONB (models and binary data produce them)
+                    clean = _strip_nul(rows[k])
+                    await self._write({k: clean}, set(), {}, Counter())
+                    written[k] = clean
+                    log.warning("execution %s saved after removing NUL characters", k)
+                    continue
+                except Exception as e2:  # noqa: BLE001
+                    e = e2
+                self.stats["dropped"] += 1
+                log.error("execution %s can't be saved and is dropped: %s (row columns: %s)",
+                          k, e, sorted(c for c in rows[k] if c not in ("node_runs", "output", "input")))
+        return written
+
     async def _write(self, rows: dict, drop: set, snaps: dict, stats: Counter) -> None:
         async with SessionLocal() as s, s.begin():
             if snaps:
                 await s.execute(pg_insert(WorkflowSnapshot).values(
                     [{"hash": h, "data": snaps[h]} for h in sorted(snaps)]).on_conflict_do_nothing(index_elements=["hash"]))
-            full = [r for k, r in sorted(rows.items()) if not r.get("_update_only")]
-            updates = [r for k, r in sorted(rows.items()) if r.get("_update_only")]
-            for i in range(0, len(full), 500):
-                chunk = full[i:i + 500]
-                stmt = pg_insert(Execution).values([{k: v for k, v in r.items() if not k.startswith("_")} for r in chunk])
-                await s.execute(stmt.on_conflict_do_update(
-                    index_elements=["id"], set_={c: getattr(stmt.excluded, c) for c in _MUTABLE}))
+            # Grouped by column set (paused rows carry no finished_at, …): one executemany per group, rows
+            # in primary-key order so concurrent flushes from several replicas can't deadlock.
+            groups: dict[frozenset, list] = {}
+            updates = []
+            for k, r in sorted(rows.items()):
+                if r.get("_update_only"):
+                    updates.append(r)
+                else:
+                    vals = {c: v for c, v in r.items() if not c.startswith("_")}
+                    groups.setdefault(frozenset(vals), []).append(vals)
+            for cols, vals in groups.items():
+                await s.execute(_upsert(cols), vals)
             for r in updates:  # finished after their "running" row was written: rare (long runs)
                 await s.execute(update(Execution).where(Execution.id == r["id"]).values(
                     {c: r[c] for c in _MUTABLE if c in r}))

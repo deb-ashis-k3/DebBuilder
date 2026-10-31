@@ -1422,3 +1422,10 @@ code {
     order: 5;
   }
 }
+
+/* hero buttons drop the shadow, which also carried the focus ring: draw a white outline instead */
+.hero .btn:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 5px rgb(0 0 0 / 35%);
+}

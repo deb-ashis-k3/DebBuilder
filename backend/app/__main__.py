@@ -12,6 +12,8 @@
 
 start options:  --no-build  --no-browser  --reload
 Environment:    HOST (0.0.0.0), PORT (8000) and everything in backend/.env.example.
+Limits:         MAX_CONNECTIONS (open connections per process before 503; 0 = 400 on Windows, 2000 elsewhere),
+                MAX_REQUEST_BODY_MB (16)
 serve also:     FORWARDED_ALLOW_IPS (proxies trusted for X-Forwarded-*, default 127.0.0.1),
                 GRACEFUL_TIMEOUT (seconds, default 30), DB_AUTO_CREATE (create the database if missing, default false)
 """
@@ -30,7 +32,111 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 FRONTEND = BACKEND.parent / "frontend"
 DIST_INDEX = FRONTEND / "dist" / "index.html"
-LOOP = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"  # psycopg async can't use Proactor
+# psycopg async can't use the Proactor loop on Windows: a selector loop, whose select() is guarded (selector_loop).
+LOOP = "app.__main__:selector_loop" if sys.platform == "win32" else "auto"
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+# ---------------------------------------------------------------------------
+# 0. server limits (connections, Windows select())
+# ---------------------------------------------------------------------------
+# Windows' select() watches at most 512 sockets per call; past that the event loop raised
+# "ValueError: too many file descriptors in select()" and the whole server died. Two layers keep it alive:
+# connections beyond MAX_CONNECTIONS are answered 503 and closed before the loop ever watches them, and if the
+# limit is still passed (outgoing connections of busy workflows) select() runs in chunks instead of raising.
+
+def max_connections() -> int:
+    from .config import get_settings
+
+    n = get_settings().max_connections
+    return n if n > 0 else (400 if sys.platform == "win32" else 2000)
+
+
+def selector_loop():
+    """Loop factory for uvicorn on Windows (`loop="app.__main__:selector_loop"`)."""
+    import asyncio
+    import select
+    import selectors
+
+    class _ChunkedSelectSelector(selectors.SelectSelector):
+        CHUNK = 500
+
+        def _select(self, r, w, _, timeout=None):
+            try:
+                return super()._select(r, w, _, timeout)
+            except ValueError:  # more than FD_SETSIZE sockets: poll them in chunks (busy-waits briefly; rare)
+                pass
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                rr, ww = [], []
+                for i in range(0, len(r), self.CHUNK):
+                    rr += select.select(r[i:i + self.CHUNK], [], [], 0)[0]
+                for i in range(0, len(w), self.CHUNK):
+                    _, wr, wx = select.select([], w[i:i + self.CHUNK], w[i:i + self.CHUNK], 0)
+                    ww += wr + wx
+                if rr or ww or (deadline is not None and time.monotonic() >= deadline):
+                    return rr, ww, []
+                time.sleep(0.002 if deadline is None else max(0.0, min(0.002, deadline - time.monotonic())))
+
+    return asyncio.SelectorEventLoop(_ChunkedSelectSelector())
+
+
+_BUSY_TEXT = b"Server is busy: too many connections. Retry shortly."
+_BUSY = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nRetry-After: 1\r\n"
+         b"Connection: close\r\nContent-Length: " + str(len(_BUSY_TEXT)).encode() + b"\r\n\r\n" + _BUSY_TEXT)
+
+
+def _capped_http_protocol():
+    """uvicorn's HTTP protocol that answers 503 and closes a connection arriving while MAX_CONNECTIONS are open,
+    before the event loop starts watching its socket (uvicorn's own limit_concurrency still keeps the socket)."""
+    try:
+        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol as Base
+    except ImportError:
+        from uvicorn.protocols.http.h11_impl import H11Protocol as Base
+    cap = max_connections()
+
+    class Capped(Base):
+        _rejected = False
+
+        def connection_made(self, transport):
+            if len(self.server_state.connections) >= cap:
+                self._rejected = True
+                try:
+                    transport.write(_BUSY)
+                finally:
+                    transport.close()
+                return
+            super().connection_made(transport)
+
+        def connection_lost(self, exc):
+            if not self._rejected:
+                super().connection_lost(exc)
+
+        def data_received(self, data):
+            if not self._rejected:
+                super().data_received(data)
+
+        def eof_received(self):
+            if not self._rejected:
+                return super().eof_received()
+
+    return Capped
+
+
+def server_options(host: str, reload: bool = False) -> dict:
+    """uvicorn settings every command shares: connection limits and the startup warnings."""
+    from .config import get_settings
+
+    cap = max_connections()
+    base = get_settings().public_base_url
+    if host not in LOOPBACK and not base.startswith("https://"):
+        step(f"warning: listening on {host}, reachable from the network, but PUBLIC_BASE_URL ({base}) is not https: "
+             "sessions travel unencrypted and cookies aren't marked Secure. Put DebBuilder behind HTTPS and set "
+             "PUBLIC_BASE_URL to the https address (or set HOST=127.0.0.1 for local use only).")
+    opts = {"loop": LOOP, "limit_concurrency": cap + 1, "backlog": min(2048, max(128, cap * 2))}
+    if not reload:  # the reloader pickles its config for the child process; a class made here can't be (dev only)
+        opts["http"] = _capped_http_protocol()
+    return opts
 
 
 def step(msg: str) -> None:
@@ -214,8 +320,8 @@ def cmd_start(args: set[str]) -> None:
         open_browser_when_ready(f"http://127.0.0.1:{port}", f"http://{shown}:{port}")
     print(f"\n  \033[1mDebBuilder\033[0m  →  \033[32mhttp://{shown}:{port}\033[0m   (Ctrl+C to stop)\n", flush=True)
     reload = "--reload" in args
-    uvicorn.run("app.main:app", host=host, port=port, loop=LOOP, reload=reload,
-                reload_dirs=[str(BACKEND / "app")] if reload else None)
+    uvicorn.run("app.main:app", host=host, port=port, reload=reload,
+                reload_dirs=[str(BACKEND / "app")] if reload else None, **server_options(host, reload))
 
 
 def cmd_dev(args: set[str]) -> None:
@@ -234,7 +340,8 @@ def cmd_dev(args: set[str]) -> None:
     print(f"\n  \033[1mDebBuilder (dev)\033[0m  →  \033[32mhttp://localhost:5173\033[0m   (API on :{port}, live reload)\n",
           flush=True)
     try:
-        uvicorn.run("app.main:app", host=host, port=port, loop=LOOP, reload=True, reload_dirs=[str(BACKEND / "app")])
+        uvicorn.run("app.main:app", host=host, port=port, reload=True, reload_dirs=[str(BACKEND / "app")],
+                    **server_options(host, reload=True))
     finally:
         if vite.poll() is None:
             if sys.platform == "win32":
@@ -257,7 +364,7 @@ def cmd_serve(args: set[str]) -> None:
     if not DIST_INDEX.exists():
         step("warning: frontend/dist is missing; serving the API only (run `debbuilder build`)")
     host, port = _port()
-    uvicorn.run("app.main:app", host=host, port=port, loop=LOOP,
+    uvicorn.run("app.main:app", host=host, port=port, **server_options(host),
                 proxy_headers=True, forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"),
                 timeout_graceful_shutdown=int(os.environ.get("GRACEFUL_TIMEOUT", "30")),
                 # Longer than any load balancer's idle timeout (ALB 60 s, nginx 75 s): with uvicorn's 5 s default a

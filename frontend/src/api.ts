@@ -1,10 +1,30 @@
 import type { ExprResult } from './components/ExprField'
-import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, Item, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow } from './types'
+import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, Item, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow, WorkflowVersion } from './types'
 
 /** Double-submit CSRF token: the server sets the readable `db_csrf` cookie at sign-in. */
 export function csrfToken(): string {
   const m = document.cookie.match(/(?:^|;\s*)db_csrf=([^;]+)/)
   return m ? decodeURIComponent(m[1]) : ''
+}
+
+/** A non-2xx answer: `status` and the server's `detail` (string, or an object such as {code, message, workflow}). */
+export class ApiError extends Error {
+  status: number
+  detail: unknown
+  constructor(message: string, status: number, detail: unknown) {
+    super(message)
+    this.status = status
+    this.detail = detail
+  }
+  /** Overloaded server (503 + Retry-After) or rate limited. */
+  get retryable() { return this.status === 503 || this.status === 429 }
+}
+
+/** The conflicting workflow when a save was rejected because someone else saved first (409 conflict). */
+export function conflictOf(e: unknown): Workflow | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null
+  const d = e.detail as { code?: string; workflow?: Workflow } | null
+  return d && typeof d === 'object' && d.code === 'conflict' && d.workflow ? d.workflow : null
 }
 
 async function req<T>(method: string, url: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
@@ -22,7 +42,19 @@ async function req<T>(method: string, url: string, body?: unknown, headers: Reco
     // Session expired / revoked, or an admin-issued temporary password: let the auth layer react.
     if (res.status === 401 && !url.startsWith('/api/auth/')) window.dispatchEvent(new Event('auth:expired'))
     if (res.status === 403 && detail === 'password_change_required') window.dispatchEvent(new Event('auth:expired'))
-    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail ?? data ?? res.statusText))
+    // Structured errors ({code, message, …}) show their message; the full detail stays on the error.
+    // FastAPI validation errors are a list of {loc, msg}: "name: String should have at most 200 characters".
+    const fieldErr = (d: { loc?: unknown[]; msg?: string }) => {
+      const loc = (d.loc ?? []).filter((x) => x !== 'body' && x !== 'query' && x !== 'path').join('.')
+      return `${loc ? `${loc}: ` : ''}${d.msg ?? 'invalid value'}`.replace(/^Value error, /, '')
+    }
+    const msg = typeof detail === 'string' ? detail
+      : Array.isArray(detail) && detail.length ? detail.map((d) => (d && typeof d === 'object' ? fieldErr(d) : String(d))).join('; ')
+      : detail && typeof detail === 'object' && typeof detail.message === 'string' ? detail.message
+      : res.status === 503 ? `The server is busy. Try again${res.headers.get('Retry-After') ? ` in ${res.headers.get('Retry-After')} s` : ' shortly'}.`
+      : res.status === 413 ? 'That is too large for the server (limit 16 MB).'
+      : JSON.stringify(detail ?? data ?? res.statusText)
+    throw new ApiError(msg, res.status, detail)
   }
   return data as T
 }
@@ -61,7 +93,9 @@ export const auth = {
   resetPassword: (id: string) => req<{ temporary_password: string }>('POST', `/api/users/${id}/reset-password`),
   resetMfa: (id: string) => req('POST', `/api/users/${id}/reset-mfa`),
   revokeUserSessions: (id: string) => req('POST', `/api/users/${id}/revoke-sessions`),
-  deleteUser: (id: string) => req('DELETE', `/api/users/${id}`),
+  /** Deletes the user's workflows, credentials and executions too, unless `transferTo` names a user who gets them. */
+  deleteUser: (id: string, transferTo?: string) =>
+    req('DELETE', `/api/users/${id}${transferTo ? `?transfer_to=${encodeURIComponent(transferTo)}` : ''}`),
   audit: (params: { user?: string; action?: string; limit?: number; offset?: number }) =>
     req<{ total: number; items: AuditEntry[] }>('GET', `/api/audit?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => [k, String(v)]))}`),
 }
@@ -72,16 +106,23 @@ export const api = {
 
   workflows: () => req<Workflow[]>('GET', '/api/workflows'),
   workflow: (id: string) => req<Workflow>('GET', `/api/workflows/${id}`),
-  expressionPreview: (id: string, body: { value: unknown; items: Item[]; node_outputs: Record<string, Item[]>; node_names?: string[]; item_index?: number }) =>
+  expressionPreview: (id: string, body: { value: unknown; items: Item[]; node_outputs: Record<string, Item[]>; node_names?: string[]; item_index?: number; state?: Record<string, unknown> }) =>
     req<ExprResult>('POST', `/api/workflows/${id}/expression-preview`, body),
   codeCheck: (id: string, body: { language: string; code: string }) =>
-    req<{ ok: boolean; checked?: boolean; line?: number; message?: string }>('POST', `/api/workflows/${id}/code-check`, body),
+    req<{ ok: boolean; checked?: boolean; line?: number; column?: number; message?: string }>('POST', `/api/workflows/${id}/code-check`, body),
   listenerStatus: (id: string) => req<Record<string, ListenerStatus>>('GET', `/api/workflows/${id}/listeners`),
   voiceWorkerStatus: (id: string) => req<Record<string, VoiceWorkerStatus>>('GET', `/api/workflows/${id}/listeners`),
   restartVoiceWorker: (id: string, nodeId: string) => req<VoiceWorkerStatus>('POST', `/api/workflows/${id}/voice-worker/${nodeId}/restart`),
   createWorkflow: (wf: Partial<Workflow>) => req<Workflow>('POST', '/api/workflows', wf),
-  updateWorkflow: (id: string, wf: Partial<Workflow>) => req<Workflow>('PUT', `/api/workflows/${id}`, wf),
+  /** With `revision`, the server refuses (409 conflict) when the workflow changed since that revision. */
+  updateWorkflow: (id: string, wf: Partial<Workflow> & { revision?: number }) => req<Workflow>('PUT', `/api/workflows/${id}`, wf),
   deleteWorkflow: (id: string) => req('DELETE', `/api/workflows/${id}`),
+  /** Publish the draft as a new version: production (triggers, webhooks, schedules) runs it from now on. */
+  publishWorkflow: (id: string, body: { note?: string; activate?: boolean } = {}) => req<Workflow>('POST', `/api/workflows/${id}/publish`, body),
+  workflowVersions: (id: string) => req<WorkflowVersion[]>('GET', `/api/workflows/${id}/versions`),
+  workflowVersion: (id: string, versionId: string) => req<WorkflowVersion>('GET', `/api/workflows/${id}/versions/${versionId}`),
+  /** Make production run this earlier version (rollback); the draft is unchanged. */
+  publishVersion: (id: string, versionId: string) => req<Workflow>('POST', `/api/workflows/${id}/versions/${versionId}/publish`),
   duplicateWorkflow: (id: string, body: { name?: string; folder_id?: string | null } = {}) =>
     req<Workflow>('POST', `/api/workflows/${id}/duplicate`, body),
   moveWorkflows: (ids: string[], folderId: string | null) => req('POST', '/api/workflows/move', { ids, folder_id: folderId }),
