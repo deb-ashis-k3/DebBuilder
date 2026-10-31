@@ -12,23 +12,94 @@ backend/voice/worker.py   LiveKit Agents worker that turns any workflow into a v
 
 Prereqs: Python 3.12 via [uv](https://docs.astral.sh/uv/), Node 20+, Postgres on `localhost:5432` (user `postgres`).
 
-One command, from the repo root:
+Install the `debbuilder` command once (editable: it runs this checkout, so code changes need no reinstall):
 
 ```powershell
-uv run --directory backend python -m app
+cd backend
+uv tool install --editable ".[voice]"
+uv tool update-shell        # adds ~/.local/bin to PATH; open a new terminal afterwards
 ```
 
-Open http://localhost:8000. On every start it:
+Then, from anywhere, in the terminal you're in (VS Code's included):
+
+```powershell
+debbuilder                  # = debbuilder start
+```
+
+(Don't type `start debbuilder` on Windows: `start` is the Windows command for "open in a new window".
+Without installing: `uv run --directory backend python -m app` from the repo root.)
+
+`debbuilder start` sets everything up and runs in the current terminal (Ctrl+C stops it):
 
 1. creates `backend/.env` from `.env.example` on first run and generates `ENCRYPTION_KEY` / `INTERNAL_TOKEN` if empty;
 2. creates the Postgres database in `DATABASE_URL` if it's missing (tables are created at startup);
 3. runs `npm install` when the editor's dependencies changed and `npm run build` when its sources are newer than `frontend/dist`;
-4. starts the API, which serves the editor on the same port, and the voice workers of active voice workflows.
+4. starts the API, which serves the editor on the same port, and opens the browser; if DebBuilder already runs, it just opens it.
 
-Options: `--dev` (live reload: API + Vite dev server on http://localhost:5173), `--no-build`, `--reload`; `PORT` / `HOST` env vars.
-For voice workflows, also install the voice packages once: `uv sync --directory backend --extra voice`.
+| Command | Use |
+|---|---|
+| `debbuilder start` | local use (options `--no-build`, `--no-browser`, `--reload`) |
+| `debbuilder dev` | development: API + Vite dev server (http://localhost:5173), both live-reloading |
+| `debbuilder serve` | **production**: settings only from the environment, never writes `.env` or builds; proxy headers, graceful shutdown |
+| `debbuilder build` | build the editor into `frontend/dist` (CI) |
+| `debbuilder check` | check settings + database connection, exit code 0/1 (CI, init containers) |
+| `debbuilder voice-worker --agent=<name>` | one LiveKit voice worker, to scale voice separately |
 
 `backend/.env` holds the DB URL, the Fernet key that encrypts credentials, and the internal token the voice worker uses. **Back up `ENCRYPTION_KEY`**: losing it makes stored credentials unreadable.
+
+## Production (Linux, Docker, Kubernetes)
+
+The [Dockerfile](Dockerfile) builds the editor at image build time and runs `debbuilder serve` as an unprivileged
+user (uid 10001). Voice models are baked in; the root filesystem can be read-only (only `/app/backend/data` and `/tmp` are written).
+
+- **One machine (VM / server):** [docker-compose.yml](docker-compose.yml) runs DebBuilder + PostgreSQL. Put `ENCRYPTION_KEY`,
+  `INTERNAL_TOKEN`, `POSTGRES_PASSWORD` and `PUBLIC_BASE_URL` in a `.env` next to it, then `docker compose up -d --build`
+  and put a TLS reverse proxy (Caddy, Traefik, nginx) in front of port 8000.
+- **Kubernetes:** [deploy/kubernetes/debbuilder.yaml](deploy/kubernetes/debbuilder.yaml): Deployment (2 replicas, rolling updates,
+  startup / liveness / readiness probes, PodDisruptionBudget, non-root + read-only), Service, Ingress (TLS, WebSockets,
+  sticky sessions), Secret + ConfigMap, a `check` init container, and an optional separate voice-worker Deployment.
+  Use a managed PostgreSQL (or an operator) for `DATABASE_URL`.
+- **Plain Linux host:** `uv tool install ".[voice]"` (or `uv sync --extra voice`), `debbuilder build`, then run `debbuilder serve`
+  under systemd with the settings in an `EnvironmentFile`.
+
+**Configuration** is environment variables only (see [backend/.env.example](backend/.env.example)); keep `ENCRYPTION_KEY`,
+`INTERNAL_TOKEN`, `DATABASE_URL` and SMTP passwords in your secret store. Back up `ENCRYPTION_KEY` with the database:
+credentials can't be decrypted without it. Set `PUBLIC_BASE_URL` to the public https URL and `FORWARDED_ALLOW_IPS`
+to your proxy (`*` inside Kubernetes).
+
+**Probes:** `GET /api/health` (liveness: the process answers) and `GET /api/ready` (readiness: database reachable; also
+reports this replica's id and whether it is the leader).
+
+**High traffic** (thousands of executions per second across workflows), see [engine/store.py](backend/app/engine/store.py):
+- **Batched history writes.** Executions are written by one background writer per process in a single multi-row upsert
+  every 200 ms (or every 500 rows), not one INSERT + one UPDATE each. A short run is written once, already finished.
+  Measured: 20,000 executions → about 120 commits (0.006 per execution instead of 2). Rows are written in primary-key
+  order, so replicas writing at the same time can't deadlock (two replicas under concurrent webhook load: 0 deadlocks).
+  The API reads a run that isn't written yet from the writer's buffer, and paused / editor runs are written at once.
+- **Backpressure:** past `EXECUTIONS_MAX_PENDING` buffered rows, new executions wait for the database instead of filling memory.
+- **Workflow snapshots** are stored once per version (`workflow_snapshots`), not copied into every execution.
+- **What to keep** (like n8n): successful / failed / manual executions, and full data or a summary (status, timings,
+  counts). Defaults in `EXECUTIONS_SAVE_*`, overridable per workflow in *Workflow settings → Execution history*.
+  For a 200-requests-per-second webhook, "save failed only" or "summary" keeps the table small and fast.
+- **Stats** come from a per-day rollup (`execution_stats`) the writer increments; the execution list stops counting at 10,000.
+- **Retention** (leader): history older than `EXECUTIONS_MAX_AGE_DAYS` (14) is deleted in batches of 5,000; runs left
+  "running" by a crashed server are marked failed. Only running / waiting rows are in the status index.
+- **No per-execution overhead elsewhere:** live events are buffered only for runs someone watches (editor runs,
+  workflows open in an editor); credentials are cached for 30 s per process (cleared on every replica when edited);
+  the webhook route table is rebuilt single-flight after a change (a burst can't stampede the database).
+- **Sizing:** throughput scales with replicas (each is one process; the engine is CPU-bound). On Linux the image uses
+  uvloop + httptools. Budget connections: replicas × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW` + 13) < Postgres
+  `max_connections`, or put PgBouncer (transaction mode) in front. Webhooks that don't need the workflow's result
+  should respond immediately, so callers don't hold connections open while it runs.
+
+**Several replicas** share one PostgreSQL:
+- every replica serves the editor, API and webhooks and runs executions;
+- schedules, listener triggers (Kafka, IMAP, …) and voice workers run on **one elected replica** (a Postgres advisory lock);
+  when it stops, another takes over within seconds, so nothing fires twice and nothing stops firing;
+- saving or (de)activating a workflow on any replica reaches the others through Postgres `NOTIFY`;
+- `BACKGROUND_TASKS=off` keeps a replica out of the election (pure web pods next to a worker pod);
+- the live execution view streams from the replica running the execution: use sticky sessions (the manifests do);
+- `data/` (execution files, the Read/Write Files sandbox) must be shared storage (ReadWriteMany) when replicas > 1.
 
 ## How it works
 
@@ -248,15 +319,14 @@ Every request is checked by `backend/app/security.py` against one route policy t
 
   | Role | Can |
   |---|---|
-  | viewer | read everyone's workflows, executions, credential names |
+  | viewer | sign in and view their own (empty) workspace; can't create or change anything |
   | editor | create/edit/run **their own** workflows, folders and credentials; see only their own executions |
-  | admin | + see and manage every user's workflows and credentials, manage users (not owners), read the audit log |
+  | admin | the same in their own workspace + manage users (not owners) and read the audit log |
   | owner | + manage admins and owners (at least one owner always remains) |
 
-- **Per-user workspaces:** workflows, folders and credentials belong to the user who created them (`owner_id`, see `backend/app/access.py`).
-  - Editors only see their own; anyone else's answers 404. Executions follow their workflow.
+- **Per-user workspaces:** workflows, folders, credentials and executions belong to the user who created them (`owner_id`, see `backend/app/access.py`).
+  - **Every role**, including admin and owner, sees and changes only their own; anyone else's answers 404. Roles control what you may do, never whose data you see.
   - At run time a workflow can only use **its owner's** credentials and call its owner's workflows (Execute Workflow, Call Workflow tool, error workflow), so pasting someone else's credential id doesn't work.
-  - Duplicating someone else's workflow makes a copy you own; pick your own credentials before running it.
   - Deleting a user transfers their workspace to the admin who deletes them; active workflows keep running.
   - Upgrading an existing database assigns all existing workflows, folders and credentials to the first owner.
 

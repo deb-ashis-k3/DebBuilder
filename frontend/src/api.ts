@@ -1,4 +1,4 @@
-import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow } from './types'
+import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, Item, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow } from './types'
 
 /** Double-submit CSRF token: the server sets the readable `db_csrf` cookie at sign-in. */
 export function csrfToken(): string {
@@ -71,6 +71,8 @@ export const api = {
 
   workflows: () => req<Workflow[]>('GET', '/api/workflows'),
   workflow: (id: string) => req<Workflow>('GET', `/api/workflows/${id}`),
+  expressionPreview: (id: string, body: { value: unknown; items: Item[]; node_outputs: Record<string, Item[]>; item_index?: number }) =>
+    req<{ ok: true; type: string; text: string; truncated?: boolean } | { ok: false; error: string }>('POST', `/api/workflows/${id}/expression-preview`, body),
   listenerStatus: (id: string) => req<Record<string, ListenerStatus>>('GET', `/api/workflows/${id}/listeners`),
   voiceWorkerStatus: (id: string) => req<Record<string, VoiceWorkerStatus>>('GET', `/api/workflows/${id}/listeners`),
   restartVoiceWorker: (id: string, nodeId: string) => req<VoiceWorkerStatus>('POST', `/api/workflows/${id}/voice-worker/${nodeId}/restart`),
@@ -124,7 +126,6 @@ export const api = {
   createCredential: (c: { name: string; type: string; data: Record<string, unknown> }) => req<Credential>('POST', '/api/credentials', c),
   updateCredential: (id: string, c: { name?: string; data?: Record<string, unknown> }) => req<Credential>('PUT', `/api/credentials/${id}`, c),
   deleteCredential: (id: string) => req('DELETE', `/api/credentials/${id}`),
-  moveCredential: (id: string, ownerId: string) => req<Credential>('POST', `/api/credentials/${id}/move`, { owner_id: ownerId }),
 
   // Telephony (LiveKit SIP trunks / dispatch rules, Plivo wiring)
   telephony: (credId: string) => req<Telephony>('GET', `/api/voice/telephony/${credId}`),

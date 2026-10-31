@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { Icon, isExpr, isVisible, toast } from '../lib'
 import type { Credential, PropSpec, Workflow } from '../types'
 import { CredentialModal } from './CredentialModal'
+import { ExprField } from './ExprField'
 import { Select } from './Select'
 
 // Small shared caches so every field doesn't refetch.
@@ -72,15 +73,6 @@ function ModelPicker({ spec, value, onChange, credentialId }: { spec: PropSpec; 
   )
 }
 
-// Owner of the workflow open in the editor. A workflow can only use its owner's credentials and
-// call its owner's workflows (enforced by the server), so pickers only offer those. Admins see
-// everyone's lists; without this they'd be offered items the run would reject.
-let pickerOwner: string | null | undefined
-let pickerMine = true  // new credentials belong to the caller, so only offer "create" in your own workflow
-export function setPickerOwner(ownerId: string | null | undefined, mine = true) { pickerOwner = ownerId; pickerMine = mine }
-const ofOwner = <T extends { owner_id?: string | null }>(items: T[]) =>
-  pickerOwner === undefined ? items : items.filter((x) => x.owner_id === pickerOwner)
-
 async function refreshCreds() {
   credCache = await api.credentials()
   credListeners.forEach((l) => l(credCache!))
@@ -125,23 +117,8 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
   const creds = useCredentials()
   const [modal, setModal] = useState(false)
   const allowed = spec.credential_types ?? []
-  const ofType = creds.filter((c) => !allowed.length || allowed.includes(c.type))
-  const options = ofOwner(ofType)
-  // Admins also receive other users' credentials; say why they can't be picked instead of hiding them silently.
-  const others = ofType.filter((c) => !options.includes(c))
-  const [moving, setMoving] = useState<string | null>(null)
-  const move = async (c: Credential) => {
-    if (!pickerOwner) return
-    setMoving(c.id)
-    try {
-      await api.moveCredential(c.id, pickerOwner)
-      await refreshCreds()
-      onChange(c.id)
-      toast(`Moved "${c.name}" to this workflow's owner`, 'info')
-    } catch (e) { toast(String(e instanceof Error ? e.message : e), 'error') } finally { setMoving(null) }
-  }
+  const options = creds.filter((c) => !allowed.length || allowed.includes(c.type))
   return (
-    <div>
     <div className="row">
       <Select value={String(value ?? '')} onChange={(v) => onChange(v || null)} placeholder={options.length ? 'Select credential…' : 'No credentials yet'}
         options={options.map((c) => ({ value: c.id, label: c.name, hint: c.type_label }))} />
@@ -151,33 +128,40 @@ function CredentialSelect({ spec, value, onChange }: { spec: PropSpec; value: un
           toast(r.message, r.ok ? 'info' : 'error')
         }}><Icon name="plug-zap" size={16} /></button>
       )}
-      {pickerMine && <button className="btn icon" title="Create credential" onClick={() => setModal(true)}><Icon name="plus" /></button>}
+      <button className="btn icon" title="Create credential" onClick={() => setModal(true)}><Icon name="plus" /></button>
       {modal && (
         <CredentialModal allowedTypes={allowed} onClose={() => setModal(false)}
           onSaved={async (c) => { setModal(false); await refreshCreds(); onChange(c.id) }} />
       )}
     </div>
-    {others.length > 0 && !options.some((c) => c.id === value) && (
-      <div className="cred-others small">
-        <Icon name="info" size={13} />
-        <div>
-          {others.length === 1 ? 'This credential belongs' : `These ${others.length} credentials belong`} to another user, and a workflow
-          can only use its owner's credentials:
-          {others.map((c) => (
-            <div key={c.id} className="cred-other">
-              <b>{c.name}</b> <span className="muted">· {c.owner_name ?? 'unknown'}{c.owner_email ? ` (${c.owner_email})` : ''}</span>
-              {pickerOwner && (
-                <button className="link-btn" disabled={moving === c.id} onClick={() => move(c)}>
-                  {moving === c.id ? 'Moving…' : "Move to this workflow's owner"}
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-    )}
-    </div>
   )
+}
+
+const TYPED = ['number', 'boolean', 'options']
+
+/** A fixed value as an expression that evaluates to the same thing (Python literal inside {{ }}). */
+function toExpression(type: string, value: unknown): string {
+  if (typeof value === 'string' && (!TYPED.includes(type) || isExpr(value))) return value
+  if (value == null || value === '') return ''
+  if (typeof value === 'boolean') return `{{ ${value ? 'True' : 'False'} }}`
+  if (typeof value === 'number') return `{{ ${value} }}`
+  if (typeof value === 'string') return `{{ '${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}' }}`
+  return JSON.stringify(value, null, 2)
+}
+
+/** Back to fixed: the literal inside a lone {{ … }} if there is one, else the parameter's default. */
+function fromExpression(spec: PropSpec, value: unknown): unknown {
+  if (!TYPED.includes(spec.type) || !isExpr(value)) return value
+  const m = /^\s*\{\{\s*([\s\S]*?)\s*\}\}\s*$/.exec(String(value))
+  const lit = m?.[1] ?? ''
+  if (spec.type === 'number' && lit !== '' && !Number.isNaN(Number(lit))) return Number(lit)
+  if (spec.type === 'boolean' && /^(True|False|true|false)$/.test(lit)) return /^t/i.test(lit)
+  if (spec.type === 'options') {
+    const q = /^(['"])(.*)\1$/.exec(lit)
+    const v = q ? q[2] : lit
+    if ((spec.options ?? []).some((o) => String(o.value) === v)) return (spec.options ?? []).find((o) => String(o.value) === v)!.value
+  }
+  return spec.default ?? null
 }
 
 function Collection({ spec, value, onChange }: { spec: PropSpec; value: unknown; onChange: (v: unknown) => void }) {
@@ -193,7 +177,7 @@ function Collection({ spec, value, onChange }: { spec: PropSpec; value: unknown;
           </button>
           <div className="collection-grid">
             {fields.filter((f) => isVisible(f, entry)).map((f) => (
-              <PropertyField key={f.name} spec={f} value={entry[f.name]}
+              <PropertyField key={f.name} spec={f} value={entry[f.name] ?? f.default}
                 onChange={(v) => onChange(list.map((e, j) => (j === i ? { ...e, [f.name]: v } : e)))} />
             ))}
           </div>
@@ -210,15 +194,58 @@ export function PropertyField({ spec, value, onChange, params }: {
   params?: Record<string, unknown>
 }) {
   const workflows = useWorkflows()
-  const exprCapable = ['number', 'boolean', 'options'].includes(spec.type)
+  // Fixed ⇄ Expression, like n8n. Pickers with their own "by ID" mode (models) and structural fields stay fixed.
+  const exprCapable = !['section', 'code', 'credential', 'workflow', 'collection'].includes(spec.type)
+    && !(spec.type === 'combo' && spec.load_options === 'models')
   const [exprMode, setExprMode] = useState(exprCapable && isExpr(value))
   const str = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   const exprCls = isExpr(value) ? 'expr' : ''
+  // Typing or dropping {{ … }} into a fixed field switches it to an expression (n8n does the same).
+  const wasExpr = useRef(isExpr(value))
+  useEffect(() => {
+    const now = isExpr(value)
+    if (exprCapable && now && !wasExpr.current) setExprMode(true)
+    wasExpr.current = now
+  }, [value, exprCapable])
+  const [dropping, setDropping] = useState(false)
   if (spec.type === 'section') return <div className="prop-section">{spec.label}</div>
+
+  const setMode = (expr: boolean) => {
+    if (expr === exprMode) return
+    setExprMode(expr)
+    const next = expr ? toExpression(spec.type, value) : fromExpression(spec, value)
+    if (next !== value) onChange(next)
+  }
+  // n8n: every parameter is a drop target. Text boxes insert at the caret themselves; anything else
+  // (dropdowns, numbers, toggles…) switches to Expression with the dropped reference.
+  const nativeTextTarget = (el: EventTarget) => {
+    const t = el as HTMLElement
+    return t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && ['text', 'search', ''].includes((t as HTMLInputElement).type))
+  }
+  const dragProps = exprCapable ? {
+    onDragOver: (e: React.DragEvent) => {
+      if (!e.dataTransfer.types.includes('text/plain')) return
+      if (!nativeTextTarget(e.target)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' }
+      if (!dropping) setDropping(true)
+    },
+    onDragLeave: (e: React.DragEvent) => {
+      if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropping(false)
+    },
+    onDrop: (e: React.DragEvent) => {
+      setDropping(false)
+      const text = e.dataTransfer.getData('text/plain')
+      if (!text || nativeTextTarget(e.target)) return
+      e.preventDefault()
+      e.stopPropagation()
+      const cur = exprMode && typeof value === 'string' ? value : ''
+      setExprMode(true)
+      onChange(cur.trim() ? `${cur} ${text}` : text)
+    },
+  } : {}
 
   let control: React.ReactNode
   if (exprMode) {
-    control = <input className="input expr" value={str} placeholder="{{ $json.field }}" onChange={(e) => onChange(e.target.value)} />
+    control = <ExprField value={str} onChange={(v) => onChange(v)} placeholder={spec.placeholder ? `${spec.placeholder}  or  {{ $json.field }}` : undefined} />
   } else {
     switch (spec.type) {
       case 'text':
@@ -271,7 +298,7 @@ export function PropertyField({ spec, value, onChange, params }: {
       case 'workflow':
         control = (
           <Select value={String(value ?? '')} onChange={(v) => onChange(v || null)} placeholder="Select workflow…"
-            options={ofOwner(workflows).map((w) => ({ value: w.id, label: w.name }))} />
+            options={workflows.map((w) => ({ value: w.id, label: w.name }))} />
         )
         break
       case 'collection':
@@ -283,13 +310,15 @@ export function PropertyField({ spec, value, onChange, params }: {
   }
 
   return (
-    <div className="field">
+    <div className={`field ${dropping ? 'drop-over' : ''} ${exprMode ? 'is-expr' : ''}`} {...dragProps}>
       <label>
-        {spec.label}{spec.required && <span className="req">*</span>}
+        <span className="lbl" title={spec.label}>{spec.label}{spec.required && <span className="req">*</span>}</span>
         <span className="spacer" />
         {exprCapable && (
-          <button className={`btn ghost sm ${exprMode ? 'primary' : ''}`} style={{ height: 22, padding: '0 6px', fontSize: 11 }}
-            title="Toggle expression" onClick={() => setExprMode(!exprMode)}>fx</button>
+          <span className="expr-toggle" role="group" aria-label="Value type">
+            <button type="button" className={!exprMode ? 'on' : ''} onClick={() => setMode(false)}>Fixed</button>
+            <button type="button" className={exprMode ? 'on' : ''} title="Use data from previous nodes" onClick={() => setMode(true)}>Expression</button>
+          </span>
         )}
       </label>
       {control}

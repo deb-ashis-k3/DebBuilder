@@ -1,0 +1,232 @@
+# DebBuilder on Kubernetes.
+#
+#   docker build -t <registry>/debbuilder:<version> . && docker push <registry>/debbuilder:<version>
+#   edit the image, the Secret values, PUBLIC_BASE_URL and the Ingress host below, then:
+#   kubectl apply -f deploy/kubernetes/debbuilder.yaml
+#
+# PostgreSQL is expected to be a managed service (RDS, Cloud SQL, Azure Database) or your own operator
+# (CloudNativePG, Zalando); point DATABASE_URL at it.
+#
+# How replicas cooperate: every pod serves the editor, API and webhooks and runs executions. Schedules,
+# listener triggers (Kafka, IMAP, …) and voice workers run on one elected pod (a Postgres advisory lock);
+# if it goes away another pod takes over within seconds. Changes are broadcast with Postgres NOTIFY.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: debbuilder
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: debbuilder-secrets
+  namespace: debbuilder
+type: Opaque
+stringData:
+  # Prefer an external secret manager (External Secrets Operator, Sealed Secrets, Vault) over plain values here.
+  DATABASE_URL: "postgresql+psycopg://debbuilder:CHANGE_ME@postgres.example.internal:5432/debbuilder"
+  # python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"  — back it up!
+  ENCRYPTION_KEY: "CHANGE_ME"
+  INTERNAL_TOKEN: "CHANGE_ME_TO_A_RANDOM_32+_CHARACTER_STRING"
+  SMTP_PASSWORD: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debbuilder-config
+  namespace: debbuilder
+data:
+  PUBLIC_BASE_URL: "https://debbuilder.example.com"
+  CORS_ORIGINS: "https://debbuilder.example.com"
+  FORWARDED_ALLOW_IPS: "*" # the ingress controller sets X-Forwarded-*
+  ALLOW_REMOTE_SETUP: "true" # first owner signs up from the browser; set "false" afterwards
+  SMTP_HOST: ""
+  SMTP_PORT: "587"
+  SMTP_USER: ""
+  MAIL_FROM: ""
+  EMAIL_CODE_FALLBACK: "log" # without SMTP, sign-in codes appear in the pod logs
+  VOICE_WORKERS: "auto" # the leader pod runs voice workers; "off" if you run the voice-worker Deployment below
+  VOICE_WORKER_IDLE_PROCESSES: "1"
+  GRACEFUL_TIMEOUT: "30"
+  KEEPALIVE_TIMEOUT: "90" # > the ingress / load balancer idle timeout
+  # Traffic: executions per pod at once, and what history to keep (high-volume workflows can override:
+  # Workflow settings → Execution history). Rows are written in batches; old ones pruned by the leader.
+  MAX_CONCURRENT_EXECUTIONS: "200"
+  EXECUTIONS_SAVE_SUCCESS: "all"
+  EXECUTIONS_SAVE_ERROR: "all"
+  EXECUTIONS_SAVE_DATA: "full" # "summary" for very high volume
+  EXECUTIONS_MAX_AGE_DAYS: "14"
+  # replicas x (DB_POOL_SIZE + DB_MAX_OVERFLOW + 13) must stay below Postgres max_connections (or use PgBouncer)
+  DB_POOL_SIZE: "20"
+  DB_MAX_OVERFLOW: "30"
+---
+# Execution files (binary data) and the Read/Write Files sandbox. With replicas > 1 every pod needs the same
+# files: use a ReadWriteMany class (EFS, Azure Files, Filestore, NFS). With ReadWriteOnce keep replicas: 1.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: debbuilder-data
+  namespace: debbuilder
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: debbuilder
+  namespace: debbuilder
+  labels: { app: debbuilder }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: debbuilder }
+  template:
+    metadata:
+      labels: { app: debbuilder }
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: check
+          image: registry.example.com/debbuilder:1.0.0
+          args: ["check"] # fails fast with a clear message if settings or the database are wrong
+          envFrom:
+            - configMapRef: { name: debbuilder-config }
+            - secretRef: { name: debbuilder-secrets }
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: ["ALL"] },
+            }
+      containers:
+        - name: debbuilder
+          image: registry.example.com/debbuilder:1.0.0
+          args: ["serve"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          envFrom:
+            - configMapRef: { name: debbuilder-config }
+            - secretRef: { name: debbuilder-secrets }
+          startupProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            httpGet: { path: /api/ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            # Let the Service stop sending traffic before the server starts draining.
+            preStop: { exec: { command: ["sleep", "5"] } }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 4Gi } # voice workers hold audio models; lower if you don't use voice
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /app/backend/data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: debbuilder-data }
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: debbuilder
+  namespace: debbuilder
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: debbuilder }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: debbuilder
+  namespace: debbuilder
+spec:
+  selector: { app: debbuilder }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+  # The editor's live execution view streams from the pod that runs the execution: keep a browser on one pod.
+  sessionAffinity: ClientIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: debbuilder
+  namespace: debbuilder
+  annotations:
+    # ingress-nginx: sticky sessions, long-lived WebSockets / streaming replies, larger uploads.
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "debbuilder-route"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    # cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["debbuilder.example.com"]
+      secretName: debbuilder-tls
+  rules:
+    - host: debbuilder.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: debbuilder, port: { name: http } }
+# ---------------------------------------------------------------------------------------------------
+# Optional: voice as its own Deployment (scale calls independently of the API). Set VOICE_WORKERS: "off"
+# in the ConfigMap, create a Secret `debbuilder-livekit` with LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET,
+# then un-comment. One Deployment per agent name; replicas share calls through LiveKit.
+#
+# ---
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata: { name: debbuilder-voice-support, namespace: debbuilder }
+# spec:
+#   replicas: 2
+#   selector: { matchLabels: { app: debbuilder-voice, agent: acme-support } }
+#   template:
+#     metadata: { labels: { app: debbuilder-voice, agent: acme-support } }
+#     spec:
+#       terminationGracePeriodSeconds: 600   # let calls in progress finish
+#       securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+#       containers:
+#         - name: worker
+#           image: registry.example.com/debbuilder:1.0.0
+#           args: ["voice-worker", "--agent=acme-support"]
+#           env:
+#             - { name: DEBBUILDER_API, value: "http://debbuilder.debbuilder.svc.cluster.local" }
+#           envFrom:
+#             - configMapRef: { name: debbuilder-config }
+#             - secretRef: { name: debbuilder-secrets }
+#             - secretRef: { name: debbuilder-livekit }
+#           resources:
+#             requests: { cpu: "1", memory: 2Gi }
+#             limits: { memory: 4Gi }

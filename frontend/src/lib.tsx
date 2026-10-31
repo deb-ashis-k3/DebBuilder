@@ -1,4 +1,5 @@
-import { icons, type LucideProps } from 'lucide-react'
+import type { LucideProps } from 'lucide-react'
+import icons from 'virtual:used-icons'
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
 import { api } from './api'
 import type { NodeTypeSpec, PropSpec, WFNode } from './types'
@@ -11,7 +12,7 @@ const ALIASES: Record<string, string> = {
 }
 
 export function Icon({ name, ...props }: { name: string } & LucideProps) {
-  const C = (icons as Record<string, React.ComponentType<LucideProps>>)[toPascal(ALIASES[name] ?? name)] ?? icons.Box
+  const C = icons[toPascal(ALIASES[name] ?? name)] ?? icons.Box
   return <C size={18} {...props} />
 }
 

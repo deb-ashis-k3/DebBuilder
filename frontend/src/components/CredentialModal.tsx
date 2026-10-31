@@ -17,7 +17,7 @@ export function useCredentialCatalog() {
 /** Monogram tile in the service's brand color (no third-party logos). */
 export function TypeTile({ label, color, size = 36 }: { label: string; color: string; size?: number }) {
   const words = label.replace(/\(.*?\)/g, '').split(/[\s/.-]+/).filter(Boolean)
-  // "OpenAI / OpenAI-compatible" → "OP", not "OO".
+  // "OpenAI" → "OP", not "OO".
   const two = words.length > 1 && words[0][0].toLowerCase() !== words[1][0].toLowerCase()
   const text = (two ? words[0][0] + words[1][0] : words[0]?.slice(0, 2) ?? '?').toUpperCase()
   const hex = color.replace('#', '')

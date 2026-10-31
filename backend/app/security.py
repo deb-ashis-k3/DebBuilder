@@ -227,7 +227,7 @@ R = "GET|HEAD"
 W = "POST|PUT|PATCH|DELETE"
 POLICY: list[tuple[str, str, str]] = [
     # public
-    (R, r"/api/health", "public"),
+    (R, r"/api/(health|ready)", "public"),               # liveness / readiness probes
     (R, r"/api/auth/status", "public"),
     ("POST", r"/api/auth/(setup|signup|login|login/verify|login/resend|logout|password/forgot|password/reset/verify|password/reset)", "public"),
     ("*", r"/webhook/.+", "public"),                      # production webhooks (active workflows only)
@@ -245,6 +245,7 @@ POLICY: list[tuple[str, str, str]] = [
     (R, r"/api/(node-types|code-runtimes|templates)", "workflow:read"),
     (R, r"/api/(workflows|folders)(/.*)?", "workflow:read"),
     ("POST", r"/api/workflows/[^/]+/run", "workflow:execute"),
+    ("POST", r"/api/workflows/[^/]+/expression-preview", "workflow:read"),  # evaluates only, changes nothing
     ("POST", r"/api/voice/session", "workflow:execute"),
     (R, r"/api/voice/telephony/[^/]+", "credential:read"),
     (W, r"/api/voice/telephony(/.*)?", "credential:write"),

@@ -1,5 +1,6 @@
 """Public entry points: webhooks, hosted forms, chat, WhatsApp webhook."""
 
+import asyncio
 import html
 import json
 import logging
@@ -25,19 +26,40 @@ router = APIRouter(tags=["hooks"])
 _webhook_routes: dict[tuple[str, str], tuple[dict, dict]] | None = None
 
 
+_routes_loading: asyncio.Task | None = None
+_routes_version = 0
+
+
 def invalidate_webhooks() -> None:
-    global _webhook_routes
+    global _webhook_routes, _routes_version
     _webhook_routes = None
+    _routes_version += 1  # a rebuild already running started before this change: don't keep its result
+
+
+async def _load_routes() -> dict[tuple[str, str], tuple[dict, dict]]:
+    routes: dict[tuple[str, str], tuple[dict, dict]] = {}
+    for wf, n in await _workflows_with("trigger.webhook", active_only=True):
+        p = n.get("parameters") or {}
+        routes.setdefault((p.get("method", "POST").upper(), p.get("path", "").strip("/")), (wf, n))
+    return routes
 
 
 async def _active_webhook(method: str, path: str) -> tuple[dict, dict] | None:
-    global _webhook_routes
-    if _webhook_routes is None:
-        routes: dict[tuple[str, str], tuple[dict, dict]] = {}
-        for wf, n in await _workflows_with("trigger.webhook", active_only=True):
-            p = n.get("parameters") or {}
-            routes.setdefault((p.get("method", "POST").upper(), p.get("path", "").strip("/")), (wf, n))
-        _webhook_routes = routes
+    """Production webhook routes come from a cache rebuilt after any workflow change. The rebuild is
+    single-flight: under load hundreds of requests arrive while the cache is empty (startup, a save), and
+    each querying the database on its own exhausted the connection pool and Postgres' client limit."""
+    global _webhook_routes, _routes_loading
+    while _webhook_routes is None:
+        if _routes_loading is None or _routes_loading.done():
+            version = _routes_version
+
+            async def build() -> None:
+                global _webhook_routes
+                routes = await _load_routes()
+                if version == _routes_version:
+                    _webhook_routes = routes
+            _routes_loading = asyncio.get_running_loop().create_task(build())
+        await asyncio.shield(_routes_loading)
     return _webhook_routes.get((method, path.strip("/")))
 
 

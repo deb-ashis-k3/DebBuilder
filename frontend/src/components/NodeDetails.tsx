@@ -1,24 +1,31 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
 import { Icon, fmtDuration, isVisible, outputPorts, toast, useCatalog } from '../lib'
 import type { CodeRuntime, Item, ListenerStatus, NodeRun, NodeSettings, RunState, VoiceWorkerStatus, WFNode } from '../types'
 import { AiLogs } from './AiLogs'
+import { ExprDataContext, type ExprData } from './ExprField'
 import { DataView } from './DataView'
 import { PropertyField } from './PropertyField'
 import { Select } from './Select'
 
-export interface ParentRef { id: string; name: string; port: string }
+export interface ParentRef { id: string; name: string; port: string; type?: string }
 
 function pinnedPorts(pin: WFNode['pin_data']): Record<string, Item[]> | null {
   if (pin == null) return null
   return Array.isArray(pin) ? { main: pin } : pin
 }
 
-export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChange, onClose, onRun }: {
+export function NodeDetails({ node, run, runsByNode, nodeNames, parents, children, workflowId, onChange, onClose, onRun, onOpen }: {
   node: WFNode
+  /** Node id → name, so expressions like $('Name') can be previewed with earlier nodes' output. */
+  nodeNames: Record<string, string>
   run?: RunState
   runsByNode: Record<string, RunState>
   parents: ParentRef[]
+  /** Nodes this one feeds (main outputs), shown on the right edge to jump to, like n8n. */
+  children: ParentRef[]
+  /** Open another node's panel (the previous / next node buttons). */
+  onOpen: (id: string) => void
   workflowId: string
   onChange: (n: WFNode) => void
   onClose: () => void
@@ -58,6 +65,14 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
   const parentNode = parent && byType ? parent : undefined
   const inItems = parentNode ? parentRun?.output?.[parent!.port] ?? parentRun?.output?.main : (r?.input ?? run?.input)
   const inBase = parentNode ? `$('${parentNode.name.replace(/'/g, "\\'")}').json` : '$json'
+  // Live expression results resolve against this node's input and every node's latest output (capped for size).
+  const exprData = useMemo<ExprData>(() => ({
+    workflowId,
+    items: (inItems ?? []).slice(0, 50),
+    nodeOutputs: Object.fromEntries(Object.entries(runsByNode)
+      .filter(([id, rs]) => rs.output && nodeNames[id])
+      .map(([id, rs]) => [nodeNames[id], (rs.output!.main ?? Object.values(rs.output!)[0] ?? []).slice(0, 50)])),
+  }), [workflowId, inItems, runsByNode, nodeNames])
   const fed = r?.sources?.map((s) => parents.find((p) => p.id === s.node_id)?.name ?? s.node_id).join(', ')
 
   const pin = () => {
@@ -93,8 +108,15 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
       options={runs.map((_, i) => ({ value: String(i), label: `Run ${i + 1} of ${runs.length}` }))} />
   )
 
+  const layout = usePanelLayout()
+  const uniq = (refs: ParentRef[]) => refs.filter((r, i) => refs.findIndex((x) => x.id === r.id) === i)
+
   return (
+    <ExprDataContext.Provider value={exprData}>
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="ndv-shell">
+      <NodeNav side="prev" refs={uniq(parents)} onOpen={onOpen} />
+      <NodeNav side="next" refs={uniq(children)} onOpen={onOpen} />
       <div className="modal wide">
         <div className="modal-head">
           <div className="mini-icon" style={{ '--nc': spec.color } as React.CSSProperties}><Icon name={spec.icon} size={15} /></div>
@@ -121,7 +143,7 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
             <button key={p} className={`tab ${pane === p ? 'active' : ''}`} onClick={() => setPane(p)}>{p === 'params' ? 'Parameters' : p[0].toUpperCase() + p.slice(1)}</button>
           ))}
         </div>
-        <div className={`ndv pane-${pane}`} style={{ flex: 1, minHeight: 0 }}>
+        <div ref={layout.ref} className={`ndv pane-${pane}`} style={{ flex: 1, minHeight: 0, ...layout.style }}>
           <div className="ndv-col ndv-data ndv-in">
             <div className="ndv-col-head">
               <Icon name="log-in" size={14} /> Input
@@ -159,6 +181,15 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
           </div>
 
           <div className="ndv-col ndv-params">
+            {layout.active && (
+              <>
+                <div className="ndv-resize l" title="Drag to resize" onPointerDown={layout.start('left')} />
+                <div className="ndv-resize r" title="Drag to resize" onPointerDown={layout.start('right')} />
+                <div className="ndv-grip" title="Drag to move · double-click to reset" onPointerDown={layout.start('move')} onDoubleClick={layout.reset}>
+                  <Icon name="grip-horizontal" size={14} />
+                </div>
+              </>
+            )}
             <div className="ndv-col-head">
               <div className="tabs">
                 <button className={`tab ${tab === 'params' ? 'active' : ''}`} onClick={() => setTab('params')}>Parameters</button>
@@ -298,8 +329,100 @@ export function NodeDetails({ node, run, runsByNode, parents, workflowId, onChan
           </div>
         </div>
       </div>
+      </div>
+    </div>
+    </ExprDataContext.Provider>
+  )
+}
+
+/** n8n's floating buttons on the panel's edges: the nodes before (left) and after (right) this one. */
+function NodeNav({ side, refs, onOpen }: { side: 'prev' | 'next'; refs: ParentRef[]; onOpen: (id: string) => void }) {
+  const { byType } = useCatalog()
+  if (!refs.length) return null
+  return (
+    <div className={`ndv-nav ${side}`}>
+      {refs.map((r) => {
+        const s = r.type ? byType[r.type] : undefined
+        return (
+          <button key={r.id} type="button" className="ndv-nav-btn" style={{ '--nc': s?.color ?? 'var(--text-3)' } as React.CSSProperties}
+            onClick={() => onOpen(r.id)} aria-label={`${side === 'prev' ? 'Previous' : 'Next'} node: ${r.name}`}>
+            <Icon name={s?.icon ?? 'box'} size={18} />
+            <span className="ndv-nav-tip">{r.name}</span>
+          </button>
+        )
+      })}
     </div>
   )
+}
+
+const LAYOUT_KEY = 'ndv-layout'
+const DEFAULT_LAYOUT = { left: 0.31, width: 0.38 }  // fractions of the panel width: input | parameters | output
+const MIN_SIDE = 200
+const MIN_MAIN = 380
+
+/** The parameters column can be moved (top grip) and resized (its edges); input / output take the rest. Remembered per browser. */
+function usePanelLayout() {
+  const ref = useRef<HTMLDivElement>(null)
+  const [width, setWidth] = useState(0)
+  const [frac, setFrac] = useState<{ left: number; width: number }>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null')
+      if (v && typeof v.left === 'number' && typeof v.width === 'number') return v
+    } catch { /* private mode / bad value */ }
+    return DEFAULT_LAYOUT
+  })
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ro = new ResizeObserver(([e]) => setWidth(e.contentRect.width))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  // Narrow screens keep the stacked / tabbed layout from the stylesheet.
+  const active = width >= 1100
+  const clamp = useCallback((left: number, w: number) => {
+    const W = width || 1
+    const wpx = Math.min(Math.max(w * W, MIN_MAIN), W - 2 * MIN_SIDE)
+    const lpx = Math.min(Math.max(left * W, MIN_SIDE), W - wpx - MIN_SIDE)
+    return { left: lpx, width: wpx }
+  }, [width])
+  const px = clamp(frac.left, frac.width)
+  const save = (f: { left: number; width: number }) => { try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(f)) } catch { /* ignore */ } }
+
+  const start = (mode: 'left' | 'right' | 'move') => (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const el = e.currentTarget
+    el.setPointerCapture(e.pointerId)
+    const x0 = e.clientX
+    const { left: l0, width: w0 } = px
+    const W = width
+    let last = frac
+    const move = (ev: PointerEvent) => {
+      const dx = ev.clientX - x0
+      let l = l0, w = w0
+      if (mode === 'move') l = l0 + dx
+      else if (mode === 'right') w = w0 + dx
+      else { l = Math.min(l0 + dx, l0 + w0 - MIN_MAIN); w = w0 - (l - l0) }
+      const c = clamp(l / W, w / W)
+      last = { left: c.left / W, width: c.width / W }
+      setFrac(last)
+    }
+    const up = () => {
+      el.removeEventListener('pointermove', move)
+      el.removeEventListener('pointerup', up)
+      el.removeEventListener('pointercancel', up)
+      document.body.classList.remove('ndv-dragging')
+      save(last)
+    }
+    document.body.classList.add('ndv-dragging')
+    el.addEventListener('pointermove', move)
+    el.addEventListener('pointerup', up)
+    el.addEventListener('pointercancel', up)
+  }
+  const reset = () => { setFrac(DEFAULT_LAYOUT); save(DEFAULT_LAYOUT) }
+  const style: React.CSSProperties = active ? { gridTemplateColumns: `${px.left}px ${px.width}px minmax(0, 1fr)` } : {}
+  return { ref, active, style, start, reset }
 }
 
 function TriggerHelp({ type, nodeId, params, workflowId, origin }: { type: string; nodeId: string; params: Record<string, unknown>; workflowId: string; origin: string }) {

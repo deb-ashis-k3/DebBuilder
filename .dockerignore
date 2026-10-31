@@ -1,0 +1,13 @@
+**/node_modules
+**/.venv
+**/__pycache__
+**/.ruff_cache
+**/*.pyc
+frontend/dist
+backend/.env
+backend/data
+.git
+.vscode
+.idea
+*.log
+deploy

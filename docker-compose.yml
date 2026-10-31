@@ -1,0 +1,61 @@
+# DebBuilder + PostgreSQL on one machine (a VM, a home server, a staging box).
+#
+#   1. Create a .env next to this file with at least:
+#        ENCRYPTION_KEY=<python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())">
+#        INTERNAL_TOKEN=<any random string of 32+ characters>
+#        POSTGRES_PASSWORD=<a strong password>
+#        PUBLIC_BASE_URL=https://debbuilder.example.com      (the URL people and webhooks use)
+#   2. docker compose up -d --build
+#   3. Open PUBLIC_BASE_URL (put a TLS reverse proxy such as Caddy / Traefik / nginx in front of port 8000).
+#
+# Back up the `pgdata` and `appdata` volumes and keep ENCRYPTION_KEY safe: without it stored credentials
+# can't be decrypted.
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: debbuilder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: debbuilder
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U debbuilder -d debbuilder"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    image: debbuilder:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://debbuilder:${POSTGRES_PASSWORD}@db:5432/debbuilder
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY in .env}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN in .env}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      CORS_ORIGINS: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      # The reverse proxy in front sets X-Forwarded-For / -Proto (client IPs for rate limits, https links).
+      FORWARDED_ALLOW_IPS: "*"
+      # The first owner account must be created from the browser, which isn't "this machine" for the container.
+      ALLOW_REMOTE_SETUP: ${ALLOW_REMOTE_SETUP:-true}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      EMAIL_CODE_FALLBACK: ${EMAIL_CODE_FALLBACK:-log}
+    volumes:
+      - appdata:/app/backend/data
+    stop_grace_period: 40s
+
+volumes:
+  pgdata:
+  appdata:

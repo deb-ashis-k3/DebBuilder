@@ -15,14 +15,14 @@ import { subNodeStats, upsertSubRun } from '../components/logTree'
 import { nodeTypes, type FlowNodeData } from '../components/FlowNode'
 import { NodeDetails } from '../components/NodeDetails'
 import { Palette } from '../components/Palette'
-import { OwnerBadge } from '../components/Owner'
-import { PropertyField, setPickerOwner } from '../components/PropertyField'
+import { PropertyField } from '../components/PropertyField'
 import { Icon, defaultParams, newId, toast, uniqueName, useCatalog } from '../lib'
 import type { ExecEvent, Execution, Folder, Item, NodeRun, NodeTypeSpec, RunState, StateKey, WFEdge, WFNode, Workflow } from '../types'
 import { WorkflowExecutionsView } from './Executions'
 import { useAuth } from '../auth'
 import { CanvasContextMenu, SelectionToolbar, type MenuTarget } from '../canvas/CanvasMenus'
 import { tidyUp } from '../canvas/tidyUp'
+import '../pages.css'  // styles for pages loaded on demand
 
 // LiveKit client is large; load it only when the voice panel opens.
 const VoicePanel = lazy(() => import('../components/VoicePanel').then((m) => ({ default: m.VoicePanel })))
@@ -88,7 +88,7 @@ function EditorInner() {
   const importRef = useRef<HTMLInputElement>(null)
   useEffect(() => { api.folders().then(setFolders).catch(() => {}) }, [])
   const { byType } = useCatalog()
-  const { can, user } = useAuth()
+  const { can } = useAuth()
   const readOnly = !can('workflow:write')
   const rf = useReactFlow()
   const [wf, setWf] = useState<Workflow | null>(null)
@@ -107,6 +107,7 @@ function EditorInner() {
   const [execRuns, setExecRuns] = useState<NodeRun[]>([])
   const [execMeta, setExecMeta] = useState<ExecMeta | null>(null)
   const runData = useMemo(() => runStateFromRuns(execRuns), [execRuns])
+  const nodeNames = useMemo(() => Object.fromEntries(nodes.map((n) => [n.id, n.data.node.name])), [nodes])
   const [execId, setExecId] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [waiting, setWaiting] = useState<Execution['waiting_for'] | null>(null)
@@ -124,7 +125,6 @@ function EditorInner() {
     let alive = true // ignore a superseded response (route change / StrictMode double effect)
     api.workflow(id).then((w) => {
       if (!alive) return
-      setPickerOwner(w.owner_id ?? null, w.owner_id === user?.id)
       setWf(w)
       setNodes(w.nodes.map((n) => toRF(n)))
       setEdges(w.edges.map(edgeToRF))
@@ -138,7 +138,7 @@ function EditorInner() {
         requestAnimationFrame(() => updateInternals(w.nodes.map((n) => n.id)))
       })
     }).catch((e) => toast(String(e), 'error'))
-    return () => { alive = false; setPickerOwner(undefined) }
+    return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, rf, setEdges, setNodes, updateInternals])
 
@@ -642,7 +642,6 @@ function EditorInner() {
         )}
         {crumbs.length > 0 && <span className="ed-crumb-sep hide-sm">/</span>}
         <input className="wf-name" value={wf.name} onChange={(e) => { setWf({ ...wf, name: e.target.value }); markDirty() }} />
-        <OwnerBadge item={wf} />
         <span className={`save-state ${dirty ? 'dirty' : ''}`} title={dirty ? 'Unsaved changes' : 'All changes saved'}><span className="btn-text">{dirty ? 'Unsaved changes' : 'All changes saved'}</span></span>
         <span className="spacer" />
         <div className="tabs ed-tabs" role="tablist">
@@ -780,10 +779,16 @@ function EditorInner() {
       </div>
 
       {opened && opened.type === 'flow' && (
-        <NodeDetails node={opened.data.node} run={runData[opened.id]} runsByNode={runData} workflowId={wf.id}
+        <NodeDetails key={opened.id} node={opened.data.node} run={runData[opened.id]} runsByNode={runData} workflowId={wf.id} nodeNames={nodeNames}
+          onOpen={(id) => setOpenNode(id)}
+          children={edges.filter((e) => e.source === opened.id && !(e.sourceHandle ?? '').startsWith('ai_')).map((e) => {
+            const n = rf.getNode(e.target) as RFNode | undefined
+            return { id: e.target, port: e.targetHandle ?? 'main', name: n?.data.node.name ?? e.target, type: n?.data.node.type }
+          })}
           parents={edges.filter((e) => e.target === opened.id && !(e.targetHandle ?? '').startsWith('ai_')).map((e) => ({
             id: e.source, port: e.sourceHandle ?? 'main',
             name: (rf.getNode(e.source) as RFNode | undefined)?.data.node.name ?? e.source,
+            type: (rf.getNode(e.source) as RFNode | undefined)?.data.node.type,
           }))}
           onChange={updateNode} onClose={() => setOpenNode(null)}
           onRun={run} />
@@ -844,6 +849,19 @@ function SettingsModal({ wf, onChange, onClose, onDelete }: { wf: Workflow; onCh
           </div>
           <PropertyField spec={{ name: 'error_workflow_id', label: 'Error workflow (runs its Error Trigger on failure)', type: 'workflow', default: null }}
             value={wf.settings.error_workflow_id} onChange={(v) => onChange({ ...wf, settings: { ...wf.settings, error_workflow_id: (v as string) || undefined } })} />
+          <div className="prop-section">Execution history</div>
+          {([
+            ['save_success', 'Save successful production executions', [['all', 'Save'], ['none', 'Do not save']]],
+            ['save_error', 'Save failed production executions', [['all', 'Save'], ['none', 'Do not save']]],
+            ['save_manual', 'Save manual (editor) executions', [['all', 'Save'], ['none', 'Do not save']]],
+            ['save_data', 'Execution data to keep', [['full', 'Everything (every node\'s items)'], ['summary', 'Summary only (status, timings, item counts)']]],
+          ] as const).map(([key, label, opts]) => (
+            <PropertyField key={key} spec={{ name: key, label, type: 'options', default: 'default',
+              options: [{ label: 'Server default', value: 'default' }, ...opts.map(([value, l]) => ({ label: l, value }))] }}
+              value={wf.settings[key] ?? 'default'}
+              onChange={(v) => onChange({ ...wf, settings: { ...wf.settings, [key]: v === 'default' ? undefined : v } })} />
+          ))}
+          <div className="hint" style={{ marginTop: -8, marginBottom: 16 }}>For high-traffic workflows, save failed runs only or a summary: the history stays small and fast. Counts on the dashboard include unsaved runs. Paused runs are always kept.</div>
           <PropertyField spec={{ name: 'variables', label: 'Variables ($vars.key)', type: 'collection', default: [], fields: [
             { name: 'key', label: 'Key', type: 'string', default: '' }, { name: 'value', label: 'Value', type: 'string', default: '' }] }}
             value={wf.settings.variables ?? []} onChange={(v) => onChange({ ...wf, settings: { ...wf.settings, variables: v as { key: string; value: string }[] } })} />

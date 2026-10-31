@@ -11,7 +11,7 @@ from ..db import AuditLog, Credential, Folder, SessionLocal, User, Workflow
 from ..security import (ROLES, audit, check_password_policy, clean_username, current, hash_password, revoke_sessions, role_rank,
                         temp_password)
 from .auth import ensure_username_free, user_json
-from .hooks import invalidate_webhooks
+from .. import cluster
 
 router = APIRouter(prefix="/api", tags=["admin"])
 
@@ -187,7 +187,7 @@ async def delete_user(user_id: str, request: Request):
             moved[model.__tablename__] = res.rowcount
         await s.delete(u)
         await s.commit()
-    invalidate_webhooks()  # cached webhook routes carry the owner
+    cluster.users_changed()  # cached webhook routes and running triggers carry the owner
     await audit("user.deleted", request, p, status=200, target=email, transferred_to=p.user.email, **moved)
     return {"ok": True, "transferred": moved}
 

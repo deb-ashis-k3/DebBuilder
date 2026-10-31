@@ -68,9 +68,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 export const useAuth = () => useContext(Ctx)
 
-/** Mirror of backend/app/access.py: editors only see their own workspace. */
-export const readsAll = (u: User | null) => !!u && u.role !== 'editor'
-export const managesAll = (u: User | null) => !!u && (u.role === 'admin' || u.role === 'owner')
 
 export const ROLE_LABEL: Record<Role, string> = { owner: 'Owner', admin: 'Admin', editor: 'Editor', viewer: 'Viewer' }
 export const ROLE_HELP: Record<Role, string> = {

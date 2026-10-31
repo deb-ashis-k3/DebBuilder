@@ -4,14 +4,13 @@ import { CredentialModal, TypeTile, useCredentialCatalog } from '../components/C
 import { Icon, fmtDate, toast } from '../lib'
 import type { Credential, TestResult } from '../types'
 import { confirmDialog, errText } from '../components/Dialogs'
-import { OwnerBadge, OwnerFilter, useOwnerScope } from '../components/Owner'
-import { managesAll, useAuth } from '../auth'
+import { useAuth } from '../auth'
+import '../pages.css'  // styles for pages loaded on demand
 
 export default function Credentials() {
-  const { can, user } = useAuth()
-  const owners = useOwnerScope('cred-owner')
-  // Editing, testing or deleting needs ownership (or admin); viewers only see names.
-  const canEdit = (c: Credential) => can('credential:write') && (owners.isMine(c) || managesAll(user))
+  const { can } = useAuth()
+  // Everyone only ever gets their own credentials; viewers can't change them.
+  const canEdit = (_c: Credential) => can('credential:write')
   const catalog = useCredentialCatalog()
   const [list, setList] = useState<Credential[] | null>(null)
   const [edit, setEdit] = useState<Credential | 'new' | null>(null)
@@ -35,7 +34,7 @@ export default function Credentials() {
     toast(`Tested ${targets.length} credential(s)`)
   }
 
-  const shown = (list ?? []).filter((c) => owners.visible(c) && `${c.name} ${c.type_label} ${c.category} ${c.owner_name ?? ''}`.toLowerCase().includes(q.toLowerCase()))
+  const shown = (list ?? []).filter((c) => `${c.name} ${c.type_label} ${c.category}`.toLowerCase().includes(q.toLowerCase()))
   const canWrite = can('credential:write')
   const total = catalog ? Object.keys(catalog.types).length : 0
 
@@ -55,7 +54,6 @@ export default function Credentials() {
               <Icon name="search" size={15} />
               <input className="input" placeholder="Search credentials…" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
-            {owners.show && <OwnerFilter value={owners.scope} onChange={owners.setScope} />}
           </div>
         )}
 
@@ -79,7 +77,6 @@ export default function Credentials() {
                   <div className="muted small">{c.type_label} · {c.category} · updated {fmtDate(c.updated_at)}</div>
                   {r && r !== 'testing' && <div className={`test-inline ${r.ok ? 'ok' : 'bad'}`}>{r.message}</div>}
                 </div>
-                <OwnerBadge item={c} />
                 {c.oauth2 && (c.oauth_connected ? <span className="badge success">Connected</span> : <span className="badge waiting">Not connected</span>)}
                 {r === 'testing' && <span className="badge running">Testing</span>}
                 {r && r !== 'testing' && <span className={`badge ${r.ok ? 'success' : 'error'}`}>{r.ok ? 'Working' : 'Failed'}</span>}

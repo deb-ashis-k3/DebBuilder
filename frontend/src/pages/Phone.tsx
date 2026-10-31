@@ -6,6 +6,7 @@ import { Select } from '../components/Select'
 import { useAuth } from '../auth'
 import { Icon, toast } from '../lib'
 import type { Credential, DispatchRule, SipTrunk, Telephony, Workflow } from '../types'
+import '../pages.css'  // styles for pages loaded on demand
 
 const DEFAULT_AGENT = 'debbuilder-voice'
 

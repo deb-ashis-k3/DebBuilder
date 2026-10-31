@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # Voice workflows: "auto" = the backend runs a LiveKit voice worker for every active workflow's
     # agent name (voice/worker.py, restarted if it crashes); "off" = you run the workers yourself.
     voice_workers: str = "auto"
+    # "auto" = replicas elect one leader (Postgres lock) that runs schedules, listeners and voice workers;
+    # "off" = this replica only serves requests (e.g. web pods next to a dedicated worker pod).
+    background_tasks: str = "auto"
     # Warm call processes each worker keeps ready (each holds the audio models in memory).
     voice_worker_idle_processes: int = 1
     # How workers reach this API; default http://127.0.0.1:$PORT (8000).
@@ -28,10 +31,27 @@ class Settings(BaseSettings):
     files_root: str = "data/files"
     # Execute Command runs shell commands on the server: off unless you enable it (like n8n 2.x).
     enable_execute_command: bool = False
-    # Executions running at once; more wait their turn (backpressure for webhook bursts).
-    max_concurrent_executions: int = 20
+    # Executions running at once per process; more wait their turn (backpressure for webhook bursts).
+    # They mostly wait on network calls and hold no database connection while running, so this can be high.
+    max_concurrent_executions: int = 200
     db_pool_size: int = 20
     db_max_overflow: int = 30
+    # ---- execution history at volume (engine/store.py) ----
+    # What to keep: "all" | "none" (per workflow overridable in its settings). Paused runs are always kept.
+    executions_save_success: str = "all"
+    executions_save_error: str = "all"
+    executions_save_manual: bool = True
+    # "full" keeps every node's items; "summary" keeps status, timings and counts only (much smaller rows).
+    executions_save_data: str = "full"
+    # The writer batches rows: every N ms, or sooner when this many are waiting; producers wait past max_pending.
+    executions_flush_ms: int = 200
+    executions_batch_size: int = 500
+    executions_max_pending: int = 20000
+    # Retention on the leader: delete history older than this (0 = keep forever); runs left "running" by a
+    # crashed server are marked failed after this many hours.
+    executions_max_age_days: int = 14
+    executions_stale_after_hours: int = 12
+    executions_prune_every_minutes: int = 15
     # Sign-in attempts per IP per minute (password and MFA steps).
     login_rate_limit: int = 10
     # First-run owner setup is only accepted from this machine unless explicitly allowed,

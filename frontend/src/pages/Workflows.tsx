@@ -2,11 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, downloadJson } from '../api'
 import { DeleteFolderDialog, ImportDialog, Menu, MoveDialog, PromptDialog, confirmDialog, errText, folderPath, folderSubtree } from '../components/Dialogs'
-import { OwnerBadge, OwnerFilter, useOwnerScope } from '../components/Owner'
 import { Select } from '../components/Select'
 import { Icon, fmtDate, toast, useCatalog } from '../lib'
 import type { Folder, Workflow } from '../types'
 import { useAuth } from '../auth'
+import { prefetchEditor } from '../prefetch'
 
 // Template tags → representative node type (for the card's icon strip).
 const TAG_NODE: Record<string, string> = {
@@ -57,23 +57,17 @@ export default function Workflows() {
   }, [])
   useEffect(() => { setSel(new Set()) }, [folderId])
 
-  const owners = useOwnerScope('wf-owner')
   const folder = folders.find((f) => f.id === folderId) ?? null
   const crumbs = folderPath(folders, folderId)
   const searching = q.trim().length > 0
-  // Inside a folder everything belongs to the folder's owner, so the owner filter applies to Home and search.
-  const inScope = (o: { owner_id?: string | null }) => (folderId && !searching) || owners.visible(o)
-  // New items always belong to the caller, so they can't go into someone else's folder.
-  const canCreateHere = canWrite && (!folder || owners.isMine(folder))
+  const canCreateHere = canWrite
   const foldersOf = (ownerId?: string | null) => folders.filter((f) => f.owner_id === ownerId)
   const subfolders = folders.filter((f) => (searching ? f.name.toLowerCase().includes(q.toLowerCase()) : f.parent_id === folderId))
-    .filter(inScope)
     .sort((a, b) => a.name.localeCompare(b.name))
 
   const shown = useMemo(() => {
     const needle = q.toLowerCase()
     const rows = (list ?? []).filter((w) => (searching ? w.name.toLowerCase().includes(needle) : (w.folder_id ?? null) === folderId))
-      .filter(inScope)
       .filter((w) => !status || (status === 'active') === w.active)
     const by: Record<Sort, (a: Workflow, b: Workflow) => number> = {
       updated: (a, b) => b.updated_at.localeCompare(a.updated_at),
@@ -83,7 +77,7 @@ export default function Workflows() {
     }
     return rows.sort(by[sort])
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list, q, searching, folderId, status, sort, owners.scope])
+  }, [list, q, searching, folderId, status, sort])
 
   const total = Object.values(stats).reduce((a, b) => a + b, 0)
   const statCards = [
@@ -95,8 +89,9 @@ export default function Workflows() {
   ]
 
   // ---- actions --------------------------------------------------------------
-  const create = async () => navigate(`/workflow/${(await api.createWorkflow({ name: 'My workflow', folder_id: folderId })).id}`)
-  const fromTemplate = async (id: string) => navigate(`/workflow/${(await api.fromTemplate(id)).id}`)
+  // The editor chunk downloads while the API creates the workflow.
+  const create = async () => { prefetchEditor(); navigate(`/workflow/${(await api.createWorkflow({ name: 'My workflow', folder_id: folderId })).id}`) }
+  const fromTemplate = async (id: string) => { prefetchEditor(); navigate(`/workflow/${(await api.fromTemplate(id)).id}`) }
   const move = async (ids: string[], target: string | null) => {
     await api.moveWorkflows(ids, target)
     const name = target ? folders.find((f) => f.id === target)?.name : 'Home'
@@ -236,7 +231,6 @@ export default function Workflows() {
             <Icon name="search" size={15} />
             <input className="input" placeholder={folderId ? 'Search all folders…' : 'Search workflows and folders…'} value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
-          {owners.show && (!folderId || searching) && <OwnerFilter className="wf-filter" value={owners.scope} onChange={owners.setScope} />}
           <Select className="wf-filter" value={status} onChange={setStatus} title="Status"
             options={[{ value: '', label: 'All statuses' }, { value: 'active', label: 'Active' }, { value: 'inactive', label: 'Inactive' }]} />
           <Select className="wf-filter" value={sort} onChange={(v) => { setSort(v as Sort); lsSet('wf-sort', v) }} title="Sort"
@@ -275,7 +269,6 @@ export default function Workflows() {
                     {f.workflow_count} workflow{f.workflow_count === 1 ? '' : 's'}{subCount(f) ? ` · ${subCount(f)} folder${subCount(f) === 1 ? '' : 's'}` : ''}
                   </div>
                 </div>
-                <OwnerBadge item={f} />
                 <Menu items={folderMenu(f)} title="Folder actions" />
               </div>
             ))}
@@ -304,6 +297,7 @@ export default function Workflows() {
                 e.dataTransfer.setData(DRAG_WF, JSON.stringify(ids))
                 e.dataTransfer.effectAllowed = 'move'
               }}
+              onPointerEnter={prefetchEditor} onFocus={prefetchEditor}
               onClick={(e) => (e.ctrlKey || e.metaKey ? window.open(`/workflow/${w.id}`, '_blank') : navigate(`/workflow/${w.id}`))}>
               <input type="checkbox" className="row-check" checked={sel.has(w.id)} onClick={(e) => e.stopPropagation()} onChange={() => toggle(w.id)} aria-label={`Select ${w.name}`} />
               <div className="icons-row">
@@ -319,7 +313,6 @@ export default function Workflows() {
                   {w.node_count} nodes · updated {fmtDate(w.updated_at)}
                 </div>
               </div>
-              <OwnerBadge item={w} />
               {w.active ? <span className="badge success">Active</span> : <span className="badge">Inactive</span>}
               <Menu items={workflowMenu(w)} title="Workflow actions" />
             </div>
@@ -331,7 +324,7 @@ export default function Workflows() {
             <div className="section-title" ref={tplRef}><Icon name="layout-template" size={17} /> Start from a template</div>
             <div className="grid-cards">
               {templates.map((t, i) => (
-                <div key={t.id} className="card tpl" style={{ animationDelay: `${i * 40}ms` }} onClick={() => fromTemplate(t.id)}>
+                <div key={t.id} className="card tpl" style={{ animationDelay: `${i * 40}ms` }} onPointerEnter={prefetchEditor} onClick={() => fromTemplate(t.id)}>
                   <div className="tpl-icons">
                     {t.tags.flatMap((tag) => (byType[TAG_NODE[tag]] ? [byType[TAG_NODE[tag]]] : [])).slice(0, 3).map((nt) => (
                       <div key={nt.type} className="mini-icon" style={{ '--nc': nt.color } as React.CSSProperties}><Icon name={nt.icon} size={15} /></div>
@@ -379,7 +372,7 @@ export default function Workflows() {
       )}
       {dialog?.kind === 'import' && (
         <ImportDialog folderId={folderId} onClose={() => setDialog(null)}
-          onImported={(wfs) => { if (wfs.length === 1) navigate(`/workflow/${wfs[0].id}`); else load() }} />
+          onImported={(wfs) => { if (wfs.length === 1) { prefetchEditor(); navigate(`/workflow/${wfs[0].id}`) } else load() }} />
       )}
     </div>
   )

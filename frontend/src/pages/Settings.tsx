@@ -7,6 +7,7 @@ import { Select } from '../components/Select'
 import { Icon, fmtDate, toast } from '../lib'
 import type { ApiKey, AuditEntry, AuthSessionInfo, Role, User } from '../types'
 import { PasswordRules } from './AuthScreens'
+import '../pages.css'  // styles for pages loaded on demand
 
 const ROLES: Role[] = ['viewer', 'editor', 'admin', 'owner']
 

@@ -39,7 +39,7 @@ def bearer_api(key, label, category, test_url, *, color, docs="", description=""
 # AI & LLM
 # ---------------------------------------------------------------------------
 AI = "AI & LLM"
-T("openai", "OpenAI / OpenAI-compatible", AI, color="#10a37f", docs="https://platform.openai.com/api-keys",
+T("openai", "OpenAI", AI, color="#10a37f", docs="https://platform.openai.com/api-keys",
   description="OpenAI, or any OpenAI-compatible server (vLLM, LM Studio, LocalAI, Groq…)",
   fields=[KEY(required=False, help="Required for OpenAI; optional for local servers started without --api-key"),
           F("base_url", "Base URL", default="https://api.openai.com/v1", required=False,

@@ -257,7 +257,7 @@ async def _wait(proc: subprocess.Popen, stopping: asyncio.Event | None = None) -
 async def _download_files(base: list[str], env: dict, status: Status) -> None:
     """Fetch the turn-detector / VAD / noise models once per backend start (a no-op when cached)."""
     global _files_ready
-    if _files_ready:
+    if _files_ready or os.environ.get("VOICE_MODELS_PREFETCHED") == "1":  # baked into the Docker image
         return
     status.line("downloading voice models (first start only)…")
     try:

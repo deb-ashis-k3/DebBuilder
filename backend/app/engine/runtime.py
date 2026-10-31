@@ -42,6 +42,7 @@ from ..nodes import get_type
 from ..nodes.base import NodeContext, NodeError
 from . import state as gstate
 from .bus import bus
+from .store import store, workflow_snapshot
 
 log = logging.getLogger("debbuilder.runtime")
 
@@ -268,6 +269,10 @@ class Run:
         self.state_outputs: dict[str, dict] = {}
         self.response: dict | None = None  # set by "Respond to Webhook"
         self.allowed: set[str] | None = None  # partial execution ("Execute step")
+        self.prior_ms = 0  # time spent before a pause (resumed executions)
+        # Keep a replay buffer only for runs someone may watch: editor runs, or a workflow open in an editor.
+        if mode == "manual" or bus.watching(f"wf:{workflow.get('id')}"):
+            bus.keep(execution_id)
         settings = workflow.get("settings") or {}
         self.meta = {
             "execution_id": execution_id,
@@ -372,7 +377,8 @@ def _make_node_fn(nid: str, is_entry: bool):
 
 
 def _make_router(nid: str):
-    def route(state: WFState):
+    # async on purpose: LangGraph runs a sync router in a thread pool (a thread hop per routing step)
+    async def route(state: WFState):
         run = _RUN.get()
         out_edges = run.flow_out(nid)
         ports = (state.get("outputs") or {}).get(nid, {})
@@ -659,18 +665,15 @@ async def execute_workflow(
     if not trigger:
         raise ValueError("Workflow has no trigger node" + (f" of type {trigger_type}" if trigger_type else ""))
 
-    async with SessionLocal() as s:
-        ex = Execution(
-            workflow_id=uuid.UUID(workflow["id"]),
-            status="running",
-            mode=mode,
-            trigger_node=trigger["id"],
-            input=_jsonable(items or []),
-            workflow_snapshot=_jsonable(workflow),
-        )
-        s.add(ex)
-        await s.commit()
-        exec_id = str(ex.id)
+    # Written by the batched execution store (engine/store.py), not a transaction per execution.
+    ex_id = uuid.uuid4()
+    await store.started({
+        "id": ex_id, "workflow_id": uuid.UUID(workflow["id"]), "status": "running", "mode": mode,
+        "trigger_node": trigger["id"], "input": _jsonable(items or []), "output": [], "node_runs": [],
+        "workflow_snapshot": None, "waiting_for": None, "error": None, "started_at": _now(),
+        "finished_at": None, "duration_ms": None,
+    }, _jsonable(workflow), immediate=mode == "manual")
+    exec_id = str(ex_id)
 
     run = Run(workflow, exec_id, mode)
     inp = {"outputs": {}, "trigger_items": _normalize_items(items) or [{}], "steps": 0,
@@ -685,11 +688,13 @@ async def resume_execution(execution_id: str, value: Any, wait: bool = False) ->
             raise ValueError("Execution is not waiting for input")
         ex.status, ex.waiting_for = "running", None
         await s.commit()
-        workflow, trigger_id, records, mode = ex.workflow_snapshot, ex.trigger_node, ex.node_runs, ex.mode
+        workflow, trigger_id, records, mode = await workflow_snapshot(ex, s), ex.trigger_node, ex.node_runs, ex.mode
+        prior_ms = ex.duration_ms or 0
         if "owner_id" not in workflow:  # snapshot taken before per-user workspaces
             wf = await s.get(Workflow, ex.workflow_id)
             workflow = {**workflow, "owner_id": str(wf.owner_id) if wf and wf.owner_id else None}
     run = Run(workflow, execution_id, mode, records)
+    run.prior_ms = prior_ms
     return await _launch(run, trigger_id, Command(resume=value), wait)
 
 
@@ -756,18 +761,11 @@ async def _drive(run: Run, trigger_id: str, inp: Any) -> dict:
 
     output = final_output(run)
     duration = int((time.perf_counter() - t0) * 1000)
-    async with SessionLocal() as s:
-        ex = await s.get(Execution, uuid.UUID(run.execution_id))
-        if ex:
-            ex.status = status
-            ex.error = error
-            ex.node_runs = _jsonable(run.records)
-            ex.output = output
-            ex.waiting_for = waiting_for
-            if status != "waiting":
-                ex.finished_at = _now()
-                ex.duration_ms = (ex.duration_ms or 0) + duration
-            await s.commit()
+    fields = {"status": status, "error": error, "node_runs": _jsonable(run.records), "output": output,
+              "waiting_for": waiting_for}
+    if status != "waiting":
+        fields.update(finished_at=_now(), duration_ms=run.prior_ms + duration)
+    await store.finished(uuid.UUID(run.execution_id), run.workflow, run.mode, fields, immediate=run.mode == "manual")
 
     if status != "waiting" and run.saver is not None:
         try:

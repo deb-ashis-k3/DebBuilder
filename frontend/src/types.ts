@@ -81,6 +81,11 @@ export interface Workflow {
     variables?: { key: string; value: string }[]
     /** Graph state schema (LangGraph channels): each key with its reducer and default. */
     state?: StateKey[]
+    /** What execution history to keep (n8n's save settings); unset = the server default. */
+    save_success?: 'default' | 'all' | 'none'
+    save_error?: 'default' | 'all' | 'none'
+    save_manual?: 'default' | 'all' | 'none'
+    save_data?: 'default' | 'full' | 'summary'
   }
   updated_at: string
   created_at: string
@@ -204,7 +209,6 @@ export interface Credential {
   oauth_connected?: boolean
   owner_id?: string | null
   owner_name?: string | null
-  owner_email?: string | null
   updated_at: string
   data?: Record<string, unknown>
 }

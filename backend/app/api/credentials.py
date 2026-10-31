@@ -8,14 +8,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
-from .. import voice_workers
+from .. import cluster
 from ..credential_tests import test_credential
 from ..credentials import (
     CREDENTIAL_TYPES, MASK, OAUTH_TOKEN_KEY, categories, decrypt, encrypt, mask, oauth2_authorize_url,
     oauth2_exchange_code, oauth2_redirect_uri, public_types, with_defaults,
 )
-from ..access import check, manages_all, owned, owner_names, principal
-from ..db import AsyncSession, Credential, SessionLocal, User, get_session
+from ..access import check, owned, owner_names, principal
+from ..db import AsyncSession, Credential, SessionLocal, get_session
 from ..model_lists import list_models
 from ..security import Principal
 
@@ -27,10 +27,6 @@ class CredentialIn(BaseModel):
     name: str | None = None
     type: str | None = None
     data: dict | None = None
-
-
-class MoveIn(BaseModel):
-    owner_id: str
 
 
 class TestIn(BaseModel):
@@ -72,14 +68,7 @@ async def list_credentials(type: str | None = None, session: AsyncSession = Depe
         q = q.where(Credential.type.in_(type.split(",")))
     rows = (await session.execute(q)).scalars().all()
     names = await owner_names(session, [c.owner_id for c in rows])
-    out = [serialize(c, owner_name=names.get(c.owner_id)) for c in rows]
-    if any(c.owner_id != p.user.id for c in rows):
-        # Users can share a display name; admins seeing others' credentials need to tell them apart.
-        ids = {c.owner_id for c in rows if c.owner_id}
-        emails = dict((await session.execute(select(User.id, User.email).where(User.id.in_(ids)))).all())
-        for d, c in zip(out, rows):
-            d["owner_email"] = emails.get(c.owner_id)
-    return out
+    return [serialize(c, owner_name=names.get(c.owner_id)) for c in rows]
 
 
 @router.post("")
@@ -165,27 +154,7 @@ async def update_credential(cred_id: str, body: CredentialIn, session: AsyncSess
         c.data = encrypt(current)
     await session.commit()
     await session.refresh(c)
-    voice_workers.credential_changed(cred_id)
-    return await _serialize_one(session, c)
-
-
-@router.post("/{cred_id}/move")
-async def move_credential(cred_id: str, body: MoveIn, session: AsyncSession = Depends(get_session),
-                          p: Principal = Depends(principal)):
-    """Give a credential to another user (admins), like n8n's "Move": only its owner's workflows can use it."""
-    if not manages_all(p):
-        raise HTTPException(403, "Only admins can move credentials between users")
-    c = await _get(session, cred_id, p, write=True)
-    try:
-        target = await session.get(User, uuid.UUID(body.owner_id))
-    except ValueError:
-        target = None
-    if not target:
-        raise HTTPException(404, "User not found")
-    c.owner_id = target.id
-    await session.commit()
-    await session.refresh(c)
-    voice_workers.credential_changed(cred_id)
+    cluster.credential_changed(cred_id)
     return await _serialize_one(session, c)
 
 
@@ -193,7 +162,7 @@ async def move_credential(cred_id: str, body: MoveIn, session: AsyncSession = De
 async def delete_credential(cred_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     await session.delete(await _get(session, cred_id, p, write=True))
     await session.commit()
-    voice_workers.credential_changed(cred_id)
+    cluster.credential_changed(cred_id)
     return {"ok": True}
 
 

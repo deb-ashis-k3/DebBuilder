@@ -1,15 +1,19 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { AuthProvider, ROLE_LABEL, useAuth } from './auth'
 import { ConfirmHost } from './components/Dialogs'
 import { CatalogProvider, Icon, Toaster } from './lib'
-import Credentials from './pages/Credentials'
-import Phone from './pages/Phone'
-import Editor from './pages/Editor'
 import { ForcePasswordChange, LoginScreen } from './pages/AuthScreens'
-import { ExecutionDetail, ExecutionList } from './pages/Executions'
-import Settings from './pages/Settings'
 import Workflows from './pages/Workflows'
+import { loadEditor } from './prefetch'
+
+// Everything else is fetched when first opened, so the first visit downloads far less JavaScript.
+const Editor = lazy(loadEditor)
+const Credentials = lazy(() => import('./pages/Credentials'))
+const Phone = lazy(() => import('./pages/Phone'))
+const Settings = lazy(() => import('./pages/Settings'))
+const ExecutionList = lazy(() => import('./pages/Executions').then((m) => ({ default: m.ExecutionList })))
+const ExecutionDetail = lazy(() => import('./pages/Executions').then((m) => ({ default: m.ExecutionDetail })))
 
 function ThemeToggle({ collapsed }: { collapsed: boolean }) {
   const [theme, setTheme] = useState(() => localStorageGet('theme') ?? '')
@@ -139,6 +143,7 @@ function AuthGate() {
   if (user.must_change_password) return <ForcePasswordChange />
   return (
     <CatalogProvider>
+      <Suspense fallback={<div className="page-loading" aria-busy="true" />}>
       <Routes>
         <Route path="/workflow/:id/*" element={<Shell compact><Editor /></Shell>} />
           <Route path="/folder/:folderId" element={<Shell><Workflows /></Shell>} />
@@ -149,6 +154,7 @@ function AuthGate() {
           <Route path="/settings/:tab?" element={<Shell><Settings /></Shell>} />
           <Route path="*" element={<Shell><Workflows /></Shell>} />
       </Routes>
+      </Suspense>
     </CatalogProvider>
   )
 }

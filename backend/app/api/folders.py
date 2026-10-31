@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 
-from .. import listeners, scheduler, voice_workers
+from .. import cluster
 from ..access import check, owned, owner_names, principal
 from ..db import AsyncSession, Folder, Workflow, get_session
 from ..security import Principal
@@ -123,15 +123,12 @@ async def delete_folder(folder_id: str, mode: str = "move", session: AsyncSessio
         ids = await _subtree(session, f.id)
         doomed = (await session.execute(select(Workflow).where(Workflow.folder_id.in_(ids)))).scalars().all()
         for wf in doomed:
-            scheduler.remove_workflow(str(wf.id))
-            listeners.remove_workflow(str(wf.id))
-            voice_workers.remove_workflow(str(wf.id))
             await session.delete(wf)
     else:
         raise HTTPException(400, "mode must be 'move' or 'delete'")
+    gone = [str(wf.id) for wf in doomed] if mode == "delete" else []
     await session.delete(f)
     await session.commit()
-    from .hooks import invalidate_webhooks
-
-    invalidate_webhooks()
+    for i in gone:
+        cluster.workflow_changed(i)
     return {"ok": True}

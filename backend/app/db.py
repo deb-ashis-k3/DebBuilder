@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func, text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -176,21 +176,45 @@ class Execution(Base):
     workflow_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("workflows.id", ondelete="CASCADE"), index=True
     )
-    # running | success | error | waiting | canceled
-    status: Mapped[str] = mapped_column(String(20), default="running", index=True)
+    # running | success | error | waiting | canceled (only running / waiting are indexed: see init_db)
+    status: Mapped[str] = mapped_column(String(20), default="running")
     # manual | webhook | schedule | chat | whatsapp | voice | subworkflow | error
     mode: Mapped[str] = mapped_column(String(20), default="manual")
     trigger_node: Mapped[str | None] = mapped_column(String(100), nullable=True)
     input: Mapped[list] = mapped_column(JSONB, default=list)
     output: Mapped[list] = mapped_column(JSONB, default=list)
     node_runs: Mapped[list] = mapped_column(JSONB, default=list)
-    # Snapshot of the graph that ran, so history stays accurate after edits.
-    workflow_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
-    waiting_for: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # The graph that ran, so history stays accurate after edits: by hash in workflow_snapshots (one row per
+    # version, not per execution); older executions carry it inline.
+    workflow_snapshot: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    snapshot_hash: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    waiting_for: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class WorkflowSnapshot(Base):
+    """One row per distinct workflow version that ran (content hash), shared by all its executions."""
+
+    __tablename__ = "workflow_snapshots"
+
+    hash: Mapped[str] = mapped_column(String(40), primary_key=True)
+    data: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExecutionStat(Base):
+    """Finished executions per workflow, day and status: incremented by the execution writer, read by dashboards."""
+
+    __tablename__ = "execution_stats"
+
+    workflow_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("workflows.id", ondelete="CASCADE"),
+                                                   primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 class ChatMessage(Base):
@@ -219,6 +243,8 @@ class StaticData(Base):
 
 async def init_db() -> None:
     async with engine.begin() as conn:
+        # Replicas starting together would race to create the same tables: one at a time.
+        await conn.execute(text("SELECT pg_advisory_xact_lock(233811)"))
         await conn.run_sync(Base.metadata.create_all)
         # create_all doesn't add columns to existing tables; upgrade databases created before folders.
         await conn.execute(text(
@@ -231,6 +257,25 @@ async def init_db() -> None:
         await conn.execute(text("ALTER TABLE login_challenges ALTER COLUMN user_id DROP NOT NULL"))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_executions_workflow_started ON executions (workflow_id, started_at DESC)"))
+        # High-volume execution history (see engine/store.py).
+        await conn.execute(text("ALTER TABLE executions ADD COLUMN IF NOT EXISTS snapshot_hash VARCHAR(40)"))
+        await conn.execute(text("ALTER TABLE executions ALTER COLUMN workflow_snapshot DROP NOT NULL"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_executions_snapshot_hash ON executions (snapshot_hash)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_executions_started_at ON executions (started_at)"))
+        # Only live rows need a status index; finished ones (almost all) then never touch it.
+        await conn.execute(text("DROP INDEX IF EXISTS ix_executions_status"))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_executions_live ON executions (status) WHERE status IN ('running', 'waiting')"))
+        # Room in each page for in-place (HOT) updates; vacuum early on a table with constant churn.
+        await conn.execute(text(
+            "ALTER TABLE executions SET (fillfactor = 85, autovacuum_vacuum_scale_factor = 0.02, "
+            "autovacuum_analyze_scale_factor = 0.02)"))
+        # Fill the stats rollup once from existing history.
+        await conn.execute(text(
+            "INSERT INTO execution_stats (workflow_id, day, status, count) "
+            "SELECT workflow_id, (started_at AT TIME ZONE 'UTC')::date, status, count(*) FROM executions "
+            "WHERE status NOT IN ('running', 'waiting') AND NOT EXISTS (SELECT 1 FROM execution_stats) "
+            "GROUP BY 1, 2, 3 ON CONFLICT DO NOTHING"))
         # Per-user workspaces: rows created before ownership existed belong to the first owner.
         for table in ("workflows", "folders", "credentials"):
             await conn.execute(text(

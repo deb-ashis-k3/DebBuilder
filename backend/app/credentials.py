@@ -1,5 +1,6 @@
 """Credential storage (encrypted), request auth for any credential type, OAuth2."""
 
+import asyncio
 import base64
 import json
 import time
@@ -76,8 +77,44 @@ def fmt(template: str, data: dict) -> str:
     return template.format_map(values)
 
 
+# Every node that uses a credential would otherwise query + decrypt it on every execution. A short cache per
+# process, cleared on every replica when a credential changes (cluster.credential_changed), removes that load.
+CACHE_SECONDS = 30
+_cache: dict[tuple[str, str | None], tuple[float, str, dict]] = {}
+_loading: dict[tuple[str, str | None], "asyncio.Future"] = {}
+
+
+def forget_credential(cred_id: str | None = None) -> None:
+    if cred_id is None:
+        _cache.clear()
+        return
+    for k in [k for k in _cache if k[0] == str(cred_id)]:
+        _cache.pop(k, None)
+
+
 async def load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None,
                           owner_id: str | uuid.UUID | None) -> tuple[str, dict]:
+    key = (str(cred_id), str(owner_id) if owner_id else None)
+    hit = _cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1], dict(hit[2])
+    # single-flight: concurrent executions needing the same credential share one query
+    pending = _loading.get(key)
+    if pending is None:
+        async def fetch() -> tuple[str, dict]:  # its own session: the first caller's may close while others wait
+            async with SessionLocal() as own:
+                return await _load_credential(own, cred_id, owner_id)
+        pending = _loading[key] = asyncio.ensure_future(fetch())
+        pending.add_done_callback(lambda _: _loading.pop(key, None))
+    ctype, data = await asyncio.shield(pending)
+    if len(_cache) > 10_000:
+        _cache.clear()
+    _cache[key] = (time.monotonic() + CACHE_SECONDS, ctype, data)
+    return ctype, dict(data)
+
+
+async def _load_credential(session: AsyncSession, cred_id: str | uuid.UUID | None,
+                           owner_id: str | uuid.UUID | None) -> tuple[str, dict]:
     """Return (type, decrypted data with defaults) or raise ValueError.
 
     `owner_id` is the owner of the workflow that needs it: workflows only get their owner's
@@ -203,5 +240,6 @@ async def oauth2_access_token(cred_type: str, data: dict, cred_id: str | None) -
         stored = {k: v for k, v in data.items()}
         stored[OAUTH_TOKEN_KEY] = tok
         await _save_data(cred_id, stored)
+        forget_credential(cred_id)  # the cached copy still holds the expired token
     data[OAUTH_TOKEN_KEY] = tok
     return tok["access_token"]

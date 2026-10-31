@@ -1,8 +1,8 @@
 """Per-user workspaces: who can see and change which workflows, folders and credentials.
 
-- editor: only their own workflows, folders, credentials (and those workflows' executions).
-- viewer: reads everything, owns nothing (route policy already blocks their writes).
-- admin / owner: read and manage everyone's.
+Every user, whatever their role, sees and changes only their own workflows, folders, credentials
+and those workflows' executions. Roles decide what a user may do (admins manage user accounts,
+viewers can't write), never whose data they see.
 
 Someone else's resource answers 404 (not 403) so ids can't be probed. At run time a workflow
 may only use its owner's credentials and call its owner's workflows (see credentials.load_credential
@@ -17,39 +17,28 @@ from sqlalchemy import select
 from .db import User, Workflow
 from .security import Principal, current
 
-_READ_ALL = {"viewer", "admin", "owner"}
-_MANAGE_ALL = {"admin", "owner"}
-
 
 def principal(request: Request) -> Principal:
     """FastAPI dependency: the signed-in caller (the middleware already authenticated them)."""
     return current(request)
 
 
-def reads_all(p: Principal) -> bool:
-    return p.role in _READ_ALL
-
-
-def manages_all(p: Principal) -> bool:
-    return p.role in _MANAGE_ALL
-
-
 def can_read(p: Principal, owner_id: uuid.UUID | None) -> bool:
-    return reads_all(p) or owner_id == p.user.id
+    return owner_id is not None and owner_id == p.user.id
 
 
 def can_manage(p: Principal, owner_id: uuid.UUID | None) -> bool:
-    return manages_all(p) or owner_id == p.user.id
+    return can_read(p, owner_id)
 
 
 def check(p: Principal, owner_id: uuid.UUID | None, what: str, write: bool = False) -> None:
-    if not (can_manage if write else can_read)(p, owner_id):
+    if not can_read(p, owner_id):
         raise HTTPException(404, f"{what} not found")
 
 
 def owned(p: Principal, column, write: bool = False) -> list:
-    """WHERE conditions limiting a query to what the caller may see (or change)."""
-    return [] if (manages_all(p) if write else reads_all(p)) else [column == p.user.id]
+    """WHERE conditions limiting a query to the caller's own rows."""
+    return [column == p.user.id]
 
 
 def visible_workflow_ids(p: Principal, write: bool = False):

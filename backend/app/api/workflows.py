@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -7,9 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
-from .. import listeners, scheduler, voice_workers
+from .. import cluster, listeners, voice_workers
 from ..access import check, owned, owner_names, principal
-from .hooks import invalidate_webhooks
 from ..db import AsyncSession, Folder, Workflow, get_session
 from ..engine.runtime import execute_workflow, workflow_to_dict
 from ..nodes import REGISTRY
@@ -157,13 +157,12 @@ async def move_workflows(body: IdsIn, session: AsyncSession = Depends(get_sessio
 async def delete_workflows(body: IdsIn, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     q = select(Workflow).where(Workflow.id.in_([_uuid(i) for i in body.ids]), *owned(p, Workflow.owner_id, write=True))
     rows = (await session.execute(q)).scalars().all()
+    ids = [str(wf.id) for wf in rows]
     for wf in rows:
-        scheduler.remove_workflow(str(wf.id))
-        listeners.remove_workflow(str(wf.id))
-        voice_workers.remove_workflow(str(wf.id))
         await session.delete(wf)
     await session.commit()
-    invalidate_webhooks()
+    for i in ids:
+        cluster.workflow_changed(i)
     return {"ok": True, "deleted": len(rows)}
 
 
@@ -247,10 +246,7 @@ async def update_workflow(wf_id: str, body: WorkflowIn, session: AsyncSession = 
         setattr(wf, k, v)
     await session.commit()
     await session.refresh(wf)
-    scheduler.sync_workflow(wf)
-    listeners.sync_workflow(wf)
-    voice_workers.sync_workflow(wf)
-    invalidate_webhooks()
+    cluster.workflow_changed(str(wf.id))  # triggers re-sync on the leader, webhook caches everywhere
     return await _serialize_one(session, wf)
 
 
@@ -259,10 +255,7 @@ async def delete_workflow(wf_id: str, session: AsyncSession = Depends(get_sessio
     wf = await _get(session, wf_id, p, write=True)
     await session.delete(wf)
     await session.commit()
-    scheduler.remove_workflow(wf_id)
-    listeners.remove_workflow(wf_id)
-    voice_workers.remove_workflow(wf_id)
-    invalidate_webhooks()
+    cluster.workflow_changed(wf_id)
     return {"ok": True}
 
 
@@ -304,6 +297,33 @@ async def duplicate_workflow(wf_id: str, body: DuplicateIn | None = None, sessio
     await session.commit()
     await session.refresh(wf)
     return await _serialize_one(session, wf)
+
+
+class PreviewIn(BaseModel):
+    value: Any
+    items: list[dict] = []          # the node's input items (latest run in the editor)
+    item_index: int = 0
+    node_outputs: dict[str, list[dict]] = {}  # earlier nodes' output by name, for $('Name')
+
+
+@router.post("/workflows/{wf_id}/expression-preview")
+async def expression_preview(wf_id: str, body: PreviewIn, session: AsyncSession = Depends(get_session),
+                             p: Principal = Depends(principal)):
+    """Resolve a parameter's expression against sample data, like n8n's inline result under a field."""
+    from ..engine.expressions import build_context, evaluate
+
+    wf = await _get(session, wf_id, p)
+    items = body.items or []
+    idx = min(max(body.item_index, 0), max(len(items) - 1, 0))
+    variables = {v["key"]: v.get("value") for v in (wf.settings or {}).get("variables", []) if v.get("key")}
+    ctx = build_context(items[idx] if items else {}, items, idx, body.node_outputs,
+                        {"workflow_id": str(wf.id), "workflow_name": wf.name, "mode": "preview", "vars": variables})
+    try:
+        result = evaluate(body.value, ctx)
+    except Exception as e:  # noqa: BLE001 - show the author what went wrong, like n8n's red hint
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:500]}
+    text = result if isinstance(result, str) else json.dumps(result, default=str, ensure_ascii=False)
+    return {"ok": True, "type": type(result).__name__, "text": text[:5000], "truncated": len(text) > 5000}
 
 
 @router.post("/workflows/{wf_id}/run")

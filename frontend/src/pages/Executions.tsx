@@ -12,6 +12,7 @@ import { Icon, StatusBadge, fmtDate, fmtDuration, toast } from '../lib'
 import type { Execution, ExecutionFilter, Workflow } from '../types'
 import { edgeToRF, runStateFromExecution, toRF } from './Editor'
 import { useAuth } from '../auth'
+import '../pages.css'  // styles for pages loaded on demand
 
 const PAGE = 50
 const STATUSES = ['success', 'error', 'running', 'waiting', 'canceled']
@@ -46,7 +47,8 @@ export function ExecutionList() {
     started_before: params.get('to') ?? undefined,
   }
   const filterKey = params.toString()
-  const [data, setData] = useState<{ total: number; items: Execution[] } | null>(null)
+  const [data, setData] = useState<{ total: number; total_capped?: boolean; items: Execution[] } | null>(null)
+  const totalText = data?.total_capped ? `${data.total.toLocaleString()}+` : String(data?.total ?? 0)
   const [workflows, setWorkflows] = useState<Workflow[]>([])
   const [page, setPage] = useState(0)
   const [auto, setAuto] = useState(true)
@@ -131,12 +133,12 @@ export function ExecutionList() {
         {pageAll && !allMatching && data && data.total > items.length && (
           <div className="select-all-banner">
             All {items.length} executions on this page are selected.
-            <button className="link-btn" onClick={() => setAllMatching(true)}>Select all {data.total} matching executions</button>
+            <button className="link-btn" onClick={() => setAllMatching(true)}>Select all {totalText} matching executions</button>
           </div>
         )}
         {allMatching && data && (
           <div className="select-all-banner">
-            All {data.total} executions matching the filters are selected. <button className="link-btn" onClick={clearSel}>Clear selection</button>
+            All {totalText} executions matching the filters are selected. <button className="link-btn" onClick={clearSel}>Clear selection</button>
           </div>
         )}
 
@@ -175,8 +177,8 @@ export function ExecutionList() {
         {data && data.total > PAGE && (
           <div className="row" style={{ marginTop: 12, justifyContent: 'flex-end' }}>
             <button className="btn sm" disabled={page === 0} onClick={() => setPage(page - 1)}>Prev</button>
-            <span className="muted small">{page * PAGE + 1}–{Math.min((page + 1) * PAGE, data.total)} of {data.total}</span>
-            <button className="btn sm" disabled={(page + 1) * PAGE >= data.total} onClick={() => setPage(page + 1)}>Next</button>
+            <span className="muted small">{page * PAGE + 1}–{Math.min((page + 1) * PAGE, data.total)} of {totalText}</span>
+            <button className="btn sm" disabled={(page + 1) * PAGE >= data.total && !data.total_capped} onClick={() => setPage(page + 1)}>Next</button>
           </div>
         )}
       </div>

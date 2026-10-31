@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, desc, func, select
 
 from ..access import check, principal, visible_workflow_ids
+from ..engine.store import stats_for, store, workflow_snapshot
 from ..db import AsyncSession, Execution, Workflow, get_session
 from ..engine.runtime import cancel_execution, execute_workflow, resume_execution
 from ..security import Principal
@@ -22,9 +23,8 @@ async def download_file(file_id: str, name: str = "file", mime: str = "applicati
     from fastapi.responses import FileResponse
 
     from .. import binary
-    from ..access import reads_all
 
-    path = binary.find(file_id, None if reads_all(p) else [p.user.id])
+    path = binary.find(file_id, [p.user.id])
     if path is None:
         raise HTTPException(404, "File not found")
     safe_mime = mime if "/" in mime and len(mime) < 128 and "\n" not in mime else "application/octet-stream"
@@ -34,6 +34,9 @@ async def download_file(file_id: str, name: str = "file", mime: str = "applicati
     return FileResponse(path, media_type=safe_mime, filename=name[:200] or "file",
                         content_disposition_type="inline" if inline else "attachment",
                         headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
+
+
+COUNT_CAP = 10_000
 
 
 def serialize(ex: Execution, full: bool = False, wf_name: str | None = None) -> dict[str, Any]:
@@ -91,8 +94,11 @@ async def list_executions(workflow_id: str | None = None, status: str | None = N
                                    started_after=started_after, started_before=started_before), p)
     q = select(Execution, Workflow.name).join(Workflow, Workflow.id == Execution.workflow_id).where(*conds)
     rows = (await session.execute(q.order_by(desc(Execution.started_at)).limit(min(limit, 200)).offset(offset))).all()
-    total = (await session.execute(select(func.count(Execution.id)).where(*conds))).scalar_one()
-    return {"total": total, "items": [serialize(ex, wf_name=name) for ex, name in rows]}
+    # Exact counts over millions of rows are slow; past COUNT_CAP the page says "10,000+".
+    total = (await session.execute(select(func.count()).select_from(
+        select(Execution.id).where(*conds).limit(COUNT_CAP + 1).subquery()))).scalar_one()
+    return {"total": min(total, COUNT_CAP), "total_capped": total > COUNT_CAP,
+            "items": [serialize(ex, wf_name=name) for ex, name in rows]}
 
 
 def _bulk_conditions(body: BulkIn, p: Principal) -> list:
@@ -128,16 +134,17 @@ async def bulk_stop(body: BulkIn, session: AsyncSession = Depends(get_session), 
 
 @router.get("/stats")
 async def stats(session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
-    q = select(Execution.status, func.count()).where(*_conditions(ExecFilter(), p)).group_by(Execution.status)
-    rows = (await session.execute(q)).all()
-    return {s: c for s, c in rows}
+    # From the per-day rollup the execution writer maintains, plus live running / waiting rows.
+    return await stats_for(session, visible_workflow_ids(p))
 
 
 async def _get(session: AsyncSession, ex_id: str, p: Principal, write: bool = False) -> tuple[Execution, Workflow | None]:
     try:
-        ex = await session.get(Execution, uuid.UUID(ex_id))
+        key = uuid.UUID(ex_id)
     except ValueError:
-        ex = None
+        raise HTTPException(404, "Execution not found") from None
+    # Not in the database yet? The batched writer may still hold it (written within EXECUTIONS_FLUSH_MS).
+    ex = await session.get(Execution, key) or store.pending(key)
     if not ex:
         raise HTTPException(404, "Execution not found")
     wf = await session.get(Workflow, ex.workflow_id)
@@ -148,7 +155,7 @@ async def _get(session: AsyncSession, ex_id: str, p: Principal, write: bool = Fa
 @router.get("/{ex_id}")
 async def get_execution(ex_id: str, session: AsyncSession = Depends(get_session), p: Principal = Depends(principal)):
     ex, wf = await _get(session, ex_id, p)
-    return serialize(ex, full=True, wf_name=wf.name if wf else None)
+    return {**serialize(ex, full=True, wf_name=wf.name if wf else None), "workflow": await workflow_snapshot(ex, session)}
 
 
 @router.delete("/{ex_id}")

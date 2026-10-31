@@ -1,0 +1,21 @@
+# DebBuilder
+
+> DebBuilder is a self-hosted visual workflow builder for AI agents, voice agents and automations: n8n-style
+> editor, LangGraph execution engine, LangChain AI nodes, LiveKit voice agents and 200+ integrations.
+> The editor and API require signing in; each user sees only their own workflows and credentials.
+
+## API
+
+- [OpenAPI schema](/openapi.json): every REST endpoint (workflows, executions, credentials, voice, webhooks)
+- [API reference](/docs): interactive documentation of the same endpoints
+- [Health](/api/health): liveness probe (no sign-in)
+
+## Triggering workflows
+
+- Production webhooks: `POST /webhook/<path>` of an active workflow with a Webhook trigger
+- Hosted forms: `/form/<workflow id>` for workflows with a Form trigger
+- Chat: `POST /api/chat/<workflow id>` for workflows with a Chat trigger (if the trigger allows public access)
+
+## Optional
+
+- [robots.txt](/robots.txt)
