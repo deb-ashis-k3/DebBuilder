@@ -150,6 +150,9 @@ def _signature(node: dict) -> str:
     return hashlib.sha1(json.dumps([node.get("type"), node.get("parameters"), node.get("disabled")], sort_keys=True, default=str).encode()).hexdigest()
 
 
+_wf_cache: dict[str, dict] = {}
+
+
 def _emitter(workflow_id: str, node: dict, status: Status, limit: int):
     from .engine.runtime import execute_workflow, load_workflow
 
@@ -157,7 +160,9 @@ def _emitter(workflow_id: str, node: dict, status: Status, limit: int):
 
     async def run(items: list[dict]) -> dict:
         try:
-            wf = await load_workflow(workflow_id)
+            wf = _wf_cache.get(workflow_id)
+            if wf is None:  # once per change, not once per event (thousands per second on busy streams)
+                wf = _wf_cache[workflow_id] = await load_workflow(workflow_id)
             return await execute_workflow(wf, trigger_node_id=node["id"], mode="trigger", items=items, wait=True)
         except Exception as e:  # noqa: BLE001
             log.exception("listener execution failed (%s / %s)", workflow_id, node.get("name"))
@@ -242,6 +247,7 @@ def _stop(key: tuple[str, str]) -> None:
 def sync_workflow(wf: Workflow, reason: str | None = None) -> None:
     """Start/stop/restart listeners so they match the workflow's active state and nodes."""
     wf_id = str(wf.id)
+    _wf_cache.pop(wf_id, None)  # the workflow changed: the next event loads the new version
     had_any = any(k[0] == wf_id for k in _running)
     wanted = {n["id"]: n for n in (wf.nodes or []) if wf.active and n.get("type") in LISTENERS and not n.get("disabled")}
     for key in [k for k in _running if k[0] == wf_id and k[1] not in wanted]:
@@ -256,6 +262,7 @@ def sync_workflow(wf: Workflow, reason: str | None = None) -> None:
 
 
 def remove_workflow(workflow_id: str) -> None:
+    _wf_cache.pop(workflow_id, None)
     for key in [k for k in _running if k[0] == workflow_id]:
         _stop(key)
 

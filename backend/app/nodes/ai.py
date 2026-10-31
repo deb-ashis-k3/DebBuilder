@@ -8,6 +8,7 @@ nodes.
 import ast
 import json
 import operator as op
+import re
 import textwrap
 from datetime import datetime, timezone
 from typing import Any
@@ -17,9 +18,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field, create_model
-from sqlalchemy import delete, select
 
-from ..db import ChatMessage, SessionLocal
 from .base import NodeContext, NodeError, NodeType, ai_input, prop, register
 
 AI = dict(group="ai", color="#ec4899")
@@ -130,42 +129,97 @@ for _type, _label, _cred, _fn in [
 
 
 class PgMemory:
-    def __init__(self, session_key: str, window: int):
-        self.session_key = session_key
-        self.window = window
+    """Chat history in a Postgres database you pick (a credential), not DebBuilder's own.
+
+    Same table layout as n8n's Postgres Chat Memory and LangChain's PostgresChatMessageHistory
+    (id, session_id, message JSONB), so an existing chat history table can be shared with them.
+    The table is created on first use; connections come from a small pool per database."""
+
+    _pools: dict[tuple, Any] = {}
+    _ready: set[tuple] = set()
+
+    def __init__(self, cred: dict, table: str, session_key: str, window: int):
+        from psycopg import sql
+
+        parts = [p for p in (table or "chat_histories").strip().split(".") if p][:2]
+        if not parts or not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", p) for p in parts):
+            raise ValueError(f"Invalid table name {table!r}: letters, digits and _ (optionally schema.table)")
+        self.cred, self.session_key, self.window = cred, session_key, window
+        self.table = sql.Identifier(*parts)
+        self.index = sql.Identifier(f"ix_{parts[-1]}_session_id")
+        self.key = tuple(str(cred.get(k) or "") for k in ("host", "port", "database", "user", "password", "ssl"))
+
+    async def _pool(self):
+        from psycopg_pool import AsyncConnectionPool
+
+        from ..services.brokers import pg_kwargs
+
+        pool = self._pools.get(self.key)
+        if pool is None:
+            pool = AsyncConnectionPool("", kwargs={**pg_kwargs(self.cred), "autocommit": True},
+                                       min_size=0, max_size=5, open=False, timeout=15)
+            await pool.open()
+            self._pools[self.key] = pool
+        return pool
+
+    async def _run(self, query, params=(), fetch: bool = False):
+        from psycopg import sql
+
+        try:
+            async with (await self._pool()).connection() as conn:
+                if (self.key, str(self.table.as_string(conn))) not in self._ready:
+                    await conn.execute(sql.SQL(
+                        "CREATE TABLE IF NOT EXISTS {t} (id SERIAL PRIMARY KEY, session_id VARCHAR(255) NOT NULL, "
+                        "message JSONB NOT NULL)").format(t=self.table))
+                    await conn.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {i} ON {t} (session_id)").format(
+                        i=self.index, t=self.table))
+                    self._ready.add((self.key, str(self.table.as_string(conn))))
+                cur = await conn.execute(query, params)
+                return await cur.fetchall() if fetch else None
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Postgres Chat Memory ({self.cred.get('host')}/{self.cred.get('database')}): {e}") from e
 
     async def load(self) -> list[BaseMessage]:
-        async with SessionLocal() as s:
-            rows = (await s.execute(
-                select(ChatMessage).where(ChatMessage.session_key == self.session_key)
-                .order_by(ChatMessage.id.desc()).limit(self.window)
-            )).scalars().all()
-        msgs: list[BaseMessage] = []
-        for r in reversed(rows):
-            msgs.append(HumanMessage(r.content) if r.role == "human" else AIMessage(r.content))
-        return msgs
+        from langchain_core.messages import messages_from_dict
+        from psycopg import sql
+
+        rows = await self._run(sql.SQL("SELECT message FROM {t} WHERE session_id = %s ORDER BY id DESC LIMIT %s").format(
+            t=self.table), (self.session_key, self.window), fetch=True)
+        return messages_from_dict([r[0] for r in reversed(rows or [])])
 
     async def save(self, human: str, ai: str) -> None:
-        async with SessionLocal() as s:
-            s.add_all([ChatMessage(session_key=self.session_key, role="human", content=human),
-                       ChatMessage(session_key=self.session_key, role="ai", content=ai)])
-            await s.commit()
+        from langchain_core.messages import message_to_dict
+        from psycopg import sql
+        from psycopg.types.json import Jsonb
+
+        await self._run(sql.SQL("INSERT INTO {t} (session_id, message) VALUES (%s, %s), (%s, %s)").format(t=self.table), (
+            self.session_key, Jsonb(message_to_dict(HumanMessage(human))),
+            self.session_key, Jsonb(message_to_dict(AIMessage(ai)))))
 
     async def clear(self) -> None:
-        async with SessionLocal() as s:
-            await s.execute(delete(ChatMessage).where(ChatMessage.session_key == self.session_key))
-            await s.commit()
+        from psycopg import sql
+
+        await self._run(sql.SQL("DELETE FROM {t} WHERE session_id = %s").format(t=self.table), (self.session_key,))
 
 
 async def _memory(ctx: NodeContext):
-    key = ctx.param("session_key") or "default"
-    return PgMemory(f"{ctx.run.meta['workflow_id']}:{key}", int(ctx.param("window") or 20))
+    if not ctx.param("credential"):
+        raise NodeError("Pick a Postgres credential (the database that stores the chat history)", ctx.name)
+    _, cred = await ctx.credential()
+    try:
+        return PgMemory(cred, str(ctx.param("table") or "chat_histories"), str(ctx.param("session_key") or "default"),
+                        int(ctx.param("window") or 20))
+    except ValueError as e:
+        raise NodeError(str(e), ctx.name) from e
 
 
 register(NodeType(
     type="memory.postgres", label="Postgres Chat Memory", icon="database",
-    description="Stores conversation history per session in Postgres.",
+    description="Stores conversation history per session in a Postgres database you choose (n8n-compatible table).",
     properties=[
+        prop("credential", "Credential", "credential", None, credential_types=["postgres"], required=True),
+        prop("table", "Table name", "string", "chat_histories",
+             description="Created automatically if missing (id, session_id, message JSONB). schema.table works too."),
         prop("session_key", "Session key", "string", "{{ $json.session_id or $json['from'] or 'default' }}"),
         prop("window", "Context window (messages)", "number", 20),
     ],

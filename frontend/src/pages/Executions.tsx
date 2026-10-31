@@ -6,6 +6,7 @@ import { api } from '../api'
 import { edgeTypes } from '../components/CanvasEdge'
 import { Menu, confirmDialog, errText } from '../components/Dialogs'
 import { ExecutionLog } from '../components/ExecutionLog'
+import { NodeDetails } from '../components/NodeDetails'
 import { nodeTypes } from '../components/FlowNode'
 import { Select } from '../components/Select'
 import { Icon, StatusBadge, fmtDate, fmtDuration, toast } from '../lib'
@@ -255,6 +256,7 @@ function ExecutionPreview({ execId, onChanged, onDebug, onSelect }: {
   const [ex, setEx] = useState<Execution | null>(null)
   const [missing, setMissing] = useState(false)
   const [sel, setSel] = useState<string | null>(null)
+  const [opened, setOpened] = useState<string | null>(null)  // node open in the read-only details panel
 
   useEffect(() => {
     let alive = true
@@ -264,7 +266,7 @@ function ExecutionPreview({ execId, onChanged, onDebug, onSelect }: {
     const t = window.setInterval(() => { if (ex?.status === 'running' || ex?.status === 'waiting') load() }, 1500)
     return () => { alive = false; window.clearInterval(t) }
   }, [execId, ex?.status])
-  useEffect(() => { setSel(null) }, [execId])
+  useEffect(() => { setSel(null); setOpened(null) }, [execId])
 
   const runs = useMemo(() => (ex ? runStateFromExecution(ex) : {}), [ex])
   const nodes = useMemo(() => (ex?.workflow?.nodes ?? []).map((n) => toRF(n, runs[n.id])), [ex, runs])
@@ -312,12 +314,28 @@ function ExecutionPreview({ execId, onChanged, onDebug, onSelect }: {
       <div className="exv-canvas canvas">
         <ReactFlowProvider>
           <ReactFlow key={ex.id} nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-            nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, n) => setSel(n.id)} minZoom={0.1} proOptions={{ hideAttribution: true }}>
+            nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, n) => setSel(n.id)} minZoom={0.1} proOptions={{ hideAttribution: true }}
+            onNodeDoubleClick={(_, n) => { (window as any).__dbg = [...((window as any).__dbg ?? []), 'dbl:' + n.id + ':' + n.type]; if (n.type !== 'sticky') setOpened(n.id) }}>
             <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} color="var(--canvas-dot)" />
             <Controls showInteractive={false} orientation="horizontal" />
           </ReactFlow>
         </ReactFlowProvider>
       </div>
+      {(() => { (window as any).__dbg = [...((window as any).__dbg ?? []), 'render:' + opened]; return null })()}{opened && (() => {
+        const wfNodes = ex.workflow?.nodes ?? []
+        const wfEdges = ex.workflow?.edges ?? []
+        const node = wfNodes.find((n) => n.id === opened)
+        if (!node) return null
+        const names = Object.fromEntries(wfNodes.map((n) => [n.id, n.name]))
+        const ref = (id: string, port: string) => ({ id, port, name: names[id] ?? id, type: wfNodes.find((n) => n.id === id)?.type })
+        const flow = wfEdges.filter((e) => !(e.targetHandle ?? '').startsWith('ai_'))
+        return (
+          <NodeDetails key={opened} node={node} run={runs[opened]} runsByNode={runs} nodeNames={names} workflowId={ex.workflow_id}
+            parents={flow.filter((e) => e.target === opened).map((e) => ref(e.source, e.sourceHandle ?? 'main'))}
+            children={flow.filter((e) => e.source === opened).map((e) => ref(e.target, e.targetHandle ?? 'main'))}
+            onOpen={(id) => setOpened(id)} onClose={() => setOpened(null)} onChange={() => {}} onRun={() => {}} readOnly />
+        )
+      })()}
       <ExecutionLog height={340} focusNode={sel} runs={ex.node_runs ?? []}
         meta={{ id: ex.id, status: ex.status, mode: ex.mode, started_at: ex.started_at, duration_ms: ex.duration_ms, error: ex.error }} />
     </section>

@@ -15,7 +15,7 @@ function pinnedPorts(pin: WFNode['pin_data']): Record<string, Item[]> | null {
   return Array.isArray(pin) ? { main: pin } : pin
 }
 
-export function NodeDetails({ node, run, runsByNode, nodeNames, parents, children, workflowId, onChange, onClose, onRun, onOpen }: {
+export function NodeDetails({ node, run, runsByNode, nodeNames, parents, children, workflowId, onChange, onClose, onRun, onOpen, readOnly = false }: {
   node: WFNode
   /** Node id → name, so expressions like $('Name') can be previewed with earlier nodes' output. */
   nodeNames: Record<string, string>
@@ -31,6 +31,8 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
   onClose: () => void
   /** Run the workflow; with a node id, stop after that node ("Execute step"). */
   onRun: (destination?: string) => void
+  /** Opened from an execution (n8n): that run's data, nothing editable, no Execute / pin buttons. */
+  readOnly?: boolean
 }) {
   const { byType } = useCatalog()
   const spec = byType[node.type]
@@ -69,6 +71,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
   const exprData = useMemo<ExprData>(() => ({
     workflowId,
     items: (inItems ?? []).slice(0, 50),
+    nodeNames: Object.values(nodeNames),
     nodeOutputs: Object.fromEntries(Object.entries(runsByNode)
       .filter(([id, rs]) => rs.output && nodeNames[id])
       .map(([id, rs]) => [nodeNames[id], (rs.output!.main ?? Object.values(rs.output!)[0] ?? []).slice(0, 50)])),
@@ -120,7 +123,8 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
       <div className="modal wide">
         <div className="modal-head">
           <div className="mini-icon" style={{ '--nc': spec.color } as React.CSSProperties}><Icon name={spec.icon} size={15} /></div>
-          <input className="wf-name" value={node.name} onChange={(e) => onChange({ ...node, name: e.target.value })} />
+          <input className="wf-name" value={node.name} readOnly={readOnly} onChange={(e) => onChange({ ...node, name: e.target.value })} />
+          {readOnly && <span className="badge plain" title="Opened from an execution: this run's data, read-only"><Icon name="lock" size={11} /> Execution · read-only</span>}
           <span className="muted small">{spec.label}</span>
           <span className="spacer" />
           {run && (
@@ -128,7 +132,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
               {run.status}{run.duration_ms != null ? ` · ${fmtDuration(run.duration_ms)}` : ''}{runs.length > 1 ? ` · ${runs.length} runs` : ''}
             </span>
           )}
-          {!isSub && (
+          {!isSub && !readOnly && (
             <>
               <button className="btn sm" onClick={() => onRun()} title="Run the whole workflow"><Icon name="play" size={14} /> <span className="btn-text">Execute workflow</span></button>
               <button className="btn sm primary" onClick={() => onRun(node.id)} title="Run only the nodes needed to reach this one">
@@ -169,7 +173,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
                       <Icon name="database-zap" size={28} />
                       <b>No input data yet</b>
                       <span>Run the previous nodes to see data you can drag into parameters.</span>
-                      {parents[0] && (
+                      {parents[0] && !readOnly && (
                         <button className="btn sm primary" onClick={() => onRun(parents[0].id)}>
                           <Icon name="step-forward" size={14} /> Execute previous nodes
                         </button>
@@ -197,6 +201,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
               </div>
             </div>
             <div className="ndv-col-body">
+              <fieldset className="ndv-fieldset" disabled={readOnly}>
               {tab === 'params' ? (
                 <>
                   <p className="muted small" style={{ marginTop: 0 }}>{spec.description}</p>
@@ -252,6 +257,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
                   <div className="muted small">Node ID: <code>{node.id}</code> · Type: <code>{node.type}</code></div>
                 </>
               )}
+              </fieldset>
             </div>
           </div>
 
@@ -306,11 +312,11 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
                       ) : null}
                       actions={
                         <div className="row" style={{ gap: 2 }}>
-                          {pinned ? <button className="btn ghost sm icon on-pin" title="Unpin" onClick={unpin}><Icon name="pin-off" size={15} /></button>
-                            : <button className="btn ghost sm icon" title="Pin this output (reuse it in editor runs)" disabled={!output} onClick={pin}><Icon name="pin" size={15} /></button>}
-                          <button className="btn ghost sm icon" title="Edit output" onClick={() => setEditing(JSON.stringify(pinned ? (Array.isArray(node.pin_data) ? node.pin_data : pinned) : (outItems ?? [{}]), null, 2))}>
+                          {!readOnly && (pinned ? <button className="btn ghost sm icon on-pin" title="Unpin" onClick={unpin}><Icon name="pin-off" size={15} /></button>
+                            : <button className="btn ghost sm icon" title="Pin this output (reuse it in editor runs)" disabled={!output} onClick={pin}><Icon name="pin" size={15} /></button>)}
+                          {!readOnly && <button className="btn ghost sm icon" title="Edit output" onClick={() => setEditing(JSON.stringify(pinned ? (Array.isArray(node.pin_data) ? node.pin_data : pinned) : (outItems ?? [{}]), null, 2))}>
                             <Icon name="pencil" size={15} />
-                          </button>
+                          </button>}
                           <button className="btn ghost sm icon" title="Copy JSON" disabled={!outItems?.length} onClick={copy}><Icon name="copy" size={15} /></button>
                           <button className="btn ghost sm icon" title="Download JSON" disabled={!outItems?.length} onClick={download}><Icon name="download" size={15} /></button>
                         </div>
@@ -320,7 +326,7 @@ export function NodeDetails({ node, run, runsByNode, nodeNames, parents, childre
                           <Icon name="play-circle" size={28} />
                           <b>{run ? 'No items on this output' : 'No output data'}</b>
                           {!run && <span>Execute this step, or set mock data with ✎ to pin it.</span>}
-                          {!run && !spec.trigger && <button className="btn sm primary" onClick={() => onRun(node.id)}><Icon name="step-forward" size={14} /> Execute step</button>}
+                          {!run && !spec.trigger && !readOnly && <button className="btn sm primary" onClick={() => onRun(node.id)}><Icon name="step-forward" size={14} /> Execute step</button>}
                         </div>
                       } />
                   </>

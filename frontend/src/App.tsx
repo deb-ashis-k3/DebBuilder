@@ -7,7 +7,7 @@ import { ForcePasswordChange, LoginScreen } from './pages/AuthScreens'
 import Workflows from './pages/Workflows'
 import { loadEditor } from './prefetch'
 
-// Everything else is fetched when first opened, so the first visit downloads far less JavaScript.
+
 const Editor = lazy(loadEditor)
 const Credentials = lazy(() => import('./pages/Credentials'))
 const Phone = lazy(() => import('./pages/Phone'))
@@ -15,19 +15,30 @@ const Settings = lazy(() => import('./pages/Settings'))
 const ExecutionList = lazy(() => import('./pages/Executions').then((m) => ({ default: m.ExecutionList })))
 const ExecutionDetail = lazy(() => import('./pages/Executions').then((m) => ({ default: m.ExecutionDetail })))
 
+// Themes in click order. '' follows the system's light / dark setting (Slate palette).
+const THEMES = [
+  { id: '', label: 'System', icon: 'monitor' },
+  { id: 'dark', label: 'Dark', icon: 'moon' },
+  { id: 'light', label: 'Light', icon: 'sun' },
+  { id: 'aqua', label: 'Aqua', icon: 'droplets' },
+  { id: 'rose', label: 'Soft Rose', icon: 'flower-2' },
+] as const
+export const THEME_KEY = 'debbuilder-ui-theme'  // index.html applies it before the first paint (no flash)
+
 function ThemeToggle({ collapsed }: { collapsed: boolean }) {
-  const [theme, setTheme] = useState(() => localStorageGet('theme') ?? '')
+  const [theme, setTheme] = useState<string>(() => localStorageGet(THEME_KEY) ?? '')
   useEffect(() => {
     if (theme) document.documentElement.dataset.theme = theme
     else delete document.documentElement.dataset.theme
-    localStorageSet('theme', theme)
+    localStorageSet(THEME_KEY, theme)
   }, [theme])
-  const next = theme === '' ? 'dark' : theme === 'dark' ? 'light' : ''
-  const label = `Theme: ${theme || 'system'}`
+  const i = Math.max(0, THEMES.findIndex((t) => t.id === theme))
+  const cur = THEMES[i], next = THEMES[(i + 1) % THEMES.length]
+  const label = `Theme: ${cur.label}`
   return (
-    <button className="nav-link theme-toggle" onClick={() => setTheme(next)}
-      title={collapsed ? `${label} (click: ${next || 'system'})` : 'Cycle theme: system → dark → light'}>
-      <Icon name={theme === 'dark' ? 'moon' : theme === 'light' ? 'sun' : 'monitor'} /> <span className="label">{label}</span>
+    <button className="nav-link theme-toggle" onClick={() => setTheme(next.id)}
+      title={collapsed ? `${label} (click: ${next.label})` : `Switch theme (next: ${next.label})`}>
+      <Icon name={cur.icon} /> <span className="label">{label}</span>
     </button>
   )
 }
@@ -59,7 +70,7 @@ function localStorageGet(k: string) {
   try { return localStorage.getItem(k) } catch { return null }
 }
 function localStorageSet(k: string, v: string) {
-  try { localStorage.setItem(k, v) } catch { /* private mode */ }
+  try { localStorage.setItem(k, v) } catch { }
 }
 
 function useMedia(query: string) {
@@ -74,8 +85,8 @@ function useMedia(query: string) {
 }
 
 function Shell({ children, compact = false }: { children: React.ReactNode; compact?: boolean }) {
-  // Collapses automatically: the workflow editor (compact) and narrow screens get an icon rail
-  // that opens as an overlay while hovered (or when the logo is tapped on touch screens).
+  
+  
   const narrow = useMedia('(max-width: 1100px)')
   const rail = narrow || compact
   const { pathname } = useLocation()
@@ -86,7 +97,7 @@ function Shell({ children, compact = false }: { children: React.ReactNode; compa
   const collapsed = rail && !peek
   const onEnter = () => {
     if (!rail || peek) return
-    // Short delay so just crossing the rail on the way to the canvas doesn't open it.
+    
     hoverTimer.current = window.setTimeout(() => setPeek('hover'), 220)
   }
   const onLeave = () => {

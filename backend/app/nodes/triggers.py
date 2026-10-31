@@ -48,11 +48,15 @@ register(NodeType(
 
 register(NodeType(
     type="trigger.schedule", label="Schedule", icon="clock",
-    description="Runs on a cron schedule while the workflow is active.",
+    description="Runs on a schedule while the workflow is active: a cron expression or every N seconds.",
     properties=[
-        prop("cron", "Cron expression", "string", "*/15 * * * *", required=True,
+        prop("mode", "Trigger", "options", "cron", options=[
+            {"label": "Cron expression", "value": "cron"}, {"label": "Every N seconds", "value": "interval"}]),
+        prop("cron", "Cron expression", "string", "*/15 * * * *", show_if={"mode": ["cron"]},
              description="minute hour day month weekday (e.g. 0 9 * * 1-5)"),
-        prop("timezone", "Timezone", "string", "UTC"),
+        prop("seconds", "Every (seconds)", "number", 60, show_if={"mode": ["interval"]},
+             description="1 or more. If a run takes longer than this, the next one is skipped rather than piling up."),
+        prop("timezone", "Timezone", "string", "UTC", show_if={"mode": ["cron"]}),
     ],
     execute=_passthrough, **TRIGGER,
 ))

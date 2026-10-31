@@ -41,6 +41,8 @@ log = logging.getLogger("debbuilder.store")
 _MUTABLE = ("status", "output", "node_runs", "waiting_for", "error", "finished_at", "duration_ms")
 # What an upsert needs to (re)insert a row that is already stored: its identity and start columns.
 _BASE = ("id", "workflow_id", "mode", "trigger_node", "started_at", "snapshot_hash", "workflow_snapshot")
+# "summary" still keeps the workflow's final output when it is this small (bytes of JSON)
+SUMMARY_OUTPUT_MAX = 4000
 # Node record keys that carry item data; "summary" saving drops them but keeps status / timings / counts.
 _DATA_KEYS = ("input", "output", "outputs", "sub_runs", "state")
 
@@ -130,7 +132,9 @@ class ExecutionStore:
             # (manual runs keep everything: they are how workflows get debugged).
             if (mode != "manual" and status != "waiting"
                     and _policy(workflow, "save_data", get_settings().executions_save_data) == "summary"):
-                fields = {**fields, "node_runs": summarize(fields.get("node_runs") or []), "output": []}
+                out = fields.get("output") or []
+                small = len(json.dumps(out, default=str)) <= SUMMARY_OUTPUT_MAX  # e.g. a one-line batch report
+                fields = {**fields, "node_runs": summarize(fields.get("node_runs") or []), "output": out if small else []}
                 if row is not None:
                     row["input"] = []
             if row is not None:
@@ -149,7 +153,7 @@ class ExecutionStore:
 
     def pending(self, exec_id: uuid.UUID) -> Execution | None:
         """An execution not written yet (read-your-writes for the API on this replica)."""
-        row = self._rows.get(exec_id)
+        row = self._rows.get(exec_id) or self._inflight.get(exec_id)  # also while its write is in flight
         if not row or row.get("_update_only"):
             return None
         snap = self._snapshots.get(row.get("snapshot_hash") or "")

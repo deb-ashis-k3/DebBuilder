@@ -268,6 +268,7 @@ function EntryDetails({ e, panes, setPanes, lines, icon }: {
               {k === 'console' ? <div className="log-lines">{lines?.map((l, i) => <div key={i}>{l}</div>)}</div>
                 : k === 'state' ? <StateView state={r.state!} changed={s ? [] : r.state_updates ?? []} />
                 : s ? <SubRunData s={s} which={k} />
+                  : notSaved(r) ? <NotSaved r={r} which={k} />
                   : k === 'input' ? <DataView items={r.input} empty="No input data (trigger or not yet loaded)" />
                     : <NodeOutput r={r} />}
             </div>
@@ -363,4 +364,20 @@ export function SubRunData({ s, which }: { s: SubRun; which: 'input' | 'output' 
   const out = s.output as Record<string, unknown> | undefined
   if (s.type === 'memory' && out && isMessages(out.chat_history)) return <Messages msgs={out.chat_history} />
   return <Payload v={s.output} />
+}
+
+/** A finished run whose items weren't kept ("Execution data: Summary"): counts and timings only. */
+function notSaved(r: NodeRun) {
+  return r.status !== 'running' && r.status !== 'waiting' && !('input' in r) && !('output' in r)
+}
+
+function NotSaved({ r, which }: { r: NodeRun; which: 'input' | 'output' | string }) {
+  const count = which === 'input' ? r.input_count : Object.values(r.item_counts ?? {}).reduce((a, b) => a + b, 0)
+  return (
+    <div className="empty small" style={{ padding: 16, lineHeight: 1.5 }}>
+      <b>{count ?? 0} item{count === 1 ? '' : 's'}</b> {which === 'input' ? 'in' : 'out'}, not saved for this run.
+      <div className="muted">The workflow keeps a summary of production runs (Workflow settings → Execution history →
+        Execution data). Choose “Everything” to see items, or run it from the editor: test runs are always saved in full.</div>
+    </div>
+  )
 }

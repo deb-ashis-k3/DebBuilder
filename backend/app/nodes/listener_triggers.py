@@ -175,7 +175,12 @@ node("trigger.redis_stream", "Redis Stream Trigger", "audio-waveform", "#dc382d"
              {"label": "New entries only ($)", "value": "new"}, {"label": "Beginning of stream (0)", "value": "all"}],
              description="For a new group, or for simple mode"),
          {**ACK(), "show_if": {"mode": ["group"]}},
-         prop("count", "Batch size", "number", 10),
+         prop("count", "Batch size", "number", 10, description="Entries read per call"),
+         prop("emit", "Emit", "options", "message", options=[
+             {"label": "One execution per message", "value": "message"},
+             {"label": "One execution per batch (high throughput)", "value": "batch"}],
+              description="Batch: each read (up to Batch size entries) runs the workflow once with all entries as "
+                          "items, acknowledged together. Use it for hundreds or thousands of messages per second."),
          JSON("Parse JSON field values"), CONCURRENCY, TEST_TIMEOUT,
      ])
 
@@ -186,6 +191,28 @@ def _stream_item(stream: str, eid: str, fields: dict | None, as_json: bool) -> d
             "timestamp": _iso(int(eid.split("-")[0]) / 1000) if "-" in eid else None}
 
 
+async def _stream_batch(lc: ListenCtx, r, group: str, res, pending: dict, after: bool, as_json: bool) -> None:
+    """One execution for everything one XREADGROUP returned; one XACK per stream for the whole batch."""
+    items, ids = [], {}
+    for stream, entries in res:
+        for eid, fields in entries:
+            if pending:
+                pending[stream] = eid
+            ids.setdefault(stream, []).append(eid)
+            if fields:  # (an entry trimmed while pending has no fields: just ack it)
+                items.append(_stream_item(stream, eid, fields, as_json))
+    if not ids:
+        return
+    if not after or not items:
+        for stream, eids in ids.items():
+            await r.xack(stream, group, *eids)
+    if items:
+        result = await lc.emit(items, wait=after)
+        if after and (result or {}).get("status") != "error":
+            for stream, eids in ids.items():
+                await r.xack(stream, group, *eids)
+
+
 @listener("trigger.redis_stream")
 async def _redis_stream(lc: ListenCtx):
     from redis.exceptions import ResponseError
@@ -194,6 +221,7 @@ async def _redis_stream(lc: ListenCtx):
     keys = csv(p["streams"])
     as_json = p.get("json_parse", True)
     count = int(p.get("count") or 10)
+    batches: set[asyncio.Task] = set()  # batch mode: executions still running (acked when each finishes)
     r = _redis_listener_client(lc.cred)
     try:
         if lc.test or p.get("mode") == "simple":
@@ -217,6 +245,7 @@ async def _redis_stream(lc: ListenCtx):
                     raise
         lc.ready()
         after = p.get("ack") != "immediately"
+        slots = asyncio.Semaphore(max(1, int(p.get("max_concurrency") or 1)))
         # First re-deliver this consumer's pending (unacked) entries, then switch to new ones.
         pending = {k: "0" for k in keys}
         while True:
@@ -224,6 +253,18 @@ async def _redis_stream(lc: ListenCtx):
             res = await r.xreadgroup(group, consumer, ids, count=count, block=None if pending else 5000) or []
             if pending and not any(entries for _, entries in res):
                 pending = {}
+                continue
+            if p.get("emit") == "batch":
+                if pending or not after:
+                    await _stream_batch(lc, r, group, res, pending, after, as_json)
+                else:
+                    # Overlap batches (up to "Max parallel executions"): the next read happens while earlier
+                    # batches run; each is acknowledged when its own execution succeeds.
+                    await slots.acquire()
+                    task = asyncio.create_task(_stream_batch(lc, r, group, res, pending, after, as_json))
+                    task.add_done_callback(lambda _: slots.release())
+                    batches.add(task)
+                    task.add_done_callback(batches.discard)
                 continue
             for stream, entries in res:
                 for eid, fields in entries:
@@ -238,6 +279,8 @@ async def _redis_stream(lc: ListenCtx):
                     if after and (result or {}).get("status") != "error":
                         await r.xack(stream, group, eid)
     finally:
+        if batches:  # stopping: let running batches finish and acknowledge
+            await asyncio.gather(*list(batches), return_exceptions=True)
         await r.aclose()
 
 

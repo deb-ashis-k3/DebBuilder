@@ -62,6 +62,36 @@ def _item(d: dict | None) -> ItemRef:
     return ItemRef(d or {})
 
 
+class InputRef:
+    """`$input.all()` / `.first()` / `.last()` / `.item`, built only when an expression uses them. Building them
+    eagerly wrapped every input item for every item's context: quadratic for nodes handling thousands of items."""
+
+    def __init__(self, items: list[dict], item: dict | None):
+        self._items, self._item_d = items, item
+        self._all: ItemsRef | None = None
+
+    @property
+    def all(self) -> ItemsRef:
+        if self._all is None:
+            self._all = ItemsRef(_item(i) for i in self._items)
+        return self._all
+
+    @property
+    def first(self) -> ItemRef:
+        return _item(self._items[0] if self._items else {})
+
+    @property
+    def last(self) -> ItemRef:
+        return _item(self._items[-1] if self._items else {})
+
+    @property
+    def item(self) -> ItemRef:
+        return _item(self._item_d)
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+
 class NodeRef:
     def __init__(self, items: list[dict]):
         self.items = ItemsRef(_item(i) for i in items)
@@ -125,8 +155,7 @@ def build_context(
     return {
         "json": item or {},
         "binary": (item or {}).get("binary") or {},
-        "input": {"all": ItemsRef(_item(i) for i in items), "first": _item(items[0] if items else {}),
-                  "item": _item(item), "last": _item(items[-1] if items else {})},
+        "input": InputRef(items, item),
         "items": items,
         "itemIndex": item_index,
         "node": NodeAccessor(node_outputs),
@@ -166,6 +195,9 @@ def _eval_str(s: str, ctx: dict[str, Any]) -> Any:
         s = s[1:]
     if "{{" not in s:
         return s
+    rest = _EXPR.sub("", s)  # an opened {{ that is never closed is a mistake, not text
+    if "{{" in rest:
+        raise ValueError(f"Unclosed expression: '{{{{' without a matching '}}}}' in {rest[rest.find('{{'):][:60]!r}")
     stripped = s.strip()
     m = _EXPR.fullmatch(stripped)
     # One expression → its native value. "{{ a }} x {{ b }}" also starts with {{ and ends with }}, but it is
@@ -196,3 +228,118 @@ def _compile(expr: str):
             _cache.clear()
         _cache[expr] = fn
     return fn
+
+
+# ---------------------------------------------------------------------------
+# Editor checks (n8n's inline expression states + field checks)
+# ---------------------------------------------------------------------------
+
+_ACCESSORS = {"json", "first", "last", "item", "all", "items"}
+
+
+def _chain(n) -> tuple[object, list] | None:
+    """Unwind `a.b['c'].d()` into (root, ['b', 'c', 'd()']) from a Jinja AST node."""
+    from jinja2 import nodes as J
+
+    path: list = []
+    while True:
+        if isinstance(n, J.Getattr):
+            path.append(n.attr)
+            n = n.node
+        elif isinstance(n, J.Getitem) and isinstance(n.arg, J.Const):
+            path.append(n.arg.value)
+            n = n.node
+        elif isinstance(n, J.Call) and not n.args and isinstance(n.node, J.Getattr) and n.node.attr in _ACCESSORS:
+            n = n.node  # .first() / .all(): same as the attribute
+        else:
+            return n, list(reversed(path))
+
+
+def _check_path(data, path: list, label: str) -> tuple[str, bool] | None:
+    """None if `path` exists in `data`; else (message naming the missing key, whether a close match exists)."""
+    import difflib
+
+    cur, walked = data, label
+    for key in path:
+        if isinstance(cur, list):
+            if isinstance(key, int) and -len(cur) <= key < len(cur):
+                cur, walked = cur[key], f"{walked}[{key}]"
+                continue
+            return None  # list methods / slicing: not ours to judge
+        if not isinstance(cur, dict):
+            return None  # str / number methods etc.
+        if key not in cur:
+            # 0.75: real typos (messag→message 0.92, nmae→name 0.75), not unrelated words (query→user 0.67)
+            close = difflib.get_close_matches(str(key), [str(k) for k in cur], n=1, cutoff=0.75)
+            hint = f" — did you mean '{close[0]}'?" if close else (f" (it has: {', '.join(list(map(str, cur))[:8])})" if cur else "")
+            return f"No field '{key}' in {walked}{hint}", bool(close)
+        cur, walked = cur[key], f"{walked}.{key}"
+    return None
+
+
+def _field_warnings(expr: str, item: dict, node_outputs: dict[str, list[dict]]) -> list[str]:
+    from jinja2 import nodes as J
+
+    try:
+        tree = _env.parse("{{ " + _translate(expr.strip()) + " }}")
+    except Exception:  # noqa: BLE001 - syntax errors are reported separately
+        return []
+    # Fields with a fallback (`a or b`, `x if c else y`, `| default`) are often optional on purpose: flag those
+    # only when they look like a typo of a real field. Anything else that's missing is flagged.
+    soft: set[int] = set()
+    for f in tree.find_all((J.Or, J.CondExpr, J.Filter, J.Test)):
+        if isinstance(f, J.Filter) and f.name != "default" or isinstance(f, J.Test) and f.name != "defined":
+            continue
+        soft.update(id(x) for x in f.find_all((J.Getattr, J.Getitem)))
+    found: list[str] = []
+    for n in tree.find_all((J.Getattr, J.Getitem)):
+        root, path = _chain(n)
+        if not path:
+            continue
+        if isinstance(root, J.Name) and root.name == "json" and item:
+            msg = _check_path(item, path, "the input item")
+        elif (isinstance(root, J.Call) and isinstance(root.node, J.Name) and root.node.name == "node"
+              and root.args and isinstance(root.args[0], J.Const) and root.args[0].value in node_outputs):
+            rest = list(path)
+            while rest and (rest[0] in _ACCESSORS or isinstance(rest[0], int)):  # .first().json / .all()[0].json
+                rest = rest[1:]
+            out = node_outputs[root.args[0].value]
+            msg = _check_path(out[0] if out else {}, rest, f"$('{root.args[0].value}')") if out else None
+        else:
+            continue
+        if msg and (msg[1] or id(n) not in soft) and msg[0] not in found:
+            found.append(msg[0])
+    return found[:3]
+
+
+def inspect(value: str, ctx: dict[str, Any], node_names: set[str], node_outputs: dict[str, list[dict]]) -> list[dict]:
+    """Per {{ }} segment, like n8n's inline expression editor: state valid | pending | invalid, its value or
+    error, plus warnings for fields that don't exist in the data the editor has (did you mean …)."""
+    segments = []
+    item = ctx.get("json") or {}
+    for m in _EXPR.finditer(value or ""):
+        expr = m.group(1)
+        seg = {"from": m.start(), "to": m.end(), "state": "valid", "warnings": []}
+        try:
+            _compile(expr)
+        except ValueError as e:
+            seg.update(state="invalid", error=str(e).split(": ", 1)[-1])
+            segments.append(seg)
+            continue
+        refs = re.findall(r"\$\(\s*['\"]([^'\"]+)['\"]\s*\)|\$node\[\s*['\"]([^'\"]+)['\"]\s*\]", expr)
+        names = {a or b for a, b in refs}
+        unknown = sorted(n for n in names if n not in node_names)
+        not_run = sorted(n for n in names if n in node_names and n not in node_outputs)
+        if unknown:
+            seg.update(state="invalid", error=f"No node named '{unknown[0]}' in this workflow")
+        elif not_run:
+            seg.update(state="pending", error=f"Execute '{not_run[0]}' to see this value")
+        else:
+            try:
+                v = _compile(expr)(**ctx)
+                seg["value"] = v if isinstance(v, str) else _json.dumps(v, default=str)
+            except Exception as e:  # noqa: BLE001
+                seg.update(state="invalid", error=f"{type(e).__name__}: {e}"[:300])
+            seg["warnings"] = _field_warnings(expr, item, node_outputs)
+        segments.append(seg)
+    return segments

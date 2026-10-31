@@ -112,7 +112,8 @@ async def _handle_webhook(path: str, request: Request, test: bool):
             "method": method, "path": path}
 
     mode = params.get("respond", "last_node")
-    res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="webhook",
+    # /webhook-test runs are test runs ("manual", as in n8n): the editor canvas follows them, not production ones.
+    res = await execute_workflow(wf, trigger_node_id=node["id"], items=[item], mode="manual" if test else "webhook",
                                  wait=mode != "immediately")
     if mode == "immediately":
         return JSONResponse({"message": "Workflow started", "execution_id": res["execution_id"]}, status_code=202)

@@ -25,6 +25,8 @@ import { tidyUp } from '../canvas/tidyUp'
 import '../pages.css'  // styles for pages loaded on demand
 
 // LiveKit client is large; load it only when the voice panel opens.
+const AUTOSAVE_MS = 800        // after the last change (a drag only saves once you let go)
+const AUTOSAVE_RETRY_MS = 5000
 const VoicePanel = lazy(() => import('../components/VoicePanel').then((m) => ({ default: m.VoicePanel })))
 
 type RFNode = Node<FlowNodeData>
@@ -96,9 +98,54 @@ function EditorInner() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
   const updateInternals = useUpdateNodeInternals()
   const [dirty, setDirty] = useState(false)
+  // Autosave: every change bumps `changes`; a save only clears `dirty` if nothing changed while it ran.
+  const changes = useRef(0)
+  const savedVersion = useRef(0)  // `changes` value the server has
+  const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved')
+  const autosave = useRef<{ timer?: number; inflight: boolean; again: boolean }>({ inflight: false, again: false })
+  const flushRef = useRef<() => Promise<void>>(async () => {})
+  const touched = () => {
+    changes.current++
+    setDirty(true)
+    window.clearTimeout(autosave.current.timer)
+    autosave.current.timer = window.setTimeout(() => { flushRef.current() }, AUTOSAVE_MS)  // after the edits settle
+  }
   const [ctxMenu, setCtxMenu] = useState<MenuTarget | null>(null)
   const [panning, setPanning] = useState(false)
   const pointer = useRef<{ x: number; y: number } | null>(null)
+  // ---- responsive canvas ------------------------------------------------------------------------------
+  const canvasRef = useRef<HTMLDivElement>(null)
+  const userMoved = useRef(false)  // the user panned / zoomed: leave their view alone on resize
+  /** Fit the workflow so it stays readable on any screen: everything when that keeps nodes legible,
+   *  otherwise the full width (at a readable zoom) starting from the top, where the triggers are. */
+  const smartFit = useCallback((duration = 0) => {
+    const el = canvasRef.current
+    const ns = rf.getNodes()
+    if (!el || !ns.length) return
+    const READABLE = 0.55, PAD_X = 40, PAD_TOP = 84, PAD_BOTTOM = 96
+    const W = el.clientWidth, H = el.clientHeight
+    const b = rf.getNodesBounds(ns)
+    const fitAll = Math.min(1, (W - 2 * PAD_X) / Math.max(b.width, 1), (H - PAD_TOP - PAD_BOTTOM) / Math.max(b.height, 1))
+    if (fitAll >= READABLE) {
+      rf.fitView({ padding: 0.3, maxZoom: 1, duration })
+      return
+    }
+    const z = Math.max(READABLE, Math.min(1, (W - 2 * PAD_X) / Math.max(b.width, 1)))
+    const x = b.width * z <= W - 2 * PAD_X ? (W - b.width * z) / 2 - b.x * z : PAD_X - b.x * z
+    rf.setViewport({ x, y: PAD_TOP - b.y * z, zoom: z }, { duration })
+  }, [rf])
+  const refit = useCallback((duration = 200) => { userMoved.current = false; smartFit(duration) }, [smartFit])
+  useEffect(() => {
+    const el = canvasRef.current
+    if (!el) return
+    let t: number | undefined
+    const ro = new ResizeObserver(() => {
+      window.clearTimeout(t)
+      t = window.setTimeout(() => { if (!userMoved.current) smartFit(150) }, 120)
+    })
+    ro.observe(el)
+    return () => { ro.disconnect(); window.clearTimeout(t) }
+  }, [smartFit])
   const placeAt = useRef<{ x: number; y: number } | null>(null)  // "Add node" from the canvas menu: drop it where you right-clicked
   // Undo/redo: snapshots of the graph, committed once edits settle (a drag or a burst of typing = one step).
   const history = useRef<{ past: string[]; future: string[]; last: string | null; timer?: number }>({ past: [], future: [], last: null })
@@ -118,6 +165,8 @@ function EditorInner() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const listeners = useRef(new Set<(ev: ExecEvent) => void>())
   const execRef = useRef<string | null>(null)
+  const panelRef = useRef<'chat' | 'voice' | null>(null)
+  panelRef.current = panel
 
   // ---- load -------------------------------------------------------------
   useEffect(() => {
@@ -129,10 +178,15 @@ function EditorInner() {
       setNodes(w.nodes.map((n) => toRF(n)))
       setEdges(w.edges.map(edgeToRF))
       setDirty(false)
+      savedVersion.current = changes.current
+      setSaveState('saved')
       history.current = { past: [], future: [], last: null }
       scheduleCommit()
       requestAnimationFrame(() => {
-        rf.fitView({ padding: 0.3, maxZoom: 1 })
+        userMoved.current = false
+        smartFit()
+        // nodes are measured a moment after they mount: fit again with their real sizes
+        window.setTimeout(() => { if (!userMoved.current) smartFit() }, 250)
         // Replacing nodes can drop React Flow's cached handle positions without a re-measure,
         // which hides every edge; force one once the nodes are on screen.
         requestAnimationFrame(() => updateInternals(w.nodes.map((n) => n.id)))
@@ -148,6 +202,11 @@ function EditorInner() {
     return openSocket(`/ws/workflows/${id}`, (ev: ExecEvent) => {
       listeners.current.forEach((l) => l(ev))
       if (ev.type === 'execution_started') {
+        // Like n8n, the canvas shows test runs: Execute workflow / step and test webhooks ("manual"), and chat or
+        // voice runs while their test panel is open. Production runs (schedules, triggers, webhooks) only go to
+        // the Executions tab, so a busy workflow doesn't flicker on the canvas while you edit it.
+        const test = ev.mode === 'manual' || (panelRef.current !== null && (ev.mode === 'chat' || ev.mode === 'voice'))
+        if (!test) return
         execRef.current = ev.execution_id
         setExecId(ev.execution_id)
         setExecRuns([])
@@ -232,13 +291,13 @@ function EditorInner() {
     window.clearTimeout(history.current.timer)
     history.current.timer = window.setTimeout(commit, 350)
   }
-  const markDirty = () => { setDirty(true); scheduleCommit() }
+  const markDirty = () => { touched(); scheduleCommit() }
   const restore = (state: string) => {
     const s = JSON.parse(state) as { nodes: WFNode[]; edges: WFEdge[] }
     setNodes(s.nodes.map((n) => toRF(n)))
     setEdges(s.edges.map(edgeToRF))
     history.current.last = state
-    setDirty(true)
+    touched()  // undo / redo are saved like any edit
   }
   const undo = () => {
     commit()  // an edit still settling becomes its own step first
@@ -356,7 +415,7 @@ function EditorInner() {
       setPalette({ pending: { nodeId: e.source, handleId: e.sourceHandle ?? 'main', handleType: 'source', position: at,
         insertEdge: { id: e.id, target: e.target, targetHandle: e.targetHandle ?? 'main' } } })
     },
-    remove: (edgeId) => { setEdges((es) => es.filter((e) => e.id !== edgeId)); setDirty(true) },
+    remove: (edgeId) => { setEdges((es) => es.filter((e) => e.id !== edgeId)); touched() },
   }), [rf, setEdges])
 
   const paletteFilter = useMemo(() => {
@@ -385,24 +444,65 @@ function EditorInner() {
   }
 
   // ---- save / run --------------------------------------------------------
-  const save = useCallback(async (extra: Partial<Workflow> = {}) => {
+  const save = useCallback(async (extra: Partial<Workflow> = {}, quiet = false) => {
     if (!wf) return
+    const version = changes.current
     try {
       const saved = await api.updateWorkflow(wf.id, {
         name: wf.name, settings: wf.settings, description: wf.description,
         nodes: currentNodes(), edges: edgesFromRF(rf.getEdges()), ...extra,
       })
-      setWf((w) => (w ? { ...w, ...saved } : saved))
-      setDirty(false)
+      // Only server-owned fields: what was typed while the request ran (name, settings…) stays.
+      setWf((w) => (w ? { ...w, updated_at: saved.updated_at, active: saved.active, folder_id: saved.folder_id } : saved))
+      savedVersion.current = Math.max(savedVersion.current, version)
+      if (changes.current === version) setDirty(false)
       return saved
     } catch (e) {
-      toast(String(e), 'error')
+      if (!quiet) toast(String(e), 'error')
       throw e
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wf, rf])
 
-  const ensureSaved = useCallback(async () => { if (dirty) await save() }, [dirty, save])
+  /** Write pending changes now. Serialised: a change made during a save is written right after it. */
+  const flush = useCallback(async () => {
+    const a = autosave.current
+    window.clearTimeout(a.timer)
+    if (readOnly || changes.current === savedVersion.current) return  // nothing new since the last save
+    if (a.inflight) { a.again = true; return }
+    a.inflight = true
+    setSaveState('saving')
+    const version = changes.current
+    try {
+      await save({}, true)
+      setSaveState('saved')
+    } catch {
+      setSaveState('error')
+      a.timer = window.setTimeout(() => { flushRef.current() }, AUTOSAVE_RETRY_MS)  // e.g. network blip
+    } finally {
+      a.inflight = false
+      if (a.again || changes.current !== version) { a.again = false; if (changes.current !== version) flushRef.current() }
+    }
+  }, [save, readOnly])
+  flushRef.current = flush
+  const ensureSaved = useCallback(async () => { if (dirty) await flush() }, [dirty, flush])
+
+  // Leaving the editor, switching tabs or closing the window: write what's pending right away.
+  useEffect(() => {
+    const onHide = () => { if (document.visibilityState === 'hidden') flushRef.current() }
+    const onUnload = (e: BeforeUnloadEvent) => {
+      if (!autosave.current.inflight && changes.current === savedVersion.current) return
+      flushRef.current()
+      e.preventDefault()  // the browser asks "leave site?" only while a save is still pending
+    }
+    document.addEventListener('visibilitychange', onHide)
+    window.addEventListener('beforeunload', onUnload)
+    return () => {
+      document.removeEventListener('visibilitychange', onHide)
+      window.removeEventListener('beforeunload', onUnload)
+      flushRef.current()  // navigating away inside the app
+    }
+  }, [])
 
   /** Run the editor's current graph. With `destination`, only up to that node (n8n "Execute step"). */
   const run = async (destination?: string) => {
@@ -520,9 +620,9 @@ function EditorInner() {
   const addSticky = () => { const s = byType['ui.sticky']; if (s) addNode(s, pointerFlow()) }
 
   // The listeners below are registered once per mode; they call the latest handlers through this ref.
-  const act = useRef({ run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
+  const act = useRef({ refit, flush, run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
     pointerFlow, selectionData, selectedNodes, save })
-  act.current = { run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
+  act.current = { refit, flush, run, undo, redo, tidy, duplicateSelected, toggleDisabled, addSticky, selectAll, deleteSelected, insertGraph,
     pointerFlow, selectionData, selectedNodes, save }
   // ---- keyboard (n8n's canvas keymap), clipboard events ----------------------
   useEffect(() => {
@@ -530,12 +630,12 @@ function EditorInner() {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey
       const k = e.key.toLowerCase()
-      if (mod && k === 's') { e.preventDefault(); act.current.save().then(() => toast('Saved')); return }
+      if (mod && k === 's') { e.preventDefault(); act.current.flush(); return }  // autosaves anyway; this saves now
       if (inField(e.target) || tab !== 'editor') return
       if (e.key === ' ' && !e.repeat) setPanning(true)
       if (mod && k === 'enter') { e.preventDefault(); act.current.run(); return }
       if (mod && k === 'a') { e.preventDefault(); act.current.selectAll(); return }
-      if (e.key === '1' && !mod) { rf.fitView({ padding: 0.2, duration: 200 }); return }
+      if (e.key === '1' && !mod) { act.current.refit(); return }
       if (e.key === '0' && !mod) { rf.zoomTo(1, { duration: 200 }); return }
       if (readOnly) return
       if (mod && k === 'z' && !e.shiftKey) { e.preventDefault(); act.current.undo(); return }
@@ -642,7 +742,11 @@ function EditorInner() {
         )}
         {crumbs.length > 0 && <span className="ed-crumb-sep hide-sm">/</span>}
         <input className="wf-name" value={wf.name} onChange={(e) => { setWf({ ...wf, name: e.target.value }); markDirty() }} />
-        <span className={`save-state ${dirty ? 'dirty' : ''}`} title={dirty ? 'Unsaved changes' : 'All changes saved'}><span className="btn-text">{dirty ? 'Unsaved changes' : 'All changes saved'}</span></span>
+        {!readOnly && (() => {
+          const st = saveState === 'error' ? 'error' : dirty || saveState === 'saving' ? 'saving' : 'saved'
+          const text = st === 'error' ? "Couldn't save · retrying" : st === 'saving' ? 'Saving…' : 'All changes saved'
+          return <span className={`save-state ${st}`} title={`${text} (changes save automatically)`} aria-live="polite"><span className="btn-text">{text}</span></span>
+        })()}
         <span className="spacer" />
         <div className="tabs ed-tabs" role="tablist">
           <button role="tab" aria-selected={tab === 'editor'} className={`tab ${tab === 'editor' ? 'active' : ''}`} onClick={() => setTab('editor')}>Editor</button>
@@ -666,7 +770,6 @@ function EditorInner() {
         </div>
         <Menu items={menu} title="Workflow actions" className="btn icon" />
         <input ref={importRef} type="file" accept=".json,application/json" hidden onChange={(e) => { if (e.target.files?.[0]) importFile(e.target.files[0]); e.target.value = '' }} />
-        {!readOnly && <button className={`btn ${dirty ? 'primary' : ''}`} onClick={() => save().then(() => toast('Saved'))} disabled={!dirty} title="Save (Ctrl+S)"><Icon name="save" size={15} /> <span className="btn-text">Save</span> <span className="kbd">Ctrl+S</span></button>}
       </div>
       {readOnly && <div className="readonly-banner"><Icon name="eye" size={14} /> View only: your role can't change or run this workflow.</div>}
 
@@ -677,7 +780,7 @@ function EditorInner() {
       {/* The editor stays mounted on the Executions tab so unsaved changes and the canvas view survive. */}
       <div className={`ed-pane ${tab === 'editor' ? '' : 'ed-hidden'}`}>
       <div className="canvas-wrap">
-        <div className={`canvas ${panning ? 'panning' : ''}`} onDrop={onDrop} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
+        <div ref={canvasRef} className={`canvas ${panning ? 'panning' : ''}`} onDrop={onDrop} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
           onMouseMove={(e) => { pointer.current = { x: e.clientX, y: e.clientY } }}>
           <EdgeActionsCtx.Provider value={edgeActions}>
           <ReactFlow
@@ -702,9 +805,11 @@ function EditorInner() {
             onNodeDragStart={() => setCtxMenu(null)}
             defaultEdgeOptions={{ type: 'canvas' }} snapToGrid snapGrid={[20, 20]} minZoom={0.1} maxZoom={2}
             proOptions={{ hideAttribution: true }}
+            onMoveEnd={(e) => { if (e) userMoved.current = true }}  // programmatic moves have no event
           >
             <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} color="var(--canvas-dot)" />
-            <Controls showInteractive={false}>
+            <Controls showInteractive={false} showFitView={false}>
+              <ControlButton onClick={() => refit()} title="Fit to screen (1)"><Icon name="maximize" size={14} /></ControlButton>
               <ControlButton onClick={() => rf.zoomTo(1, { duration: 200 })} title="Reset zoom (0)"><Icon name="scan-search" size={14} /></ControlButton>
               {!readOnly && <>
                 <ControlButton onClick={tidy} title="Tidy up (Shift+Alt+T)"><Icon name="wand-sparkles" size={14} /></ControlButton>
@@ -727,7 +832,7 @@ function EditorInner() {
                 open: (id) => setOpenNode(id), execute: (id) => run(id), copy: () => copySelection(), cut: () => copySelection(true),
                 duplicate: duplicateSelected, toggleDisabled: (ids) => toggleDisabled(ids), remove: deleteSelected, tidy, selectAll,
                 paste: (at) => pasteFromClipboard(at), addNode: (at) => { placeAt.current = at; setPalette({}) }, addSticky: (at) => { const s = byType['ui.sticky']; if (s) addNode(s, at) },
-                fitView: () => rf.fitView({ padding: 0.2, duration: 200 }),
+                fitView: () => refit(),
               }} />
           )}
           {nodes.length === 0 && (

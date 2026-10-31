@@ -1,21 +1,21 @@
-/* schema view */
+
 .schema { display: flex; flex-direction: column; gap: 3px; }
 .role { font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 6px; background: var(--surface-3); color: var(--text-2); text-transform: uppercase; flex-shrink: 0; margin-top: 4px; }
 .role.system { background: rgb(245 158 11 / 15%); color: #c27803; }
-.role.ai { background: rgb(45 212 191 / 15%); color: var(--primary); }
-.role.tool { background: rgb(45 212 191 / 15%); color: var(--primary); }
+.role.ai { background: rgb(var(--accent-rgb) / 15%); color: var(--primary); }
+.role.tool { background: rgb(var(--accent-rgb) / 15%); color: var(--primary); }
 @keyframes pulse-bar { 50% { opacity: .55; } }
 
-/* phone: execution table rows become compact cards */
+
 @media (max-width: 640px) {
   .app.side-collapsed .sidebar { width: 52px; padding: 14px 6px; }
   .app.side-collapsed .nav-link.active::before { left: -6px; }
   .app.side-peek .main { margin-left: 52px; }
 }
-@keyframes listen-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgb(45 212 191 / 45%); } 50% { box-shadow: 0 0 0 5px rgb(45 212 191 / 0%); } }
+@keyframes listen-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgb(var(--accent-rgb) / 45%); } 50% { box-shadow: 0 0 0 5px rgb(var(--accent-rgb) / 0%); } }
 
 
-/* ---------- action menu (⋯) ---------- */
+
 .act-menu {
   position: fixed; z-index: 1000; min-width: 210px; padding: 4px; background: var(--surface); border: 1px solid var(--border-strong);
   border-radius: 8px; box-shadow: var(--shadow-lg); animation: fade-in .12s ease;
@@ -29,7 +29,7 @@
 .act-hint { margin-left: auto; font-size: 11px; color: var(--text-3); }
 .act-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 
-/* ---------- workflows page: folders, toolbar, selection ---------- */
+
 .wf-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 22px 0 12px; }
 .wf-actions { display: flex; gap: 8px; }
 .crumbs { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; min-width: 0; font-size: 16px; font-weight: 650; }
@@ -46,7 +46,7 @@
 .wf-selall { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); margin-left: auto; cursor: pointer; }
 input[type='checkbox'] { accent-color: var(--violet); width: 15px; height: 15px; cursor: pointer; }
 .bulk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 12px; border-radius: 8px;
-  background: var(--primary-soft); border: 1px solid rgb(45 212 191 / 30%); animation: fade-in .15s ease; }
+  background: var(--primary-soft); border: 1px solid rgb(var(--accent-rgb) / 30%); animation: fade-in .15s ease; }
 .bulk-bar b { color: var(--primary); margin-right: 6px; }
 .link-btn { border: 0; background: none; color: var(--primary); font: inherit; font-weight: 650; cursor: pointer; padding: 0 4px; text-decoration: underline; }
 .list-item .row-check { flex-shrink: 0; }
@@ -81,11 +81,11 @@ input[type='checkbox'] { accent-color: var(--violet); width: 15px; height: 15px;
   .wf-selall { margin-left: 0; }
 }
 
-/* theme switch sits at the top of the sidebar, under the logo */
+
 .theme-toggle { margin-bottom: 4px; }
 .sidebar .brand { padding-bottom: 14px; }
 
-/* in-app confirm + outdated API banner */
+
 .confirm-msg { color: var(--text-2); line-height: 1.5; }
 .btn.danger.solid { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.danger.solid:hover { filter: brightness(1.08); background: var(--danger); }
@@ -98,7 +98,7 @@ input[type='checkbox'] { accent-color: var(--violet); width: 15px; height: 15px;
 .api-banner code { background: var(--surface-3); padding: 1px 5px; border-radius: 4px; }
 
 
-/* ---------- authentication screens ---------- */
+
 .auth-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; background: var(--bg); }
 .auth-card { width: min(420px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 28px 28px 24px; box-shadow: var(--shadow-lg); }
 .auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; font-size: 16px; }
@@ -114,7 +114,7 @@ input[type='checkbox'] { accent-color: var(--violet); width: 15px; height: 15px;
 .pw-rules li { display: flex; align-items: center; gap: 6px; }
 .pw-rules li.ok { color: var(--success); }
 
-/* ---------- sidebar user chip ---------- */
+
 .user-chip { display: flex; align-items: center; gap: 10px; padding: 10px 8px 4px; border-top: 1px solid var(--side-border); }
 .user-chip .avatar { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; display: grid; place-items: center; font-size: 12px; font-weight: 700;
   background: var(--primary-soft); color: var(--primary); }
@@ -124,9 +124,9 @@ input[type='checkbox'] { accent-color: var(--violet); width: 15px; height: 15px;
 .user-chip .signout { width: auto; padding: 8px; flex-shrink: 0; }
 .app.side-collapsed .user-chip { flex-direction: column; padding: 10px 0 4px; }
 
-/* ---------- settings ---------- */
+
 .settings { max-width: 880px; }
-/* Edge/IE add their own reveal button to password inputs; ours is in .input-wrap */
+
 input[type='password']::-ms-reveal, input[type='password']::-ms-clear { display: none; }
 .code-boxes { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
 .code-box { height: 52px; padding: 0; text-align: center; font-family: var(--mono); font-size: 22px; font-weight: 700; }
@@ -138,7 +138,7 @@ input[type='password']::-ms-reveal, input[type='password']::-ms-clear { display:
 .auth-label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .auth-label-row .link-btn { font-size: 12.5px; }
 .auth-ok { display: flex; gap: 8px; align-items: center; padding: 9px 11px; border-radius: 8px; font-size: 12.5px;
-  background: var(--primary-soft); border: 1px solid rgb(45 212 191 / 35%); }
+  background: var(--primary-soft); border: 1px solid rgb(var(--accent-rgb) / 35%); }
 .auth-ok svg { flex-shrink: 0; color: var(--primary); }
 
 .voice-worker { margin-bottom: 12px; }

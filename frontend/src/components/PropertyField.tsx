@@ -3,7 +3,7 @@ import { api } from '../api'
 import { Icon, isExpr, isVisible, toast } from '../lib'
 import type { Credential, PropSpec, Workflow } from '../types'
 import { CredentialModal } from './CredentialModal'
-import { ExprField } from './ExprField'
+import { CodeCheck, ExprField } from './ExprField'
 import { Select } from './Select'
 
 // Small shared caches so every field doesn't refetch.
@@ -252,7 +252,12 @@ export function PropertyField({ spec, value, onChange, params }: {
         control = <textarea className={`textarea ${exprCls}`} rows={spec.rows ?? 3} value={str} placeholder={spec.placeholder} onChange={(e) => onChange(e.target.value)} />
         break
       case 'code':
-        control = <CodeArea value={str} rows={spec.rows} onChange={onChange} />
+        control = (
+          <>
+            <CodeArea value={str} rows={spec.rows} onChange={onChange} />
+            {spec.name === 'code' && <CodeCheck code={str} language={String(params?.language ?? 'python')} />}
+          </>
+        )
         break
       case 'json':
         control = <CodeArea value={str} rows={spec.rows ?? 5} className={exprCls} onChange={onChange} />

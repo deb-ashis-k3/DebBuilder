@@ -246,6 +246,7 @@ POLICY: list[tuple[str, str, str]] = [
     (R, r"/api/(workflows|folders)(/.*)?", "workflow:read"),
     ("POST", r"/api/workflows/[^/]+/run", "workflow:execute"),
     ("POST", r"/api/workflows/[^/]+/expression-preview", "workflow:read"),  # evaluates only, changes nothing
+    ("POST", r"/api/workflows/[^/]+/code-check", "workflow:read"),  # compiles only, never runs
     ("POST", r"/api/voice/session", "workflow:execute"),
     (R, r"/api/voice/telephony/[^/]+", "credential:read"),
     (W, r"/api/voice/telephony(/.*)?", "credential:write"),
@@ -435,8 +436,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return _secure_headers(response, path)
 
 
-_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; "
+_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' data:; img-src 'self' data: blob: https:; "
         "connect-src 'self' ws: wss: https:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 
 

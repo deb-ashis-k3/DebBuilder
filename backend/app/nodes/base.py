@@ -137,6 +137,16 @@ class NodeError(Exception):
         self.node_name = node_name
 
 
+def _has_expression(value: Any) -> bool:
+    if isinstance(value, str):
+        return "{{" in value
+    if isinstance(value, dict):
+        return any(_has_expression(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_expression(v) for v in value)
+    return False
+
+
 @dataclass
 class NodeContext:
     run: Run
@@ -178,8 +188,17 @@ class NodeContext:
         return evaluate(raw, self.expr_context(i))
 
     def params(self, i: int = 0) -> dict:
+        raw = self.raw_params
+        # No {{ }} anywhere: the values are the same for every item, so evaluate once (a node handling
+        # thousands of items otherwise rebuilt the expression context per item for nothing).
+        static = getattr(self, "_static_params", None)
+        if static is None and not _has_expression(raw):
+            ctx = self.expr_context(0)
+            static = self._static_params = {k: evaluate(v, ctx) for k, v in raw.items()}
+        if static is not None:
+            return dict(static)
         ctx = self.expr_context(i)
-        return {k: evaluate(v, ctx) for k, v in self.raw_params.items()}
+        return {k: evaluate(v, ctx) for k, v in raw.items()}
 
     def eval(self, value: Any, i: int = 0) -> Any:
         return evaluate(value, self.expr_context(i))

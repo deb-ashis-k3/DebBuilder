@@ -3,6 +3,7 @@
 import asyncio
 import json
 import smtplib
+from typing import Any
 from email.message import EmailMessage
 
 import httpx
@@ -329,15 +330,58 @@ register(NodeType(
 ))
 
 
-async def _redis(ctx: NodeContext):
+_redis_clients: dict[tuple, Any] = {}
+
+
+def _redis_client(cred: dict):
+    """One pooled client per Redis credential (and event loop), reused across runs. A new connection per run
+    costs a TCP (+TLS) handshake every time; on Windows "localhost" can add ~2 s while IPv6 is tried first."""
+    import asyncio
+
     import redis.asyncio as aioredis
 
+    key = (id(asyncio.get_running_loop()), cred.get("host"), str(cred.get("port") or 6379), str(cred.get("db") or 0),
+           cred.get("username") or "", cred.get("password") or "", bool(cred.get("ssl")))
+    client = _redis_clients.get(key)
+    if client is None:
+        if len(_redis_clients) > 64:
+            _redis_clients.clear()
+        client = _redis_clients[key] = aioredis.Redis(
+            host=cred["host"], port=int(cred.get("port") or 6379), db=int(cred.get("db") or 0),
+            username=cred.get("username") or None, password=cred.get("password") or None, ssl=bool(cred.get("ssl")),
+            decode_responses=True, max_connections=50, health_check_interval=30)
+    return client
+
+
+def _stream_fields(value, item: dict) -> dict:
+    """Redis stream entries are flat string maps: nested values go in as JSON. No value = the whole item."""
+    if value in (None, ""):
+        value = item
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {"value": value}
+    if not isinstance(value, dict):
+        return {"value": json.dumps(value)}
+    return {str(k): v if isinstance(v, str) else json.dumps(v, default=str) for k, v in value.items()}
+
+
+async def _redis(ctx: NodeContext):
     _, cred = await ctx.credential()
-    r = aioredis.Redis(host=cred["host"], port=int(cred.get("port") or 6379), db=int(cred.get("db") or 0),
-                       username=cred.get("username") or None, password=cred.get("password") or None,
-                       ssl=bool(cred.get("ssl")), decode_responses=True)
+    r = _redis_client(cred)
     out = []
     try:
+        if ctx.raw_params.get("operation") == "xadd":
+            # Every item in one pipeline: a single round trip for the whole batch (thousands per second).
+            pipe = r.pipeline(transaction=False)
+            for i, item in enumerate(ctx.items or [{}]):
+                p = ctx.params(i)
+                fields = _stream_fields(p.get("fields"), item)
+                maxlen = int(p["maxlen"]) if p.get("maxlen") else None
+                pipe.xadd(str(p.get("key") or ""), fields, maxlen=maxlen, approximate=True)
+            ids = await pipe.execute()
+            return {"main": [{**item, "stream_id": eid} for item, eid in zip(ctx.items or [{}], ids)]}
         for i, item in enumerate(ctx.items or [{}]):
             p = ctx.params(i)
             op, key = p.get("operation", "get"), str(p.get("key") or "")
@@ -367,17 +411,25 @@ async def _redis(ctx: NodeContext):
             elif op == "keys":
                 out.append({"keys": await r.keys(key or "*")})
     finally:
-        await r.aclose()
+        pass  # pooled client: connections stay open for the next run
     return {"main": out}
 
 
 register(NodeType(
-    type="db.redis", label="Redis", icon="layers", description="Get/set keys, counters, lists and pub/sub.",
+    type="db.redis", label="Redis", icon="layers", description="Get/set keys, counters, lists, pub/sub and streams.",
     properties=[
         prop("credential", "Redis credential", "credential", None, credential_types=["redis"], required=True),
-        prop("operation", "Operation", "options", "get", options=["get", "set", "delete", "incr", "publish", "push", "pop", "keys"]),
-        prop("key", "Key / channel / pattern", "string", ""),
+        prop("operation", "Operation", "options", "get", options=[
+            {"label": "get", "value": "get"}, {"label": "set", "value": "set"}, {"label": "delete", "value": "delete"},
+            {"label": "incr", "value": "incr"}, {"label": "publish", "value": "publish"}, {"label": "push", "value": "push"},
+            {"label": "pop", "value": "pop"}, {"label": "keys", "value": "keys"},
+            {"label": "Stream add (XADD)", "value": "xadd"}]),
+        prop("key", "Key / channel / pattern / stream", "string", ""),
         prop("value", "Value", "string", "", show_if={"operation": ["set", "publish", "push"]}),
+        prop("fields", "Fields (JSON object; empty = the whole item)", "string", "", show_if={"operation": ["xadd"]},
+             description="Each item becomes one entry. All items are sent in one pipelined batch."),
+        prop("maxlen", "Max stream length (approx.)", "number", 100000, show_if={"operation": ["xadd"]},
+             description="Trims old entries (MAXLEN ~) so the stream can't grow without limit. Empty = never trim."),
         prop("ttl", "TTL seconds (optional)", "number", None, show_if={"operation": ["set"]}),
         prop("amount", "Increment by", "number", 1, show_if={"operation": ["incr"]}),
         prop("property", "Output property", "string", "value", show_if={"operation": ["get"]}),

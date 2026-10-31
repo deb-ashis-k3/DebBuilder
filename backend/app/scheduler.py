@@ -4,6 +4,7 @@ import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from .db import SessionLocal, Workflow
@@ -32,6 +33,17 @@ def sync_workflow(wf: Workflow) -> None:
         if node.get("type") != "trigger.schedule" or node.get("disabled"):
             continue
         params = node.get("parameters") or {}
+        if params.get("mode") == "interval":
+            try:
+                seconds = max(1.0, float(params.get("seconds") or 60))
+            except (TypeError, ValueError):
+                log.warning("invalid interval %r on %s", params.get("seconds"), wf.id)
+                continue
+            trigger = IntervalTrigger(seconds=seconds)
+            # Fast intervals: never overlap runs; a late tick is dropped instead of queued behind the last one.
+            scheduler.add_job(_fire, trigger, id=f"{prefix}{node['id']}", args=[str(wf.id), node["id"]],
+                              replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=max(1, int(seconds)))
+            continue
         cron = params.get("cron") or "*/15 * * * *"
         try:
             trigger = CronTrigger.from_crontab(cron, timezone=params.get("timezone") or "UTC")

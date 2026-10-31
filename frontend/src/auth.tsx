@@ -1,78 +1,142 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
-import { auth } from './api'
-import type { Role, User } from './types'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
+import { auth } from "./api";
+import type { Role, User } from "./types";
 
-/** Mirror of backend/app/security.py PERMISSIONS (the server enforces; this only shapes the UI). */
-const VIEW = ['workflow:read', 'execution:read', 'credential:read']
-const EDIT = [...VIEW, 'workflow:write', 'workflow:execute', 'execution:write', 'credential:write']
-const ADMIN = [...EDIT, 'user:manage', 'audit:read']
-const PERMS: Record<Role, string[]> = { viewer: VIEW, editor: EDIT, admin: ADMIN, owner: [...ADMIN, 'owner'] }
+const VIEW = ["workflow:read", "execution:read", "credential:read"];
+const EDIT = [
+  ...VIEW,
+  "workflow:write",
+  "workflow:execute",
+  "execution:write",
+  "credential:write",
+];
+const ADMIN = [...EDIT, "user:manage", "audit:read"];
+const PERMS: Record<Role, string[]> = {
+  viewer: VIEW,
+  editor: EDIT,
+  admin: ADMIN,
+  owner: [...ADMIN, "owner"],
+};
 
-export type Perm = 'workflow:read' | 'workflow:write' | 'workflow:execute' | 'execution:read' | 'execution:write'
-  | 'credential:read' | 'credential:write' | 'user:manage' | 'audit:read' | 'owner'
+export type Perm =
+  | "workflow:read"
+  | "workflow:write"
+  | "workflow:execute"
+  | "execution:read"
+  | "execution:write"
+  | "credential:read"
+  | "credential:write"
+  | "user:manage"
+  | "audit:read"
+  | "owner";
 
 interface AuthState {
-  loading: boolean
-  setupRequired: boolean
-  signupEnabled: boolean
-  user: User | null
-  refresh: () => Promise<void>
-  setUser: (u: User | null) => void
-  logout: () => Promise<void>
-  can: (p: Perm) => boolean
+  loading: boolean;
+  setupRequired: boolean;
+  signupEnabled: boolean;
+  user: User | null;
+  refresh: () => Promise<void>;
+  setUser: (u: User | null) => void;
+  logout: () => Promise<void>;
+  can: (p: Perm) => boolean;
 }
 
 const Ctx = createContext<AuthState>({
-  loading: true, setupRequired: false, signupEnabled: false, user: null, refresh: async () => {}, setUser: () => {}, logout: async () => {}, can: () => false,
-})
+  loading: true,
+  setupRequired: false,
+  signupEnabled: false,
+  user: null,
+  refresh: async () => {},
+  setUser: () => {},
+  logout: async () => {},
+  can: () => false,
+});
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [loading, setLoading] = useState(true)
-  const [setupRequired, setSetupRequired] = useState(false)
-  const [signupEnabled, setSignupEnabled] = useState(false)
-  const [user, setUser] = useState<User | null>(null)
+  const [loading, setLoading] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [signupEnabled, setSignupEnabled] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const s = await auth.status()
-      setSetupRequired(s.setup_required)
-      setSignupEnabled(s.signup_enabled)
-      setUser(s.user)
+      const s = await auth.status();
+      setSetupRequired(s.setup_required);
+      setSignupEnabled(s.signup_enabled);
+      setUser(s.user);
     } catch {
-      setUser(null)
+      setUser(null);
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    refresh()
-    // Any API call that comes back 401 (session expired / revoked) re-checks and shows sign-in.
-    const onExpired = () => { refresh() }
-    window.addEventListener('auth:expired', onExpired)
-    return () => window.removeEventListener('auth:expired', onExpired)
-  }, [refresh])
+    refresh();
+
+    const onExpired = () => {
+      refresh();
+    };
+    window.addEventListener("auth:expired", onExpired);
+    return () => window.removeEventListener("auth:expired", onExpired);
+  }, [refresh]);
 
   const logout = useCallback(async () => {
-    try { await auth.logout() } finally { setUser(null) }
-  }, [])
+    try {
+      await auth.logout();
+    } finally {
+      setUser(null);
+    }
+  }, []);
 
-  const can = useCallback((p: Perm) => !!user && (PERMS[user.role] ?? []).includes(p), [user])
+  const can = useCallback(
+    (p: Perm) => !!user && (PERMS[user.role] ?? []).includes(p),
+    [user],
+  );
 
-  // Signing in as someone else (same tab) must not show the previous user's cached lists.
-  const userId = user?.id
-  useEffect(() => { window.dispatchEvent(new Event('auth:changed')) }, [userId])
+  const userId = user?.id;
+  useEffect(() => {
+    window.dispatchEvent(new Event("auth:changed"));
+  }, [userId]);
 
-  return <Ctx.Provider value={{ loading, setupRequired, signupEnabled, user, refresh, setUser, logout, can }}>{children}</Ctx.Provider>
+  return (
+    <Ctx.Provider
+      value={{
+        loading,
+        setupRequired,
+        signupEnabled,
+        user,
+        refresh,
+        setUser,
+        logout,
+        can,
+      }}
+    >
+      {children}
+    </Ctx.Provider>
+  );
 }
 
-export const useAuth = () => useContext(Ctx)
+export const useAuth = () => useContext(Ctx);
 
-
-export const ROLE_LABEL: Record<Role, string> = { owner: 'Owner', admin: 'Admin', editor: 'Editor', viewer: 'Viewer' }
+export const ROLE_LABEL: Record<Role, string> = {
+  owner: "Owner",
+  admin: "Admin",
+  editor: "Editor",
+  viewer: "Viewer",
+};
 export const ROLE_HELP: Record<Role, string> = {
-  owner: 'Everything, including managing admins and other owners',
-  admin: "Manage users, see the audit log, and see and manage every user's workflows",
-  editor: 'Own workspace: create, edit and run their own workflows and credentials',
+  owner: "Everything, including managing admins and other owners",
+  admin:
+    "Manage users, see the audit log, and see and manage every user's workflows",
+  editor:
+    "Own workspace: create, edit and run their own workflows and credentials",
   viewer: "Read-only access to everyone's workflows and executions",
-}
+};

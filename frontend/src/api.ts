@@ -1,3 +1,4 @@
+import type { ExprResult } from './components/ExprField'
 import type { ApiKey, Telephony, AuditEntry, AuthSessionInfo, AuthStatus, LoginChallenge, CodeRuntime, Credential, CredentialCatalog, Execution, ExecutionFilter, Folder, Item, ListenerStatus, NodeTypeSpec, VoiceWorkerStatus, TestResult, User, Workflow } from './types'
 
 /** Double-submit CSRF token: the server sets the readable `db_csrf` cookie at sign-in. */
@@ -71,8 +72,10 @@ export const api = {
 
   workflows: () => req<Workflow[]>('GET', '/api/workflows'),
   workflow: (id: string) => req<Workflow>('GET', `/api/workflows/${id}`),
-  expressionPreview: (id: string, body: { value: unknown; items: Item[]; node_outputs: Record<string, Item[]>; item_index?: number }) =>
-    req<{ ok: true; type: string; text: string; truncated?: boolean } | { ok: false; error: string }>('POST', `/api/workflows/${id}/expression-preview`, body),
+  expressionPreview: (id: string, body: { value: unknown; items: Item[]; node_outputs: Record<string, Item[]>; node_names?: string[]; item_index?: number }) =>
+    req<ExprResult>('POST', `/api/workflows/${id}/expression-preview`, body),
+  codeCheck: (id: string, body: { language: string; code: string }) =>
+    req<{ ok: boolean; checked?: boolean; line?: number; message?: string }>('POST', `/api/workflows/${id}/code-check`, body),
   listenerStatus: (id: string) => req<Record<string, ListenerStatus>>('GET', `/api/workflows/${id}/listeners`),
   voiceWorkerStatus: (id: string) => req<Record<string, VoiceWorkerStatus>>('GET', `/api/workflows/${id}/listeners`),
   restartVoiceWorker: (id: string, nodeId: string) => req<VoiceWorkerStatus>('POST', `/api/workflows/${id}/voice-worker/${nodeId}/restart`),

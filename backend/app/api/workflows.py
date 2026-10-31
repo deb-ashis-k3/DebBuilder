@@ -304,13 +304,14 @@ class PreviewIn(BaseModel):
     items: list[dict] = []          # the node's input items (latest run in the editor)
     item_index: int = 0
     node_outputs: dict[str, list[dict]] = {}  # earlier nodes' output by name, for $('Name')
+    node_names: list[str] = []  # every node in the editor (also unsaved ones), to tell "not run yet" from "no such node"
 
 
 @router.post("/workflows/{wf_id}/expression-preview")
 async def expression_preview(wf_id: str, body: PreviewIn, session: AsyncSession = Depends(get_session),
                              p: Principal = Depends(principal)):
     """Resolve a parameter's expression against sample data, like n8n's inline result under a field."""
-    from ..engine.expressions import build_context, evaluate
+    from ..engine.expressions import build_context, evaluate, inspect
 
     wf = await _get(session, wf_id, p)
     items = body.items or []
@@ -318,12 +319,44 @@ async def expression_preview(wf_id: str, body: PreviewIn, session: AsyncSession 
     variables = {v["key"]: v.get("value") for v in (wf.settings or {}).get("variables", []) if v.get("key")}
     ctx = build_context(items[idx] if items else {}, items, idx, body.node_outputs,
                         {"workflow_id": str(wf.id), "workflow_name": wf.name, "mode": "preview", "vars": variables})
+    # Each {{ }} on its own (valid / pending / invalid + field warnings), like n8n's inline expression editor.
+    names = {n.get("name") for n in (wf.nodes or []) if n.get("name")} | set(body.node_outputs) | set(body.node_names)
+    segments = inspect(body.value, ctx, names, body.node_outputs) if isinstance(body.value, str) else []
     try:
         result = evaluate(body.value, ctx)
     except Exception as e:  # noqa: BLE001 - show the author what went wrong, like n8n's red hint
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:500]}
+        pending = next((sg for sg in segments if sg["state"] == "pending"), None)
+        if pending:  # a node that hasn't run yet: not an error, the value just isn't known
+            return {"ok": False, "pending": True, "error": pending["error"], "segments": segments}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:500], "segments": segments}
     text = result if isinstance(result, str) else json.dumps(result, default=str, ensure_ascii=False)
-    return {"ok": True, "type": type(result).__name__, "text": text[:5000], "truncated": len(text) > 5000}
+    return {"ok": True, "type": type(result).__name__, "text": text[:5000], "truncated": len(text) > 5000,
+            "segments": segments}
+
+
+class CodeCheckIn(BaseModel):
+    language: str = "python"
+    code: str = ""
+
+
+@router.post("/workflows/{wf_id}/code-check")
+async def code_check(wf_id: str, body: CodeCheckIn, session: AsyncSession = Depends(get_session),
+                     p: Principal = Depends(principal)):
+    """Syntax check for the Code node while typing (n8n lints its code editor). Compiles only, never runs."""
+    import textwrap
+
+    await _get(session, wf_id, p)
+    if body.language != "python":
+        return {"ok": True, "checked": False}
+    # Same wrapping as the Code node (core.py): the code is the body of an async function, so `return` works.
+    src = "async def __user_fn(items, item, index):\n" + textwrap.indent(body.code or "pass", "    ")
+    try:
+        compile(src, "<code>", "exec", dont_inherit=True)
+    except SyntaxError as e:
+        line = max((e.lineno or 2) - 1, 1)
+        return {"ok": False, "checked": True, "line": line, "column": max((e.offset or 5) - 4, 1),
+                "message": f"{e.msg} (line {line})"}
+    return {"ok": True, "checked": True}
 
 
 @router.post("/workflows/{wf_id}/run")
